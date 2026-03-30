@@ -106,22 +106,30 @@ app.get("/api/v1/leases/expirations", async (req: Request, res: Response) => {
 app.get("/api/v1/leases/expiring-soon", async (req: Request, res: Response) => {
   let sql: postgres.Sql | null = null;
   try {
-    const days  = Math.min(parseInt(String(req.query.days  ?? "90"),  10), 365);
+    const days  = Math.min(parseInt(String(req.query.days  ?? "90"),  10), 730);
     const limit = Math.min(parseInt(String(req.query.limit ?? "100"), 10), 500);
     sql = getDb();
     const rows = await sql<GoldLeaseExpiration[]>`
       SELECT id, bronze_report_id, tenant_id, unit_id,
              lease_start_date::text AS lease_start_date,
              lease_end_date::text   AS lease_end_date,
-             days_until_expiration, created_at
+             (lease_end_date - CURRENT_DATE)::int AS days_until_expiration,
+             created_at
       FROM gold_lease_expirations
-      WHERE days_until_expiration IS NOT NULL
-        AND days_until_expiration >= 0
-        AND days_until_expiration <= ${days}
-      ORDER BY days_until_expiration ASC
+      WHERE lease_end_date IS NOT NULL
+        AND lease_end_date >= CURRENT_DATE
+        AND (lease_end_date - CURRENT_DATE) <= ${days}
+      ORDER BY lease_end_date ASC
       LIMIT ${limit}
     `;
-    res.status(200).json({ success: true, days_window: days, count: rows.length, data: rows.map(mapRow) });
+    const countRes = await sql<{ count: string }[]>`
+      SELECT COUNT(*) AS count FROM gold_lease_expirations
+      WHERE lease_end_date IS NOT NULL
+        AND lease_end_date >= CURRENT_DATE
+        AND (lease_end_date - CURRENT_DATE) <= ${days}
+    `;
+    const total = parseInt(countRes[0].count, 10);
+    res.status(200).json({ success: true, days_window: days, total, count: rows.length, data: rows.map(mapRow) });
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
     console.error(`[${SERVICE_NAME}] GET /api/v1/leases/expiring-soon error:`, message);
@@ -143,15 +151,23 @@ app.get("/api/v1/leases/upcoming-renewals", async (req: Request, res: Response) 
       SELECT id, bronze_report_id, tenant_id, unit_id,
              lease_start_date::text AS lease_start_date,
              lease_end_date::text   AS lease_end_date,
-             days_until_expiration, created_at
+             (lease_end_date - CURRENT_DATE)::int AS days_until_expiration,
+             created_at
       FROM gold_lease_expirations
-      WHERE days_until_expiration IS NOT NULL
-        AND days_until_expiration > ${fromDays}
-        AND days_until_expiration <= ${toDays}
-      ORDER BY days_until_expiration ASC
+      WHERE lease_end_date IS NOT NULL
+        AND (lease_end_date - CURRENT_DATE) > ${fromDays}
+        AND (lease_end_date - CURRENT_DATE) <= ${toDays}
+      ORDER BY lease_end_date ASC
       LIMIT ${limit}
     `;
-    res.status(200).json({ success: true, from_days: fromDays, to_days: toDays, count: rows.length, data: rows.map(mapRow) });
+    const countRes = await sql<{ count: string }[]>`
+      SELECT COUNT(*) AS count FROM gold_lease_expirations
+      WHERE lease_end_date IS NOT NULL
+        AND (lease_end_date - CURRENT_DATE) > ${fromDays}
+        AND (lease_end_date - CURRENT_DATE) <= ${toDays}
+    `;
+    const total = parseInt(countRes[0].count, 10);
+    res.status(200).json({ success: true, from_days: fromDays, to_days: toDays, total, count: rows.length, data: rows.map(mapRow) });
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
     console.error(`[${SERVICE_NAME}] GET /api/v1/leases/upcoming-renewals error:`, message);
