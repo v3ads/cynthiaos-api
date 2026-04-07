@@ -534,6 +534,129 @@ app.get("/health", (_req: Request, res: Response) => {
   });
 });
 
+// ── GET /api/v1/income ───────────────────────────────────────────────────────────────
+// Returns income statement records from the Gold layer.
+// Supports pagination (limit/offset), optional date range filter,
+// and sorts by report_date DESC by default.
+interface GoldIncomeStatement {
+  id: string;
+  bronze_report_id: string | null;
+  report_date: unknown;
+  total_income: string;
+  rental_income: string;
+  other_income: string;
+  total_expenses: string;
+  operating_expenses: string;
+  net_operating_income: string;
+  profit_margin: string | null;
+  created_at: Date;
+}
+
+function mapISRow(r: GoldIncomeStatement) {
+  return {
+    id: r.id,
+    bronze_report_id: r.bronze_report_id,
+    report_date:          toDateStr(r.report_date),
+    total_income:         parseFloat(r.total_income),
+    rental_income:        parseFloat(r.rental_income),
+    other_income:         parseFloat(r.other_income),
+    total_expenses:       parseFloat(r.total_expenses),
+    operating_expenses:   parseFloat(r.operating_expenses),
+    net_operating_income: parseFloat(r.net_operating_income),
+    profit_margin:        r.profit_margin !== null ? parseFloat(r.profit_margin) : null,
+    created_at: r.created_at,
+  };
+}
+
+app.get("/api/v1/income", async (req: Request, res: Response) => {
+  let sql: postgres.Sql | null = null;
+  try {
+    const limit   = Math.min(parseInt(String(req.query.limit  ?? "100"), 10), 500);
+    const offset  = Math.max(parseInt(String(req.query.offset ?? "0"),   10), 0);
+    const dateFrom = typeof req.query.date_from === "string" ? req.query.date_from : null;
+    const dateTo   = typeof req.query.date_to   === "string" ? req.query.date_to   : null;
+
+    sql = getDb();
+
+    let rows: GoldIncomeStatement[];
+    let countRes: { count: string }[];
+
+    if (dateFrom && dateTo) {
+      rows = await sql<GoldIncomeStatement[]>`
+        SELECT id, bronze_report_id, report_date::text AS report_date,
+               total_income::text, rental_income::text, other_income::text,
+               total_expenses::text, operating_expenses::text,
+               net_operating_income::text, profit_margin::text, created_at
+        FROM gold_income_statements
+        WHERE report_date BETWEEN ${dateFrom}::date AND ${dateTo}::date
+        ORDER BY report_date DESC
+        LIMIT ${limit} OFFSET ${offset}
+      `;
+      countRes = await sql<{ count: string }[]>`
+        SELECT COUNT(*) AS count FROM gold_income_statements
+        WHERE report_date BETWEEN ${dateFrom}::date AND ${dateTo}::date
+      `;
+    } else if (dateFrom) {
+      rows = await sql<GoldIncomeStatement[]>`
+        SELECT id, bronze_report_id, report_date::text AS report_date,
+               total_income::text, rental_income::text, other_income::text,
+               total_expenses::text, operating_expenses::text,
+               net_operating_income::text, profit_margin::text, created_at
+        FROM gold_income_statements
+        WHERE report_date >= ${dateFrom}::date
+        ORDER BY report_date DESC
+        LIMIT ${limit} OFFSET ${offset}
+      `;
+      countRes = await sql<{ count: string }[]>`
+        SELECT COUNT(*) AS count FROM gold_income_statements WHERE report_date >= ${dateFrom}::date
+      `;
+    } else if (dateTo) {
+      rows = await sql<GoldIncomeStatement[]>`
+        SELECT id, bronze_report_id, report_date::text AS report_date,
+               total_income::text, rental_income::text, other_income::text,
+               total_expenses::text, operating_expenses::text,
+               net_operating_income::text, profit_margin::text, created_at
+        FROM gold_income_statements
+        WHERE report_date <= ${dateTo}::date
+        ORDER BY report_date DESC
+        LIMIT ${limit} OFFSET ${offset}
+      `;
+      countRes = await sql<{ count: string }[]>`
+        SELECT COUNT(*) AS count FROM gold_income_statements WHERE report_date <= ${dateTo}::date
+      `;
+    } else {
+      rows = await sql<GoldIncomeStatement[]>`
+        SELECT id, bronze_report_id, report_date::text AS report_date,
+               total_income::text, rental_income::text, other_income::text,
+               total_expenses::text, operating_expenses::text,
+               net_operating_income::text, profit_margin::text, created_at
+        FROM gold_income_statements
+        ORDER BY report_date DESC
+        LIMIT ${limit} OFFSET ${offset}
+      `;
+      countRes = await sql<{ count: string }[]>`SELECT COUNT(*) AS count FROM gold_income_statements`;
+    }
+
+    const total = parseInt(countRes[0].count, 10);
+
+    res.status(200).json({
+      success: true,
+      total,
+      limit,
+      offset,
+      date_from_filter: dateFrom,
+      date_to_filter:   dateTo,
+      data: rows.map(mapISRow),
+    });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`[${SERVICE_NAME}] GET /api/v1/income error:`, message);
+    res.status(500).json({ success: false, error: message });
+  } finally {
+    if (sql) await sql.end();
+  }
+});
+
 // ── GET /api/v1/tenants ─────────────────────────────────────────────────────
 // Returns canonical tenant records from the Gold identity layer.
 // Supports pagination (limit/offset), optional name search, and
@@ -676,6 +799,7 @@ app.get("/api/v1", (_req: Request, res: Response) => {
       "GET  /api/v1/delinquency",
       "GET  /api/v1/aged-receivables",
       "GET  /api/v1/tenants",
+      "GET  /api/v1/income",
     ],
   });
 });
