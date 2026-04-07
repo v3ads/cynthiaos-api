@@ -1590,6 +1590,220 @@ app.get("/api/v1/insights/portfolio-health", async (_req: Request, res: Response
     if (sql) await sql.end();
   }
 });
+// ── GET /api/v1/insights/collections-risk ───────────────────────────────────
+interface CollectionsRiskRow {
+  tenant_id:             string;
+  full_name:             string | null;
+  unit_id:               string | null;
+  total_balance:         string | null;
+  risk_score:            string | null;
+  bucket_90_plus:        string | null;
+  dominant_bucket:       string | null;
+  days_overdue:          number | null;
+  delinquency_level:     string | null;
+  lease_end_date:        string | null;
+  days_until_expiration: number | null;
+}
+
+app.get("/api/v1/insights/collections-risk", async (req: Request, res: Response) => {
+  let sql: ReturnType<typeof getDb> | null = null;
+  try {
+    const limit  = Math.min(parseInt(String(req.query.limit  ?? "10"), 10), 100);
+    const offset = parseInt(String(req.query.offset ?? "0"),  10);
+    const classFilter = req.query.classification
+      ? String(req.query.classification)
+      : null;
+    const validClasses = ["Immediate Action", "High Priority", "Monitor", "Low Risk"];
+    if (classFilter && !validClasses.includes(classFilter)) {
+      res.status(400).json({
+        success: false,
+        error: `Invalid classification. Must be one of: ${validClasses.join(", ")}`
+      });
+      return;
+    }
+
+    sql = getDb();
+
+    const baseQuery = sql<CollectionsRiskRow[]>`
+      WITH
+      ar_deduped AS (
+        SELECT DISTINCT ON (tenant_id)
+          tenant_id, unit_id,
+          total_balance::numeric    AS total_balance,
+          risk_score::numeric       AS risk_score,
+          bucket_90_plus::numeric   AS bucket_90_plus,
+          dominant_bucket
+        FROM gold_aged_receivables
+        ORDER BY tenant_id, risk_score DESC, created_at DESC
+      ),
+      d_deduped AS (
+        SELECT DISTINCT ON (tenant_id)
+          tenant_id,
+          days_overdue,
+          risk_level AS delinquency_level
+        FROM gold_delinquency_records
+        ORDER BY tenant_id, days_overdue DESC NULLS LAST, created_at DESC
+      ),
+      le_deduped AS (
+        SELECT DISTINCT ON (tenant_id)
+          tenant_id,
+          lease_end_date::text          AS lease_end_date,
+          days_until_expiration
+        FROM gold_lease_expirations
+        ORDER BY tenant_id, lease_end_date ASC, created_at DESC
+      ),
+      t_deduped AS (
+        SELECT DISTINCT ON (full_name)
+          full_name
+        FROM gold_tenants
+        ORDER BY full_name, updated_at DESC
+      ),
+      joined AS (
+        SELECT
+          ar.tenant_id,
+          COALESCE(t.full_name, ar.tenant_id)  AS full_name,
+          ar.unit_id,
+          ar.total_balance,
+          ar.risk_score,
+          ar.bucket_90_plus,
+          ar.dominant_bucket,
+          d.days_overdue,
+          d.delinquency_level,
+          le.lease_end_date,
+          le.days_until_expiration,
+          -- Collections risk score (0-100)
+          -- 90+ bucket: up to 40 pts (bucket_90_plus / total_balance * 40)
+          -- days_overdue: up to 35 pts (days_overdue / 90 * 35, capped)
+          -- lease ending soon: up to 25 pts (inverse of days_until_expiration)
+          LEAST(100, ROUND(
+            COALESCE(
+              CASE WHEN ar.total_balance > 0
+                THEN (ar.bucket_90_plus / ar.total_balance) * 40
+                ELSE 0
+              END, 0
+            ) +
+            COALESCE(
+              LEAST(35, (d.days_overdue::numeric / 90.0) * 35), 0
+            ) +
+            COALESCE(
+              CASE
+                WHEN le.days_until_expiration IS NULL THEN 25
+                WHEN le.days_until_expiration <= 30   THEN 25
+                WHEN le.days_until_expiration <= 60   THEN 18
+                WHEN le.days_until_expiration <= 90   THEN 10
+                ELSE 0
+              END, 0
+            )
+          )) AS collections_risk_score
+        FROM ar_deduped ar
+        LEFT JOIN d_deduped  d  ON LOWER(TRIM(ar.tenant_id)) = LOWER(TRIM(d.tenant_id))
+        LEFT JOIN le_deduped le ON LOWER(TRIM(ar.tenant_id)) = LOWER(TRIM(le.tenant_id))
+        LEFT JOIN t_deduped  t  ON LOWER(TRIM(ar.tenant_id)) = LOWER(TRIM(t.full_name))
+      ),
+      classified AS (
+        SELECT *,
+          CASE
+            WHEN collections_risk_score >= 80 THEN 'Immediate Action'
+            WHEN collections_risk_score >= 60 THEN 'High Priority'
+            WHEN collections_risk_score >= 40 THEN 'Monitor'
+            ELSE 'Low Risk'
+          END AS collections_classification
+        FROM joined
+      )
+      SELECT *
+      FROM classified
+      WHERE
+        ${classFilter ? sql`collections_classification = ${classFilter}` : sql`TRUE`}
+      ORDER BY collections_risk_score DESC, tenant_id ASC
+      LIMIT ${limit} OFFSET ${offset}
+    `;
+
+    const countQuery = sql<{ count: string }[]>`
+      WITH
+      ar_deduped AS (
+        SELECT DISTINCT ON (tenant_id)
+          tenant_id,
+          total_balance::numeric  AS total_balance,
+          risk_score::numeric     AS risk_score,
+          bucket_90_plus::numeric AS bucket_90_plus
+        FROM gold_aged_receivables
+        ORDER BY tenant_id, risk_score DESC, created_at DESC
+      ),
+      d_deduped AS (
+        SELECT DISTINCT ON (tenant_id) tenant_id, days_overdue
+        FROM gold_delinquency_records
+        ORDER BY tenant_id, days_overdue DESC NULLS LAST, created_at DESC
+      ),
+      le_deduped AS (
+        SELECT DISTINCT ON (tenant_id) tenant_id, days_until_expiration
+        FROM gold_lease_expirations
+        ORDER BY tenant_id, lease_end_date ASC, created_at DESC
+      ),
+      joined AS (
+        SELECT
+          LEAST(100, ROUND(
+            COALESCE(CASE WHEN ar.total_balance > 0
+              THEN (ar.bucket_90_plus / ar.total_balance) * 40 ELSE 0 END, 0) +
+            COALESCE(LEAST(35, (d.days_overdue::numeric / 90.0) * 35), 0) +
+            COALESCE(CASE
+              WHEN le.days_until_expiration IS NULL THEN 25
+              WHEN le.days_until_expiration <= 30   THEN 25
+              WHEN le.days_until_expiration <= 60   THEN 18
+              WHEN le.days_until_expiration <= 90   THEN 10
+              ELSE 0
+            END, 0)
+          )) AS collections_risk_score
+        FROM ar_deduped ar
+        LEFT JOIN d_deduped  d  ON LOWER(TRIM(ar.tenant_id)) = LOWER(TRIM(d.tenant_id))
+        LEFT JOIN le_deduped le ON LOWER(TRIM(ar.tenant_id)) = LOWER(TRIM(le.tenant_id))
+      ),
+      classified AS (
+        SELECT CASE
+          WHEN collections_risk_score >= 80 THEN 'Immediate Action'
+          WHEN collections_risk_score >= 60 THEN 'High Priority'
+          WHEN collections_risk_score >= 40 THEN 'Monitor'
+          ELSE 'Low Risk'
+        END AS collections_classification
+        FROM joined
+      )
+      SELECT COUNT(*)::text AS count
+      FROM classified
+      WHERE ${classFilter ? sql`collections_classification = ${classFilter}` : sql`TRUE`}
+    `;
+
+    const [rows, countRows] = await Promise.all([baseQuery, countQuery]);
+    const total = parseInt(countRows[0]?.count ?? "0", 10);
+
+    res.status(200).json({
+      success: true,
+      total,
+      limit,
+      offset,
+      classification_filter: classFilter,
+      data: rows.map((r) => ({
+        tenant_id:              r.tenant_id,
+        full_name:              r.full_name,
+        unit_id:                r.unit_id,
+        total_balance:          r.total_balance !== null ? parseFloat(String(r.total_balance)) : null,
+        risk_score:             r.risk_score    !== null ? parseFloat(String(r.risk_score))    : null,
+        bucket_90_plus:         r.bucket_90_plus !== null ? parseFloat(String(r.bucket_90_plus)) : null,
+        dominant_bucket:        r.dominant_bucket,
+        days_overdue:           r.days_overdue,
+        delinquency_level:      r.delinquency_level,
+        lease_end_date:         r.lease_end_date,
+        days_until_expiration:  r.days_until_expiration,
+        collections_risk_score: parseInt(String((r as unknown as { collections_risk_score: string }).collections_risk_score ?? "0"), 10),
+        collections_classification: (r as unknown as { collections_classification: string }).collections_classification,
+      })),
+    });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`[${SERVICE_NAME}] GET /api/v1/insights/collections-risk error:`, message);
+    res.status(500).json({ success: false, error: message });
+  } finally {
+    if (sql) await sql.end();
+  }
+});
 // ── API v1 root ───────────────────────────────────────────────────────────────
 app.get("/api/v1", (_req: Request, res: Response) => {
   res.status(200).json({
@@ -1611,6 +1825,7 @@ app.get("/api/v1", (_req: Request, res: Response) => {
       "GET  /api/v1/insights/at-risk-revenue",
       "GET  /api/v1/insights/lease-expiration-risk",
       "GET  /api/v1/insights/portfolio-health",
+      "GET  /api/v1/insights/collections-risk",
     ],
   });
 });
