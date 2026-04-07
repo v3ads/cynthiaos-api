@@ -385,7 +385,7 @@ app.get("/api/v1/delinquency", async (req: Request, res: Response) => {
                  days_overdue, risk_level, created_at
           FROM gold_delinquency_records
           WHERE risk_level = ${riskLevel}
-          ORDER BY balance_due DESC
+          ORDER BY balance_due::numeric DESC
           LIMIT ${limit} OFFSET ${offset}
         `
       : await sql<GoldDelinquencyRecord[]>`
@@ -393,7 +393,7 @@ app.get("/api/v1/delinquency", async (req: Request, res: Response) => {
                  balance_due::text AS balance_due,
                  days_overdue, risk_level, created_at
           FROM gold_delinquency_records
-          ORDER BY balance_due DESC
+          ORDER BY balance_due::numeric DESC
           LIMIT ${limit} OFFSET ${offset}
         `;
 
