@@ -68,6 +68,30 @@ interface LeaseActionRow {
   updated_at: Date;
 }
 
+interface GoldDelinquencyRecord {
+  id: string;
+  bronze_report_id: string | null;
+  tenant_id: string;
+  unit_id: string;
+  balance_due: string; // NUMERIC returns as string from postgres driver
+  days_overdue: number | null;
+  risk_level: string;
+  created_at: Date;
+}
+
+function mapDelinquencyRow(r: GoldDelinquencyRecord) {
+  return {
+    id: r.id,
+    bronze_report_id: r.bronze_report_id,
+    tenant_id: r.tenant_id,
+    unit_id: r.unit_id,
+    balance_due: parseFloat(r.balance_due),
+    days_overdue: r.days_overdue,
+    risk_level: r.risk_level,
+    created_at: r.created_at,
+  };
+}
+
 function toDateStr(val: unknown): string | null {
   if (!val) return null;
   if (val instanceof Date) return val.toISOString().slice(0, 10);
@@ -342,6 +366,64 @@ app.put("/api/v1/leases/:id/actions", async (req: Request, res: Response) => {
   }
 });
 
+// ── GET /api/v1/delinquency ──────────────────────────────────────────────────
+// Returns delinquency records from the Gold layer.
+// Supports pagination (limit/offset) and sorts by highest balance_due by default.
+app.get("/api/v1/delinquency", async (req: Request, res: Response) => {
+  let sql: postgres.Sql | null = null;
+  try {
+    const limit     = Math.min(parseInt(String(req.query.limit  ?? "100"), 10), 500);
+    const offset    = Math.max(parseInt(String(req.query.offset ?? "0"),   10), 0);
+    const riskLevel = typeof req.query.risk_level === "string" ? req.query.risk_level : null;
+
+    sql = getDb();
+
+    const rows = riskLevel
+      ? await sql<GoldDelinquencyRecord[]>`
+          SELECT id, bronze_report_id, tenant_id, unit_id,
+                 balance_due::text AS balance_due,
+                 days_overdue, risk_level, created_at
+          FROM gold_delinquency_records
+          WHERE risk_level = ${riskLevel}
+          ORDER BY balance_due DESC
+          LIMIT ${limit} OFFSET ${offset}
+        `
+      : await sql<GoldDelinquencyRecord[]>`
+          SELECT id, bronze_report_id, tenant_id, unit_id,
+                 balance_due::text AS balance_due,
+                 days_overdue, risk_level, created_at
+          FROM gold_delinquency_records
+          ORDER BY balance_due DESC
+          LIMIT ${limit} OFFSET ${offset}
+        `;
+
+    const countRes = riskLevel
+      ? await sql<{ count: string }[]>`
+          SELECT COUNT(*) AS count FROM gold_delinquency_records WHERE risk_level = ${riskLevel}
+        `
+      : await sql<{ count: string }[]>`
+          SELECT COUNT(*) AS count FROM gold_delinquency_records
+        `;
+
+    const total = parseInt(countRes[0].count, 10);
+
+    res.status(200).json({
+      success: true,
+      total,
+      limit,
+      offset,
+      risk_level_filter: riskLevel,
+      data: rows.map(mapDelinquencyRow),
+    });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`[${SERVICE_NAME}] GET /api/v1/delinquency error:`, message);
+    res.status(500).json({ success: false, error: message });
+  } finally {
+    if (sql) await sql.end();
+  }
+});
+
 // ── Health check ──────────────────────────────────────────────────────────────
 app.get("/health", (_req: Request, res: Response) => {
   res.status(200).json({
@@ -365,6 +447,7 @@ app.get("/api/v1", (_req: Request, res: Response) => {
       "GET  /api/v1/leases/:id",
       "GET  /api/v1/leases/:id/actions",
       "PUT  /api/v1/leases/:id/actions",
+      "GET  /api/v1/delinquency",
     ],
   });
 });
