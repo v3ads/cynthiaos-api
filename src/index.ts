@@ -1330,7 +1330,7 @@ app.get("/api/v1/insights/lease-expiration-risk", async (req: Request, res: Resp
       WHERE
         ${riskFilter ? sql`expiration_risk = ${riskFilter}` : sql`TRUE`}
         AND ${daysWindow ? sql`days_until_expiration <= ${daysWindow}` : sql`TRUE`}
-      ORDER BY days_until_expiration ASC NULLS LAST, risk_score DESC NULLS LAST
+      ORDER BY days_until_expiration ASC NULLS LAST, risk_score DESC NULLS LAST, tenant_id ASC
       LIMIT ${limit} OFFSET ${offset}
     `;
 
