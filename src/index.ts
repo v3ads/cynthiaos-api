@@ -531,6 +531,14 @@ app.get("/health", (_req: Request, res: Response) => {
     version: API_VERSION,
     timestamp: new Date().toISOString(),
     db: { connected: dbConnected, verified_at: dbTimestamp },
+    constraints: {
+      auth: "single_operator",
+      auth_note: "No authentication layer. All endpoints are publicly accessible. Multi-user auth is a future phase.",
+      tenant_id_format: "normalised",
+      tenant_id_note: "All Gold strategies use shared normalizeTenantId(name, unit) from utils/normalize. Format: name_unit e.g. maria_santos_101.",
+      idempotency: "content_hash",
+      idempotency_note: "income_statement and occupancy_summary use UNIQUE(report_date, content_hash). All other tables use UNIQUE(bronze_report_id, tenant_id, unit_id).",
+    },
   });
 });
 
