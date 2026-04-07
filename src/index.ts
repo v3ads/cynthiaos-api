@@ -411,9 +411,11 @@ app.get("/api/v1/aged-receivables", async (req: Request, res: Response) => {
 
     sql = getDb();
 
+    // Deduplicate to one row per tenant (most recent ingestion wins)
     const rows = dominantBucket
       ? await sql<GoldAgedReceivable[]>`
-          SELECT id, bronze_report_id, tenant_id, unit_id,
+          SELECT DISTINCT ON (tenant_id)
+                 id, bronze_report_id, tenant_id, unit_id,
                  total_balance::text  AS total_balance,
                  bucket_0_30::text    AS bucket_0_30,
                  bucket_31_60::text   AS bucket_31_60,
@@ -422,11 +424,12 @@ app.get("/api/v1/aged-receivables", async (req: Request, res: Response) => {
                  dominant_bucket, risk_score::text AS risk_score, created_at
           FROM gold_aged_receivables
           WHERE dominant_bucket = ${dominantBucket}
-          ORDER BY risk_score::numeric DESC
+          ORDER BY tenant_id, created_at DESC, risk_score::numeric DESC
           LIMIT ${limit} OFFSET ${offset}
         `
       : await sql<GoldAgedReceivable[]>`
-          SELECT id, bronze_report_id, tenant_id, unit_id,
+          SELECT DISTINCT ON (tenant_id)
+                 id, bronze_report_id, tenant_id, unit_id,
                  total_balance::text  AS total_balance,
                  bucket_0_30::text    AS bucket_0_30,
                  bucket_31_60::text   AS bucket_31_60,
@@ -434,16 +437,16 @@ app.get("/api/v1/aged-receivables", async (req: Request, res: Response) => {
                  bucket_90_plus::text AS bucket_90_plus,
                  dominant_bucket, risk_score::text AS risk_score, created_at
           FROM gold_aged_receivables
-          ORDER BY risk_score::numeric DESC
+          ORDER BY tenant_id, created_at DESC, risk_score::numeric DESC
           LIMIT ${limit} OFFSET ${offset}
         `;
 
     const countRes = dominantBucket
       ? await sql<{ count: string }[]>`
-          SELECT COUNT(*) AS count FROM gold_aged_receivables WHERE dominant_bucket = ${dominantBucket}
+          SELECT COUNT(DISTINCT tenant_id) AS count FROM gold_aged_receivables WHERE dominant_bucket = ${dominantBucket}
         `
       : await sql<{ count: string }[]>`
-          SELECT COUNT(*) AS count FROM gold_aged_receivables
+          SELECT COUNT(DISTINCT tenant_id) AS count FROM gold_aged_receivables
         `;
 
     const total = parseInt(countRes[0].count, 10);
@@ -477,31 +480,34 @@ app.get("/api/v1/delinquency", async (req: Request, res: Response) => {
 
     sql = getDb();
 
+    // Deduplicate to one row per tenant (most recent ingestion wins)
     const rows = riskLevel
       ? await sql<GoldDelinquencyRecord[]>`
-          SELECT id, bronze_report_id, tenant_id, unit_id,
+          SELECT DISTINCT ON (tenant_id)
+                 id, bronze_report_id, tenant_id, unit_id,
                  balance_due::text AS balance_due,
                  days_overdue, risk_level, created_at
           FROM gold_delinquency_records
           WHERE risk_level = ${riskLevel}
-          ORDER BY balance_due::numeric DESC
+          ORDER BY tenant_id, created_at DESC, balance_due::numeric DESC
           LIMIT ${limit} OFFSET ${offset}
         `
       : await sql<GoldDelinquencyRecord[]>`
-          SELECT id, bronze_report_id, tenant_id, unit_id,
+          SELECT DISTINCT ON (tenant_id)
+                 id, bronze_report_id, tenant_id, unit_id,
                  balance_due::text AS balance_due,
                  days_overdue, risk_level, created_at
           FROM gold_delinquency_records
-          ORDER BY balance_due::numeric DESC
+          ORDER BY tenant_id, created_at DESC, balance_due::numeric DESC
           LIMIT ${limit} OFFSET ${offset}
         `;
 
     const countRes = riskLevel
       ? await sql<{ count: string }[]>`
-          SELECT COUNT(*) AS count FROM gold_delinquency_records WHERE risk_level = ${riskLevel}
+          SELECT COUNT(DISTINCT tenant_id) AS count FROM gold_delinquency_records WHERE risk_level = ${riskLevel}
         `
       : await sql<{ count: string }[]>`
-          SELECT COUNT(*) AS count FROM gold_delinquency_records
+          SELECT COUNT(DISTINCT tenant_id) AS count FROM gold_delinquency_records
         `;
 
     const total = parseInt(countRes[0].count, 10);
@@ -1289,11 +1295,12 @@ app.get("/api/v1/insights/lease-expiration-risk", async (req: Request, res: Resp
         FROM gold_lease_expirations
         ORDER BY tenant_id, lease_end_date ASC, created_at DESC
       ),
-      t_deduped AS (
+      ar_deduped AS (
         SELECT DISTINCT ON (tenant_id)
-          tenant_id, full_name
-        FROM gold_tenants
-        ORDER BY tenant_id, updated_at DESC
+          tenant_id, unit_id AS ar_unit_id,
+          risk_score::numeric AS risk_score
+        FROM gold_aged_receivables
+        ORDER BY tenant_id, risk_score DESC, created_at DESC
       ),
       d_deduped AS (
         SELECT DISTINCT ON (tenant_id)
@@ -1301,17 +1308,24 @@ app.get("/api/v1/insights/lease-expiration-risk", async (req: Request, res: Resp
         FROM gold_delinquency_records
         ORDER BY tenant_id, days_overdue DESC NULLS LAST, created_at DESC
       ),
-      ar_deduped AS (
+      t_deduped AS (
         SELECT DISTINCT ON (tenant_id)
-          tenant_id, risk_score::numeric AS risk_score
-        FROM gold_aged_receivables
-        ORDER BY tenant_id, risk_score DESC, created_at DESC
+          tenant_id, full_name
+        FROM gold_tenants
+        ORDER BY tenant_id, updated_at DESC
+      ),
+      all_tenants AS (
+        SELECT tenant_id FROM le_deduped
+        UNION
+        SELECT tenant_id FROM ar_deduped
+        UNION
+        SELECT tenant_id FROM d_deduped
       ),
       joined AS (
         SELECT
-          le.tenant_id,
-          COALESCE(t.full_name, le.tenant_id) AS full_name,
-          le.unit_id,
+          at.tenant_id,
+          COALESCE(t.full_name, at.tenant_id)         AS full_name,
+          COALESCE(le.unit_id, ar.ar_unit_id)         AS unit_id,
           le.lease_end_date,
           le.days_until_expiration,
           ar.risk_score,
@@ -1323,22 +1337,26 @@ app.get("/api/v1/insights/lease-expiration-risk", async (req: Request, res: Resp
             THEN 'HIGH'
             WHEN le.days_until_expiration <= 90
             THEN 'MEDIUM'
+            WHEN ar.risk_score >= 2000 OR d.delinquency_level IS NOT NULL
+            THEN 'HIGH'
             ELSE 'LOW'
           END AS expiration_risk
-        FROM le_deduped le
-        LEFT JOIN t_deduped t
-          ON le.tenant_id = t.tenant_id
-        LEFT JOIN d_deduped d
-          ON le.tenant_id = d.tenant_id
-        LEFT JOIN ar_deduped ar
-          ON le.tenant_id = ar.tenant_id
+        FROM all_tenants at
+        LEFT JOIN t_deduped  t  ON at.tenant_id = t.tenant_id
+        LEFT JOIN le_deduped le ON at.tenant_id = le.tenant_id
+        LEFT JOIN ar_deduped ar ON at.tenant_id = ar.tenant_id
+        LEFT JOIN d_deduped  d  ON at.tenant_id = d.tenant_id
       )
       SELECT *
       FROM joined
       WHERE
         ${riskFilter ? sql`expiration_risk = ${riskFilter}` : sql`TRUE`}
         AND ${daysWindow ? sql`days_until_expiration <= ${daysWindow}` : sql`TRUE`}
-      ORDER BY days_until_expiration ASC NULLS LAST, risk_score DESC NULLS LAST, tenant_id ASC
+      ORDER BY
+        CASE expiration_risk WHEN 'HIGH' THEN 1 WHEN 'MEDIUM' THEN 2 ELSE 3 END,
+        days_until_expiration ASC NULLS LAST,
+        risk_score DESC NULLS LAST,
+        tenant_id ASC
       LIMIT ${limit} OFFSET ${offset}
     `;
 
@@ -1348,23 +1366,30 @@ app.get("/api/v1/insights/lease-expiration-risk", async (req: Request, res: Resp
         SELECT DISTINCT ON (tenant_id)
           tenant_id, days_until_expiration
         FROM gold_lease_expirations
-        ORDER BY tenant_id, lease_end_date ASC
-      ),
-      d_deduped AS (
-        SELECT DISTINCT ON (tenant_id)
-          tenant_id, risk_level AS delinquency_level
-        FROM gold_delinquency_records
-        ORDER BY tenant_id, days_overdue DESC NULLS LAST
+        ORDER BY tenant_id, lease_end_date ASC, created_at DESC
       ),
       ar_deduped AS (
         SELECT DISTINCT ON (tenant_id)
           tenant_id, risk_score::numeric AS risk_score
         FROM gold_aged_receivables
-        ORDER BY tenant_id, risk_score DESC
+        ORDER BY tenant_id, risk_score DESC, created_at DESC
+      ),
+      d_deduped AS (
+        SELECT DISTINCT ON (tenant_id)
+          tenant_id, risk_level AS delinquency_level
+        FROM gold_delinquency_records
+        ORDER BY tenant_id, days_overdue DESC NULLS LAST, created_at DESC
+      ),
+      all_tenants AS (
+        SELECT tenant_id FROM le_deduped
+        UNION
+        SELECT tenant_id FROM ar_deduped
+        UNION
+        SELECT tenant_id FROM d_deduped
       ),
       joined AS (
         SELECT
-          le.tenant_id,
+          at.tenant_id,
           le.days_until_expiration,
           ar.risk_score,
           d.delinquency_level,
@@ -1374,11 +1399,14 @@ app.get("/api/v1/insights/lease-expiration-risk", async (req: Request, res: Resp
             THEN 'HIGH'
             WHEN le.days_until_expiration <= 90
             THEN 'MEDIUM'
+            WHEN ar.risk_score >= 2000 OR d.delinquency_level IS NOT NULL
+            THEN 'HIGH'
             ELSE 'LOW'
           END AS expiration_risk
-        FROM le_deduped le
-        LEFT JOIN d_deduped d ON le.tenant_id = d.tenant_id
-        LEFT JOIN ar_deduped ar ON le.tenant_id = ar.tenant_id
+        FROM all_tenants at
+        LEFT JOIN le_deduped le ON at.tenant_id = le.tenant_id
+        LEFT JOIN ar_deduped ar ON at.tenant_id = ar.tenant_id
+        LEFT JOIN d_deduped  d  ON at.tenant_id = d.tenant_id
       )
       SELECT COUNT(*) AS count
       FROM joined
