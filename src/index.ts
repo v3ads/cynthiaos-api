@@ -1279,7 +1279,7 @@ app.get("/api/v1/insights/lease-expiration-risk", async (req: Request, res: Resp
           lease_end_date::text AS lease_end_date,
           days_until_expiration
         FROM gold_lease_expirations
-        ORDER BY tenant_id, lease_end_date ASC
+        ORDER BY tenant_id, lease_end_date ASC, created_at DESC
       ),
       t_deduped AS (
         SELECT DISTINCT ON (full_name)
@@ -1291,13 +1291,13 @@ app.get("/api/v1/insights/lease-expiration-risk", async (req: Request, res: Resp
         SELECT DISTINCT ON (tenant_id)
           tenant_id, risk_level AS delinquency_level, days_overdue
         FROM gold_delinquency_records
-        ORDER BY tenant_id, days_overdue DESC NULLS LAST
+        ORDER BY tenant_id, days_overdue DESC NULLS LAST, created_at DESC
       ),
       ar_deduped AS (
         SELECT DISTINCT ON (tenant_id)
           tenant_id, risk_score::numeric AS risk_score
         FROM gold_aged_receivables
-        ORDER BY tenant_id, risk_score DESC
+        ORDER BY tenant_id, risk_score DESC, created_at DESC
       ),
       joined AS (
         SELECT
