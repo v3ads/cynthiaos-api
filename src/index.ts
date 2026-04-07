@@ -534,6 +534,133 @@ app.get("/health", (_req: Request, res: Response) => {
   });
 });
 
+// ── GET /api/v1/tenants ─────────────────────────────────────────────────────
+// Returns canonical tenant records from the Gold identity layer.
+// Supports pagination (limit/offset), optional name search, and
+// optional lease_status filter.
+interface GoldTenant {
+  id: string;
+  bronze_report_id: string | null;
+  tenant_id: string;
+  full_name: string;
+  unit_id: string;
+  email: string | null;
+  phone: string | null;
+  lease_start_date: unknown;
+  lease_end_date: unknown;
+  lease_status: string | null;
+  created_at: Date;
+  updated_at: Date;
+}
+
+function mapTenantRow(r: GoldTenant) {
+  return {
+    id: r.id,
+    bronze_report_id: r.bronze_report_id,
+    tenant_id: r.tenant_id,
+    full_name: r.full_name,
+    unit_id: r.unit_id,
+    email: r.email,
+    phone: r.phone,
+    lease_start_date: toDateStr(r.lease_start_date),
+    lease_end_date:   toDateStr(r.lease_end_date),
+    lease_status: r.lease_status,
+    created_at: r.created_at,
+    updated_at: r.updated_at,
+  };
+}
+
+app.get("/api/v1/tenants", async (req: Request, res: Response) => {
+  let sql: postgres.Sql | null = null;
+  try {
+    const limit       = Math.min(parseInt(String(req.query.limit  ?? "100"), 10), 500);
+    const offset      = Math.max(parseInt(String(req.query.offset ?? "0"),   10), 0);
+    const search      = typeof req.query.search       === "string" ? req.query.search.trim()       : null;
+    const leaseStatus = typeof req.query.lease_status === "string" ? req.query.lease_status.trim() : null;
+
+    sql = getDb();
+
+    // Build query dynamically based on active filters
+    let rows: GoldTenant[];
+    let countRes: { count: string }[];
+
+    if (search && leaseStatus) {
+      rows = await sql<GoldTenant[]>`
+        SELECT id, bronze_report_id, tenant_id, full_name, unit_id, email, phone,
+               lease_start_date::text AS lease_start_date,
+               lease_end_date::text   AS lease_end_date,
+               lease_status, created_at, updated_at
+        FROM gold_tenants
+        WHERE full_name ILIKE ${'%' + search + '%'}
+          AND lease_status = ${leaseStatus}
+        ORDER BY full_name ASC
+        LIMIT ${limit} OFFSET ${offset}
+      `;
+      countRes = await sql<{ count: string }[]>`
+        SELECT COUNT(*) AS count FROM gold_tenants
+        WHERE full_name ILIKE ${'%' + search + '%'} AND lease_status = ${leaseStatus}
+      `;
+    } else if (search) {
+      rows = await sql<GoldTenant[]>`
+        SELECT id, bronze_report_id, tenant_id, full_name, unit_id, email, phone,
+               lease_start_date::text AS lease_start_date,
+               lease_end_date::text   AS lease_end_date,
+               lease_status, created_at, updated_at
+        FROM gold_tenants
+        WHERE full_name ILIKE ${'%' + search + '%'}
+        ORDER BY full_name ASC
+        LIMIT ${limit} OFFSET ${offset}
+      `;
+      countRes = await sql<{ count: string }[]>`
+        SELECT COUNT(*) AS count FROM gold_tenants WHERE full_name ILIKE ${'%' + search + '%'}
+      `;
+    } else if (leaseStatus) {
+      rows = await sql<GoldTenant[]>`
+        SELECT id, bronze_report_id, tenant_id, full_name, unit_id, email, phone,
+               lease_start_date::text AS lease_start_date,
+               lease_end_date::text   AS lease_end_date,
+               lease_status, created_at, updated_at
+        FROM gold_tenants
+        WHERE lease_status = ${leaseStatus}
+        ORDER BY full_name ASC
+        LIMIT ${limit} OFFSET ${offset}
+      `;
+      countRes = await sql<{ count: string }[]>`
+        SELECT COUNT(*) AS count FROM gold_tenants WHERE lease_status = ${leaseStatus}
+      `;
+    } else {
+      rows = await sql<GoldTenant[]>`
+        SELECT id, bronze_report_id, tenant_id, full_name, unit_id, email, phone,
+               lease_start_date::text AS lease_start_date,
+               lease_end_date::text   AS lease_end_date,
+               lease_status, created_at, updated_at
+        FROM gold_tenants
+        ORDER BY full_name ASC
+        LIMIT ${limit} OFFSET ${offset}
+      `;
+      countRes = await sql<{ count: string }[]>`SELECT COUNT(*) AS count FROM gold_tenants`;
+    }
+
+    const total = parseInt(countRes[0].count, 10);
+
+    res.status(200).json({
+      success: true,
+      total,
+      limit,
+      offset,
+      search_filter:  search,
+      status_filter:  leaseStatus,
+      data: rows.map(mapTenantRow),
+    });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`[${SERVICE_NAME}] GET /api/v1/tenants error:`, message);
+    res.status(500).json({ success: false, error: message });
+  } finally {
+    if (sql) await sql.end();
+  }
+});
+
 // ── API v1 root ───────────────────────────────────────────────────────────────
 app.get("/api/v1", (_req: Request, res: Response) => {
   res.status(200).json({
@@ -548,6 +675,7 @@ app.get("/api/v1", (_req: Request, res: Response) => {
       "PUT  /api/v1/leases/:id/actions",
       "GET  /api/v1/delinquency",
       "GET  /api/v1/aged-receivables",
+      "GET  /api/v1/tenants",
     ],
   });
 });
