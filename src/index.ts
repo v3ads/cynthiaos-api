@@ -1232,6 +1232,184 @@ app.get("/api/v1/insights/at-risk-revenue", async (req: Request, res: Response) 
   }
 });
 
+// ── GET /api/v1/insights/lease-expiration-risk ─────────────────────────────────────────
+//
+// Base: gold_lease_expirations
+// LEFT JOIN gold_tenants          ON LOWER(TRIM(le.tenant_id)) = LOWER(TRIM(t.full_name))
+// LEFT JOIN gold_delinquency_records ON LOWER(TRIM(le.tenant_id)) = LOWER(TRIM(d.tenant_id))
+// LEFT JOIN gold_aged_receivables  ON LOWER(TRIM(le.tenant_id)) = LOWER(TRIM(ar.tenant_id))
+//
+// expiration_risk derivation:
+//   HIGH   → days_until_expiration <= 60 AND (risk_score >= 2000 OR delinquency_level IS NOT NULL)
+//   MEDIUM → days_until_expiration <= 90
+//   LOW    → otherwise
+
+interface LeaseExpirationRiskRow {
+  tenant_id:             string;
+  full_name:             string;
+  unit_id:               string;
+  lease_end_date:        string | null;
+  days_until_expiration: number | null;
+  risk_score:            string | null;
+  days_overdue:          number | null;
+  delinquency_level:     string | null;
+  expiration_risk:       string;
+}
+
+app.get("/api/v1/insights/lease-expiration-risk", async (req: Request, res: Response) => {
+  let sql: ReturnType<typeof getDb> | null = null;
+  try {
+    const limit       = Math.min(parseInt(String(req.query.limit  ?? "10"),  10), 100);
+    const offset      = Math.max(parseInt(String(req.query.offset ?? "0"),   10), 0);
+    const riskFilter  = typeof req.query.risk === "string" ? req.query.risk.trim().toUpperCase() : null;
+    const daysWindow  = typeof req.query.days === "string" ? parseInt(req.query.days, 10) : null;
+
+    if (riskFilter && !["HIGH", "MEDIUM", "LOW"].includes(riskFilter)) {
+      res.status(400).json({ success: false, error: "risk must be HIGH, MEDIUM, or LOW" });
+      return;
+    }
+
+    sql = getDb();
+
+    const baseQuery = sql<LeaseExpirationRiskRow[]>`
+      WITH
+      le_deduped AS (
+        SELECT DISTINCT ON (tenant_id)
+          tenant_id, unit_id,
+          lease_end_date::text AS lease_end_date,
+          days_until_expiration
+        FROM gold_lease_expirations
+        ORDER BY tenant_id, lease_end_date ASC
+      ),
+      t_deduped AS (
+        SELECT DISTINCT ON (full_name)
+          full_name
+        FROM gold_tenants
+        ORDER BY full_name, updated_at DESC
+      ),
+      d_deduped AS (
+        SELECT DISTINCT ON (tenant_id)
+          tenant_id, risk_level AS delinquency_level, days_overdue
+        FROM gold_delinquency_records
+        ORDER BY tenant_id, days_overdue DESC NULLS LAST
+      ),
+      ar_deduped AS (
+        SELECT DISTINCT ON (tenant_id)
+          tenant_id, risk_score::numeric AS risk_score
+        FROM gold_aged_receivables
+        ORDER BY tenant_id, risk_score DESC
+      ),
+      joined AS (
+        SELECT
+          le.tenant_id,
+          COALESCE(t.full_name, le.tenant_id) AS full_name,
+          le.unit_id,
+          le.lease_end_date,
+          le.days_until_expiration,
+          ar.risk_score,
+          d.days_overdue,
+          d.delinquency_level,
+          CASE
+            WHEN le.days_until_expiration <= 60
+                 AND (ar.risk_score >= 2000 OR d.delinquency_level IS NOT NULL)
+            THEN 'HIGH'
+            WHEN le.days_until_expiration <= 90
+            THEN 'MEDIUM'
+            ELSE 'LOW'
+          END AS expiration_risk
+        FROM le_deduped le
+        LEFT JOIN t_deduped t
+          ON LOWER(TRIM(le.tenant_id)) = LOWER(TRIM(t.full_name))
+        LEFT JOIN d_deduped d
+          ON LOWER(TRIM(le.tenant_id)) = LOWER(TRIM(d.tenant_id))
+        LEFT JOIN ar_deduped ar
+          ON LOWER(TRIM(le.tenant_id)) = LOWER(TRIM(ar.tenant_id))
+      )
+      SELECT *
+      FROM joined
+      WHERE
+        ${riskFilter ? sql`expiration_risk = ${riskFilter}` : sql`TRUE`}
+        AND ${daysWindow ? sql`days_until_expiration <= ${daysWindow}` : sql`TRUE`}
+      ORDER BY days_until_expiration ASC NULLS LAST, risk_score DESC NULLS LAST
+      LIMIT ${limit} OFFSET ${offset}
+    `;
+
+    const countQuery = sql<{ count: string }[]>`
+      WITH
+      le_deduped AS (
+        SELECT DISTINCT ON (tenant_id)
+          tenant_id, days_until_expiration
+        FROM gold_lease_expirations
+        ORDER BY tenant_id, lease_end_date ASC
+      ),
+      d_deduped AS (
+        SELECT DISTINCT ON (tenant_id)
+          tenant_id, risk_level AS delinquency_level
+        FROM gold_delinquency_records
+        ORDER BY tenant_id, days_overdue DESC NULLS LAST
+      ),
+      ar_deduped AS (
+        SELECT DISTINCT ON (tenant_id)
+          tenant_id, risk_score::numeric AS risk_score
+        FROM gold_aged_receivables
+        ORDER BY tenant_id, risk_score DESC
+      ),
+      joined AS (
+        SELECT
+          le.tenant_id,
+          le.days_until_expiration,
+          ar.risk_score,
+          d.delinquency_level,
+          CASE
+            WHEN le.days_until_expiration <= 60
+                 AND (ar.risk_score >= 2000 OR d.delinquency_level IS NOT NULL)
+            THEN 'HIGH'
+            WHEN le.days_until_expiration <= 90
+            THEN 'MEDIUM'
+            ELSE 'LOW'
+          END AS expiration_risk
+        FROM le_deduped le
+        LEFT JOIN d_deduped d ON LOWER(TRIM(le.tenant_id)) = LOWER(TRIM(d.tenant_id))
+        LEFT JOIN ar_deduped ar ON LOWER(TRIM(le.tenant_id)) = LOWER(TRIM(ar.tenant_id))
+      )
+      SELECT COUNT(*) AS count
+      FROM joined
+      WHERE
+        ${riskFilter ? sql`expiration_risk = ${riskFilter}` : sql`TRUE`}
+        AND ${daysWindow ? sql`days_until_expiration <= ${daysWindow}` : sql`TRUE`}
+    `;
+
+    const [rows, countRes] = await Promise.all([baseQuery, countQuery]);
+    const total = parseInt(countRes[0].count, 10);
+
+    res.status(200).json({
+      success:      true,
+      total,
+      limit,
+      offset,
+      risk_filter:  riskFilter,
+      days_window:  daysWindow,
+      data: rows.map((r) => ({
+        tenant_id:             r.tenant_id,
+        full_name:             r.full_name,
+        unit_id:               r.unit_id,
+        lease_end_date:        r.lease_end_date,
+        days_until_expiration: r.days_until_expiration,
+        risk_score:            r.risk_score !== null ? parseFloat(String(r.risk_score)) : null,
+        days_overdue:          r.days_overdue,
+        delinquency_level:     r.delinquency_level,
+        expiration_risk:       r.expiration_risk,
+      })),
+    });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`[${SERVICE_NAME}] GET /api/v1/insights/lease-expiration-risk error:`, message);
+    res.status(500).json({ success: false, error: message });
+  } finally {
+    if (sql) await sql.end();
+  }
+});
+
 // ── API v1 root ───────────────────────────────────────────────────────────────
 app.get("/api/v1", (_req: Request, res: Response) => {
   res.status(200).json({
@@ -1251,6 +1429,7 @@ app.get("/api/v1", (_req: Request, res: Response) => {
       "GET  /api/v1/occupancy",
       "GET  /api/v1/turnover",
       "GET  /api/v1/insights/at-risk-revenue",
+      "GET  /api/v1/insights/lease-expiration-risk",
     ],
   });
 });
