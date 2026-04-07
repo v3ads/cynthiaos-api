@@ -92,6 +92,38 @@ function mapDelinquencyRow(r: GoldDelinquencyRecord) {
   };
 }
 
+interface GoldAgedReceivable {
+  id: string;
+  bronze_report_id: string | null;
+  tenant_id: string;
+  unit_id: string;
+  total_balance: string;
+  bucket_0_30: string;
+  bucket_31_60: string;
+  bucket_61_90: string;
+  bucket_90_plus: string;
+  dominant_bucket: string;
+  risk_score: string;
+  created_at: Date;
+}
+
+function mapARRow(r: GoldAgedReceivable) {
+  return {
+    id: r.id,
+    bronze_report_id: r.bronze_report_id,
+    tenant_id: r.tenant_id,
+    unit_id: r.unit_id,
+    total_balance:  parseFloat(r.total_balance),
+    bucket_0_30:    parseFloat(r.bucket_0_30),
+    bucket_31_60:   parseFloat(r.bucket_31_60),
+    bucket_61_90:   parseFloat(r.bucket_61_90),
+    bucket_90_plus: parseFloat(r.bucket_90_plus),
+    dominant_bucket: r.dominant_bucket,
+    risk_score:     parseFloat(r.risk_score),
+    created_at: r.created_at,
+  };
+}
+
 function toDateStr(val: unknown): string | null {
   if (!val) return null;
   if (val instanceof Date) return val.toISOString().slice(0, 10);
@@ -366,6 +398,73 @@ app.put("/api/v1/leases/:id/actions", async (req: Request, res: Response) => {
   }
 });
 
+// ── GET /api/v1/aged-receivables ─────────────────────────────────────────────
+// Returns aged receivables records from the Gold layer.
+// Supports pagination (limit/offset), optional dominant_bucket filter,
+// and sorts by risk_score DESC by default.
+app.get("/api/v1/aged-receivables", async (req: Request, res: Response) => {
+  let sql: postgres.Sql | null = null;
+  try {
+    const limit          = Math.min(parseInt(String(req.query.limit  ?? "100"), 10), 500);
+    const offset         = Math.max(parseInt(String(req.query.offset ?? "0"),   10), 0);
+    const dominantBucket = typeof req.query.dominant_bucket === "string" ? req.query.dominant_bucket : null;
+
+    sql = getDb();
+
+    const rows = dominantBucket
+      ? await sql<GoldAgedReceivable[]>`
+          SELECT id, bronze_report_id, tenant_id, unit_id,
+                 total_balance::text  AS total_balance,
+                 bucket_0_30::text    AS bucket_0_30,
+                 bucket_31_60::text   AS bucket_31_60,
+                 bucket_61_90::text   AS bucket_61_90,
+                 bucket_90_plus::text AS bucket_90_plus,
+                 dominant_bucket, risk_score::text AS risk_score, created_at
+          FROM gold_aged_receivables
+          WHERE dominant_bucket = ${dominantBucket}
+          ORDER BY risk_score::numeric DESC
+          LIMIT ${limit} OFFSET ${offset}
+        `
+      : await sql<GoldAgedReceivable[]>`
+          SELECT id, bronze_report_id, tenant_id, unit_id,
+                 total_balance::text  AS total_balance,
+                 bucket_0_30::text    AS bucket_0_30,
+                 bucket_31_60::text   AS bucket_31_60,
+                 bucket_61_90::text   AS bucket_61_90,
+                 bucket_90_plus::text AS bucket_90_plus,
+                 dominant_bucket, risk_score::text AS risk_score, created_at
+          FROM gold_aged_receivables
+          ORDER BY risk_score::numeric DESC
+          LIMIT ${limit} OFFSET ${offset}
+        `;
+
+    const countRes = dominantBucket
+      ? await sql<{ count: string }[]>`
+          SELECT COUNT(*) AS count FROM gold_aged_receivables WHERE dominant_bucket = ${dominantBucket}
+        `
+      : await sql<{ count: string }[]>`
+          SELECT COUNT(*) AS count FROM gold_aged_receivables
+        `;
+
+    const total = parseInt(countRes[0].count, 10);
+
+    res.status(200).json({
+      success: true,
+      total,
+      limit,
+      offset,
+      dominant_bucket_filter: dominantBucket,
+      data: rows.map(mapARRow),
+    });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`[${SERVICE_NAME}] GET /api/v1/aged-receivables error:`, message);
+    res.status(500).json({ success: false, error: message });
+  } finally {
+    if (sql) await sql.end();
+  }
+});
+
 // ── GET /api/v1/delinquency ──────────────────────────────────────────────────
 // Returns delinquency records from the Gold layer.
 // Supports pagination (limit/offset) and sorts by highest balance_due by default.
@@ -448,6 +547,7 @@ app.get("/api/v1", (_req: Request, res: Response) => {
       "GET  /api/v1/leases/:id/actions",
       "PUT  /api/v1/leases/:id/actions",
       "GET  /api/v1/delinquency",
+      "GET  /api/v1/aged-receivables",
     ],
   });
 });
