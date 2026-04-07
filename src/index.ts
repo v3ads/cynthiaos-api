@@ -1804,6 +1804,136 @@ app.get("/api/v1/insights/collections-risk", async (req: Request, res: Response)
     if (sql) await sql.end();
   }
 });
+// ── GET /api/v1/insights/turnover-velocity ─────────────────────────────────
+interface TurnoverUnitRow {
+  unit_id:            string;
+  number_of_move_ins: string;
+  number_of_move_outs: string;
+  turnover_count:     string;
+  first_event_date:   string | null;
+  last_event_date:    string | null;
+}
+
+interface PortfolioRow {
+  total_turnover_events: string;
+  units_with_turnover:   string;
+  total_units_tracked:   string;
+}
+
+app.get("/api/v1/insights/turnover-velocity", async (req: Request, res: Response) => {
+  let sql: ReturnType<typeof getDb> | null = null;
+  try {
+    const limit  = Math.min(parseInt(String(req.query.limit  ?? "20"), 10), 100);
+    const offset = parseInt(String(req.query.offset ?? "0"),  10);
+
+    sql = getDb();
+
+    // Per-unit turnover stats
+    const unitQuery = sql<TurnoverUnitRow[]>`
+      SELECT
+        unit_id,
+        COUNT(*) FILTER (WHERE event_type = 'move_in')  AS number_of_move_ins,
+        COUNT(*) FILTER (WHERE event_type = 'move_out') AS number_of_move_outs,
+        COUNT(*)                                         AS turnover_count,
+        MIN(COALESCE(move_in_date, move_out_date))::text AS first_event_date,
+        MAX(COALESCE(move_in_date, move_out_date))::text AS last_event_date
+      FROM gold_unit_turnover
+      GROUP BY unit_id
+      ORDER BY turnover_count DESC, unit_id ASC
+      LIMIT ${limit} OFFSET ${offset}
+    `;
+
+    // Portfolio-level aggregates
+    const portfolioQuery = sql<PortfolioRow[]>`
+      SELECT
+        COUNT(*)::text                    AS total_turnover_events,
+        COUNT(DISTINCT unit_id)::text     AS units_with_turnover,
+        (SELECT COUNT(DISTINCT unit_id) FROM gold_unit_turnover)::text AS total_units_tracked
+      FROM gold_unit_turnover
+    `;
+
+    // Total units for pagination
+    const countQuery = sql<{ count: string }[]>`
+      SELECT COUNT(DISTINCT unit_id)::text AS count FROM gold_unit_turnover
+    `;
+
+    const [unitRows, portfolioRows, countRows] = await Promise.all([
+      unitQuery, portfolioQuery, countQuery
+    ]);
+
+    const total = parseInt(countRows[0]?.count ?? "0", 10);
+    const portfolio = portfolioRows[0] ?? {
+      total_turnover_events: "0",
+      units_with_turnover: "0",
+      total_units_tracked: "0",
+    };
+
+    const totalEvents   = parseInt(portfolio.total_turnover_events, 10);
+    const unitsTracked  = parseInt(portfolio.total_units_tracked, 10);
+    const avgTurnoverPerUnit = unitsTracked > 0
+      ? parseFloat((totalEvents / unitsTracked).toFixed(2))
+      : 0;
+
+    // Derive stability_score and classification per unit
+    const maxTurnover = unitRows.length > 0
+      ? Math.max(...unitRows.map((r) => parseInt(String(r.turnover_count), 10)))
+      : 1;
+
+    const units = unitRows.map((r) => {
+      const tc = parseInt(String(r.turnover_count), 10);
+      // stability_score: 100 = no turnover, 0 = highest turnover in portfolio
+      const stabilityScore = maxTurnover > 0
+        ? Math.round(Math.max(0, 100 - (tc / maxTurnover) * 100))
+        : 100;
+      const classification =
+        stabilityScore >= 70 ? "Stable" :
+        stabilityScore >= 40 ? "Moderate" :
+        "High Churn";
+
+      return {
+        unit_id:             r.unit_id,
+        number_of_move_ins:  parseInt(String(r.number_of_move_ins), 10),
+        number_of_move_outs: parseInt(String(r.number_of_move_outs), 10),
+        turnover_count:      tc,
+        first_event_date:    r.first_event_date,
+        last_event_date:     r.last_event_date,
+        stability_score:     stabilityScore,
+        classification,
+      };
+    });
+
+    // Portfolio stability score = avg of unit stability scores
+    const portfolioStabilityScore = units.length > 0
+      ? Math.round(units.reduce((sum, u) => sum + u.stability_score, 0) / units.length)
+      : 100;
+    const portfolioClassification =
+      portfolioStabilityScore >= 70 ? "Stable" :
+      portfolioStabilityScore >= 40 ? "Moderate" :
+      "High Churn";
+
+    res.status(200).json({
+      success: true,
+      total,
+      limit,
+      offset,
+      portfolio: {
+        total_turnover_events: totalEvents,
+        units_with_turnover:   parseInt(portfolio.units_with_turnover, 10),
+        total_units_tracked:   unitsTracked,
+        avg_turnover_per_unit: avgTurnoverPerUnit,
+        stability_score:       portfolioStabilityScore,
+        classification:        portfolioClassification,
+      },
+      data: units,
+    });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`[${SERVICE_NAME}] GET /api/v1/insights/turnover-velocity error:`, message);
+    res.status(500).json({ success: false, error: message });
+  } finally {
+    if (sql) await sql.end();
+  }
+});
 // ── API v1 root ───────────────────────────────────────────────────────────────
 app.get("/api/v1", (_req: Request, res: Response) => {
   res.status(200).json({
@@ -1826,6 +1956,7 @@ app.get("/api/v1", (_req: Request, res: Response) => {
       "GET  /api/v1/insights/lease-expiration-risk",
       "GET  /api/v1/insights/portfolio-health",
       "GET  /api/v1/insights/collections-risk",
+      "GET  /api/v1/insights/turnover-velocity",
     ],
   });
 });
