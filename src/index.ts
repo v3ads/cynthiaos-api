@@ -784,6 +784,117 @@ app.get("/api/v1/tenants", async (req: Request, res: Response) => {
   }
 });
 
+// ── GET /api/v1/occupancy ───────────────────────────────────────────────────────
+
+interface GoldOccupancySnapshot {
+  id:               string;
+  bronze_report_id: string | null;
+  report_date:      string;
+  total_units:      string;
+  occupied_units:   string;
+  vacant_units:     string;
+  occupancy_rate:   string | null;
+  vacancy_rate:     string | null;
+  created_at:       Date;
+}
+
+function mapOccRow(r: GoldOccupancySnapshot) {
+  return {
+    id:               r.id,
+    bronze_report_id: r.bronze_report_id,
+    report_date:      r.report_date,
+    total_units:      parseInt(r.total_units, 10),
+    occupied_units:   parseInt(r.occupied_units, 10),
+    vacant_units:     parseInt(r.vacant_units, 10),
+    occupancy_rate:   r.occupancy_rate !== null ? parseFloat(r.occupancy_rate) : null,
+    vacancy_rate:     r.vacancy_rate   !== null ? parseFloat(r.vacancy_rate)   : null,
+    created_at:       r.created_at,
+  };
+}
+
+app.get("/api/v1/occupancy", async (req: Request, res: Response) => {
+  let sql: ReturnType<typeof getDb> | null = null;
+  try {
+    const limit    = Math.min(parseInt(String(req.query.limit  ?? "100"), 10), 500);
+    const offset   = Math.max(parseInt(String(req.query.offset ?? "0"),   10), 0);
+    const dateFrom = typeof req.query.date_from === "string" ? req.query.date_from.trim() : null;
+    const dateTo   = typeof req.query.date_to   === "string" ? req.query.date_to.trim()   : null;
+
+    sql = getDb();
+    let rows: GoldOccupancySnapshot[];
+    let countRes: { count: string }[];
+
+    if (dateFrom && dateTo) {
+      rows = await sql<GoldOccupancySnapshot[]>`
+        SELECT id, bronze_report_id, report_date::text AS report_date,
+               total_units, occupied_units, vacant_units,
+               occupancy_rate, vacancy_rate, created_at
+        FROM gold_occupancy_snapshots
+        WHERE report_date >= ${dateFrom}::date AND report_date <= ${dateTo}::date
+        ORDER BY report_date DESC
+        LIMIT ${limit} OFFSET ${offset}
+      `;
+      countRes = await sql<{ count: string }[]>`
+        SELECT COUNT(*) AS count FROM gold_occupancy_snapshots
+        WHERE report_date >= ${dateFrom}::date AND report_date <= ${dateTo}::date
+      `;
+    } else if (dateFrom) {
+      rows = await sql<GoldOccupancySnapshot[]>`
+        SELECT id, bronze_report_id, report_date::text AS report_date,
+               total_units, occupied_units, vacant_units,
+               occupancy_rate, vacancy_rate, created_at
+        FROM gold_occupancy_snapshots
+        WHERE report_date >= ${dateFrom}::date
+        ORDER BY report_date DESC
+        LIMIT ${limit} OFFSET ${offset}
+      `;
+      countRes = await sql<{ count: string }[]>`
+        SELECT COUNT(*) AS count FROM gold_occupancy_snapshots WHERE report_date >= ${dateFrom}::date
+      `;
+    } else if (dateTo) {
+      rows = await sql<GoldOccupancySnapshot[]>`
+        SELECT id, bronze_report_id, report_date::text AS report_date,
+               total_units, occupied_units, vacant_units,
+               occupancy_rate, vacancy_rate, created_at
+        FROM gold_occupancy_snapshots
+        WHERE report_date <= ${dateTo}::date
+        ORDER BY report_date DESC
+        LIMIT ${limit} OFFSET ${offset}
+      `;
+      countRes = await sql<{ count: string }[]>`
+        SELECT COUNT(*) AS count FROM gold_occupancy_snapshots WHERE report_date <= ${dateTo}::date
+      `;
+    } else {
+      rows = await sql<GoldOccupancySnapshot[]>`
+        SELECT id, bronze_report_id, report_date::text AS report_date,
+               total_units, occupied_units, vacant_units,
+               occupancy_rate, vacancy_rate, created_at
+        FROM gold_occupancy_snapshots
+        ORDER BY report_date DESC
+        LIMIT ${limit} OFFSET ${offset}
+      `;
+      countRes = await sql<{ count: string }[]>`SELECT COUNT(*) AS count FROM gold_occupancy_snapshots`;
+    }
+
+    const total = parseInt(countRes[0].count, 10);
+    res.status(200).json({
+      success: true,
+      total,
+      limit,
+      offset,
+      date_from_filter: dateFrom,
+      date_to_filter:   dateTo,
+      data: rows.map(mapOccRow),
+    });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`[${SERVICE_NAME}] GET /api/v1/occupancy error:`, message);
+    res.status(500).json({ success: false, error: message });
+  } finally {
+    if (sql) await sql.end();
+  }
+});
+
 // ── API v1 root ───────────────────────────────────────────────────────────────
 app.get("/api/v1", (_req: Request, res: Response) => {
   res.status(200).json({
@@ -800,6 +911,7 @@ app.get("/api/v1", (_req: Request, res: Response) => {
       "GET  /api/v1/aged-receivables",
       "GET  /api/v1/tenants",
       "GET  /api/v1/income",
+      "GET  /api/v1/occupancy",
     ],
   });
 });
