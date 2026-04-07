@@ -895,6 +895,166 @@ app.get("/api/v1/occupancy", async (req: Request, res: Response) => {
   }
 });
 
+// ── GET /api/v1/turnover ───────────────────────────────────────────────────────
+
+interface GoldUnitTurnover {
+  id:               string;
+  bronze_report_id: string | null;
+  tenant_id:        string;
+  unit_id:          string;
+  move_in_date:     string | null;
+  move_out_date:    string | null;
+  event_type:       string;
+  created_at:       Date;
+}
+
+function mapTurnoverRow(r: GoldUnitTurnover) {
+  return {
+    id:               r.id,
+    bronze_report_id: r.bronze_report_id,
+    tenant_id:        r.tenant_id,
+    unit_id:          r.unit_id,
+    move_in_date:     r.move_in_date,
+    move_out_date:    r.move_out_date,
+    event_type:       r.event_type,
+    created_at:       r.created_at,
+  };
+}
+
+app.get("/api/v1/turnover", async (req: Request, res: Response) => {
+  let sql: ReturnType<typeof getDb> | null = null;
+  try {
+    const limit     = Math.min(parseInt(String(req.query.limit  ?? "100"), 10), 500);
+    const offset    = Math.max(parseInt(String(req.query.offset ?? "0"),   10), 0);
+    const eventType = typeof req.query.event_type === "string" ? req.query.event_type.trim() : null;
+    const dateFrom  = typeof req.query.date_from  === "string" ? req.query.date_from.trim()  : null;
+    const dateTo    = typeof req.query.date_to    === "string" ? req.query.date_to.trim()    : null;
+
+    // Validate event_type if provided
+    if (eventType && eventType !== "move_in" && eventType !== "move_out") {
+      res.status(400).json({ success: false, error: "event_type must be 'move_in' or 'move_out'" });
+      return;
+    }
+
+    sql = getDb();
+
+    // Build WHERE clauses dynamically
+    // We use four query variants to avoid dynamic SQL injection risks:
+    // (event_type filter) x (date range filter)
+    let rows: GoldUnitTurnover[];
+    let countRes: { count: string }[];
+
+    // The effective date column depends on event_type:
+    // move_in  → sort by move_in_date DESC
+    // move_out → sort by move_out_date DESC
+    // both     → sort by GREATEST(move_in_date, move_out_date) DESC
+
+    if (eventType === "move_in" && dateFrom && dateTo) {
+      rows = await sql<GoldUnitTurnover[]>`
+        SELECT id, bronze_report_id, tenant_id, unit_id,
+               move_in_date::text AS move_in_date, move_out_date::text AS move_out_date,
+               event_type, created_at
+        FROM gold_unit_turnover
+        WHERE event_type = 'move_in'
+          AND move_in_date >= ${dateFrom}::date AND move_in_date <= ${dateTo}::date
+        ORDER BY move_in_date DESC NULLS LAST
+        LIMIT ${limit} OFFSET ${offset}
+      `;
+      countRes = await sql<{ count: string }[]>`
+        SELECT COUNT(*) AS count FROM gold_unit_turnover
+        WHERE event_type = 'move_in'
+          AND move_in_date >= ${dateFrom}::date AND move_in_date <= ${dateTo}::date
+      `;
+    } else if (eventType === "move_out" && dateFrom && dateTo) {
+      rows = await sql<GoldUnitTurnover[]>`
+        SELECT id, bronze_report_id, tenant_id, unit_id,
+               move_in_date::text AS move_in_date, move_out_date::text AS move_out_date,
+               event_type, created_at
+        FROM gold_unit_turnover
+        WHERE event_type = 'move_out'
+          AND move_out_date >= ${dateFrom}::date AND move_out_date <= ${dateTo}::date
+        ORDER BY move_out_date DESC NULLS LAST
+        LIMIT ${limit} OFFSET ${offset}
+      `;
+      countRes = await sql<{ count: string }[]>`
+        SELECT COUNT(*) AS count FROM gold_unit_turnover
+        WHERE event_type = 'move_out'
+          AND move_out_date >= ${dateFrom}::date AND move_out_date <= ${dateTo}::date
+      `;
+    } else if (eventType === "move_in") {
+      rows = await sql<GoldUnitTurnover[]>`
+        SELECT id, bronze_report_id, tenant_id, unit_id,
+               move_in_date::text AS move_in_date, move_out_date::text AS move_out_date,
+               event_type, created_at
+        FROM gold_unit_turnover
+        WHERE event_type = 'move_in'
+        ORDER BY move_in_date DESC NULLS LAST
+        LIMIT ${limit} OFFSET ${offset}
+      `;
+      countRes = await sql<{ count: string }[]>`
+        SELECT COUNT(*) AS count FROM gold_unit_turnover WHERE event_type = 'move_in'
+      `;
+    } else if (eventType === "move_out") {
+      rows = await sql<GoldUnitTurnover[]>`
+        SELECT id, bronze_report_id, tenant_id, unit_id,
+               move_in_date::text AS move_in_date, move_out_date::text AS move_out_date,
+               event_type, created_at
+        FROM gold_unit_turnover
+        WHERE event_type = 'move_out'
+        ORDER BY move_out_date DESC NULLS LAST
+        LIMIT ${limit} OFFSET ${offset}
+      `;
+      countRes = await sql<{ count: string }[]>`
+        SELECT COUNT(*) AS count FROM gold_unit_turnover WHERE event_type = 'move_out'
+      `;
+    } else if (dateFrom && dateTo) {
+      rows = await sql<GoldUnitTurnover[]>`
+        SELECT id, bronze_report_id, tenant_id, unit_id,
+               move_in_date::text AS move_in_date, move_out_date::text AS move_out_date,
+               event_type, created_at
+        FROM gold_unit_turnover
+        WHERE COALESCE(move_in_date, move_out_date) >= ${dateFrom}::date
+          AND COALESCE(move_in_date, move_out_date) <= ${dateTo}::date
+        ORDER BY COALESCE(move_in_date, move_out_date) DESC NULLS LAST
+        LIMIT ${limit} OFFSET ${offset}
+      `;
+      countRes = await sql<{ count: string }[]>`
+        SELECT COUNT(*) AS count FROM gold_unit_turnover
+        WHERE COALESCE(move_in_date, move_out_date) >= ${dateFrom}::date
+          AND COALESCE(move_in_date, move_out_date) <= ${dateTo}::date
+      `;
+    } else {
+      rows = await sql<GoldUnitTurnover[]>`
+        SELECT id, bronze_report_id, tenant_id, unit_id,
+               move_in_date::text AS move_in_date, move_out_date::text AS move_out_date,
+               event_type, created_at
+        FROM gold_unit_turnover
+        ORDER BY COALESCE(move_in_date, move_out_date) DESC NULLS LAST
+        LIMIT ${limit} OFFSET ${offset}
+      `;
+      countRes = await sql<{ count: string }[]>`SELECT COUNT(*) AS count FROM gold_unit_turnover`;
+    }
+
+    const total = parseInt(countRes[0].count, 10);
+    res.status(200).json({
+      success:            true,
+      total,
+      limit,
+      offset,
+      event_type_filter:  eventType,
+      date_from_filter:   dateFrom,
+      date_to_filter:     dateTo,
+      data: rows.map(mapTurnoverRow),
+    });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`[${SERVICE_NAME}] GET /api/v1/turnover error:`, message);
+    res.status(500).json({ success: false, error: message });
+  } finally {
+    if (sql) await sql.end();
+  }
+});
+
 // ── API v1 root ───────────────────────────────────────────────────────────────
 app.get("/api/v1", (_req: Request, res: Response) => {
   res.status(200).json({
@@ -912,6 +1072,7 @@ app.get("/api/v1", (_req: Request, res: Response) => {
       "GET  /api/v1/tenants",
       "GET  /api/v1/income",
       "GET  /api/v1/occupancy",
+      "GET  /api/v1/turnover",
     ],
   });
 });
