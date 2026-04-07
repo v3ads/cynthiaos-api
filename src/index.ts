@@ -1055,6 +1055,183 @@ app.get("/api/v1/turnover", async (req: Request, res: Response) => {
   }
 });
 
+// ── GET /api/v1/insights/at-risk-revenue ────────────────────────────────────────────
+//
+// Joins:
+//   gold_aged_receivables  (base)
+//   LEFT JOIN gold_tenants          ON LOWER(TRIM(ar.tenant_id)) = LOWER(TRIM(t.full_name))
+//   LEFT JOIN gold_delinquency_records ON LOWER(TRIM(ar.tenant_id)) = LOWER(TRIM(d.tenant_id))
+//   LEFT JOIN gold_lease_expirations   ON LOWER(TRIM(ar.tenant_id)) = LOWER(TRIM(le.tenant_id))
+//
+// Note: tenant_id is stored as raw name in ar/d/le tables and as normalised key in gold_tenants.
+// The join bridges this by matching ar.tenant_id against t.full_name (case-insensitive).
+
+interface AtRiskRevenueRow {
+  tenant_id:            string;
+  full_name:            string;
+  unit_id:              string;
+  total_balance:        string;
+  risk_score:           string;
+  dominant_bucket:      string | null;
+  delinquency_level:    string | null;
+  days_overdue:         number | null;
+  lease_end_date:       string | null;
+  days_until_expiration: number | null;
+  urgency_level:        string;
+}
+
+app.get("/api/v1/insights/at-risk-revenue", async (req: Request, res: Response) => {
+  let sql: ReturnType<typeof getDb> | null = null;
+  try {
+    const limit         = Math.min(parseInt(String(req.query.limit  ?? "10"),  10), 100);
+    const offset        = Math.max(parseInt(String(req.query.offset ?? "0"),   10), 0);
+    const urgencyFilter = typeof req.query.urgency === "string" ? req.query.urgency.trim().toUpperCase() : null;
+
+    if (urgencyFilter && !["HIGH", "MEDIUM", "LOW"].includes(urgencyFilter)) {
+      res.status(400).json({ success: false, error: "urgency must be HIGH, MEDIUM, or LOW" });
+      return;
+    }
+
+    sql = getDb();
+
+    // ── Core CTE ────────────────────────────────────────────────────────────
+    // Deduplicates each source table to one row per tenant before joining.
+    // Uses LOWER(TRIM()) on both sides to bridge the tenant_id format mismatch.
+
+    const baseQuery = sql<AtRiskRevenueRow[]>`
+      WITH
+      ar_deduped AS (
+        SELECT DISTINCT ON (tenant_id)
+          tenant_id, unit_id,
+          total_balance::numeric   AS total_balance,
+          risk_score::numeric      AS risk_score,
+          dominant_bucket
+        FROM gold_aged_receivables
+        ORDER BY tenant_id, risk_score DESC
+      ),
+      d_deduped AS (
+        SELECT DISTINCT ON (tenant_id)
+          tenant_id, risk_level, days_overdue
+        FROM gold_delinquency_records
+        ORDER BY tenant_id, days_overdue DESC NULLS LAST
+      ),
+      le_deduped AS (
+        SELECT DISTINCT ON (tenant_id)
+          tenant_id,
+          lease_end_date::text AS lease_end_date,
+          days_until_expiration
+        FROM gold_lease_expirations
+        ORDER BY tenant_id, lease_end_date ASC
+      ),
+      t_deduped AS (
+        SELECT DISTINCT ON (full_name)
+          full_name
+        FROM gold_tenants
+        ORDER BY full_name, updated_at DESC
+      ),
+      joined AS (
+        SELECT
+          ar.tenant_id,
+          COALESCE(t.full_name, ar.tenant_id)  AS full_name,
+          ar.unit_id,
+          ar.total_balance,
+          ar.risk_score,
+          ar.dominant_bucket,
+          d.risk_level                         AS delinquency_level,
+          d.days_overdue,
+          le.lease_end_date,
+          le.days_until_expiration,
+          CASE
+            WHEN ar.risk_score >= 5000
+                 AND (le.days_until_expiration IS NULL OR le.days_until_expiration <= 90)
+            THEN 'HIGH'
+            WHEN ar.risk_score >= 2000
+            THEN 'MEDIUM'
+            ELSE 'LOW'
+          END AS urgency_level
+        FROM ar_deduped ar
+        LEFT JOIN t_deduped t
+          ON LOWER(TRIM(ar.tenant_id)) = LOWER(TRIM(t.full_name))
+        LEFT JOIN d_deduped d
+          ON LOWER(TRIM(ar.tenant_id)) = LOWER(TRIM(d.tenant_id))
+        LEFT JOIN le_deduped le
+          ON LOWER(TRIM(ar.tenant_id)) = LOWER(TRIM(le.tenant_id))
+      )
+      SELECT *
+      FROM joined
+      ${urgencyFilter ? sql`WHERE urgency_level = ${urgencyFilter}` : sql``}
+      ORDER BY risk_score DESC, days_until_expiration ASC NULLS LAST
+      LIMIT ${limit} OFFSET ${offset}
+    `;
+
+    const countQuery = sql<{ count: string }[]>`
+      WITH
+      ar_deduped AS (
+        SELECT DISTINCT ON (tenant_id)
+          tenant_id, risk_score::numeric AS risk_score
+        FROM gold_aged_receivables
+        ORDER BY tenant_id, risk_score DESC
+      ),
+      le_deduped AS (
+        SELECT DISTINCT ON (tenant_id)
+          tenant_id, days_until_expiration
+        FROM gold_lease_expirations
+        ORDER BY tenant_id, lease_end_date ASC
+      ),
+      joined AS (
+        SELECT
+          ar.tenant_id,
+          ar.risk_score,
+          le.days_until_expiration,
+          CASE
+            WHEN ar.risk_score >= 5000
+                 AND (le.days_until_expiration IS NULL OR le.days_until_expiration <= 90)
+            THEN 'HIGH'
+            WHEN ar.risk_score >= 2000
+            THEN 'MEDIUM'
+            ELSE 'LOW'
+          END AS urgency_level
+        FROM ar_deduped ar
+        LEFT JOIN le_deduped le
+          ON LOWER(TRIM(ar.tenant_id)) = LOWER(TRIM(le.tenant_id))
+      )
+      SELECT COUNT(*) AS count
+      FROM joined
+      ${urgencyFilter ? sql`WHERE urgency_level = ${urgencyFilter}` : sql``}
+    `;
+
+    const [rows, countRes] = await Promise.all([baseQuery, countQuery]);
+    const total = parseInt(countRes[0].count, 10);
+
+    res.status(200).json({
+      success:        true,
+      total,
+      limit,
+      offset,
+      urgency_filter: urgencyFilter,
+      data: rows.map((r) => ({
+        tenant_id:             r.tenant_id,
+        full_name:             r.full_name,
+        unit_id:               r.unit_id,
+        total_balance:         parseFloat(r.total_balance),
+        risk_score:            parseFloat(r.risk_score),
+        dominant_bucket:       r.dominant_bucket,
+        delinquency_level:     r.delinquency_level,
+        days_overdue:          r.days_overdue,
+        lease_end_date:        r.lease_end_date,
+        days_until_expiration: r.days_until_expiration,
+        urgency_level:         r.urgency_level,
+      })),
+    });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`[${SERVICE_NAME}] GET /api/v1/insights/at-risk-revenue error:`, message);
+    res.status(500).json({ success: false, error: message });
+  } finally {
+    if (sql) await sql.end();
+  }
+});
+
 // ── API v1 root ───────────────────────────────────────────────────────────────
 app.get("/api/v1", (_req: Request, res: Response) => {
   res.status(200).json({
@@ -1073,6 +1250,7 @@ app.get("/api/v1", (_req: Request, res: Response) => {
       "GET  /api/v1/income",
       "GET  /api/v1/occupancy",
       "GET  /api/v1/turnover",
+      "GET  /api/v1/insights/at-risk-revenue",
     ],
   });
 });
