@@ -1067,9 +1067,9 @@ app.get("/api/v1/turnover", async (req: Request, res: Response) => {
 //
 // Joins:
 //   gold_aged_receivables  (base)
-//   LEFT JOIN gold_tenants          ON LOWER(TRIM(ar.tenant_id)) = LOWER(TRIM(t.full_name))
-//   LEFT JOIN gold_delinquency_records ON LOWER(TRIM(ar.tenant_id)) = LOWER(TRIM(d.tenant_id))
-//   LEFT JOIN gold_lease_expirations   ON LOWER(TRIM(ar.tenant_id)) = LOWER(TRIM(le.tenant_id))
+//   LEFT JOIN gold_tenants          ON ar.tenant_id = t.full_name
+//   LEFT JOIN gold_delinquency_records ON ar.tenant_id = d.tenant_id
+//   LEFT JOIN gold_lease_expirations   ON ar.tenant_id = le.tenant_id
 //
 // Note: tenant_id is stored as raw name in ar/d/le tables and as normalised key in gold_tenants.
 // The join bridges this by matching ar.tenant_id against t.full_name (case-insensitive).
@@ -1159,11 +1159,11 @@ app.get("/api/v1/insights/at-risk-revenue", async (req: Request, res: Response) 
           END AS urgency_level
         FROM ar_deduped ar
         LEFT JOIN t_deduped t
-          ON LOWER(TRIM(ar.tenant_id)) = LOWER(TRIM(t.full_name))
+          ON ar.tenant_id = t.full_name
         LEFT JOIN d_deduped d
-          ON LOWER(TRIM(ar.tenant_id)) = LOWER(TRIM(d.tenant_id))
+          ON ar.tenant_id = d.tenant_id
         LEFT JOIN le_deduped le
-          ON LOWER(TRIM(ar.tenant_id)) = LOWER(TRIM(le.tenant_id))
+          ON ar.tenant_id = le.tenant_id
       )
       SELECT *
       FROM joined
@@ -1201,7 +1201,7 @@ app.get("/api/v1/insights/at-risk-revenue", async (req: Request, res: Response) 
           END AS urgency_level
         FROM ar_deduped ar
         LEFT JOIN le_deduped le
-          ON LOWER(TRIM(ar.tenant_id)) = LOWER(TRIM(le.tenant_id))
+          ON ar.tenant_id = le.tenant_id
       )
       SELECT COUNT(*) AS count
       FROM joined
@@ -1243,9 +1243,9 @@ app.get("/api/v1/insights/at-risk-revenue", async (req: Request, res: Response) 
 // ── GET /api/v1/insights/lease-expiration-risk ─────────────────────────────────────────
 //
 // Base: gold_lease_expirations
-// LEFT JOIN gold_tenants          ON LOWER(TRIM(le.tenant_id)) = LOWER(TRIM(t.full_name))
-// LEFT JOIN gold_delinquency_records ON LOWER(TRIM(le.tenant_id)) = LOWER(TRIM(d.tenant_id))
-// LEFT JOIN gold_aged_receivables  ON LOWER(TRIM(le.tenant_id)) = LOWER(TRIM(ar.tenant_id))
+// LEFT JOIN gold_tenants          ON le.tenant_id = t.full_name
+// LEFT JOIN gold_delinquency_records ON le.tenant_id = d.tenant_id
+// LEFT JOIN gold_aged_receivables  ON le.tenant_id = ar.tenant_id
 //
 // expiration_risk derivation:
 //   HIGH   → days_until_expiration <= 60 AND (risk_score >= 2000 OR delinquency_level IS NOT NULL)
@@ -1327,11 +1327,11 @@ app.get("/api/v1/insights/lease-expiration-risk", async (req: Request, res: Resp
           END AS expiration_risk
         FROM le_deduped le
         LEFT JOIN t_deduped t
-          ON LOWER(TRIM(le.tenant_id)) = LOWER(TRIM(t.full_name))
+          ON le.tenant_id = t.full_name
         LEFT JOIN d_deduped d
-          ON LOWER(TRIM(le.tenant_id)) = LOWER(TRIM(d.tenant_id))
+          ON le.tenant_id = d.tenant_id
         LEFT JOIN ar_deduped ar
-          ON LOWER(TRIM(le.tenant_id)) = LOWER(TRIM(ar.tenant_id))
+          ON le.tenant_id = ar.tenant_id
       )
       SELECT *
       FROM joined
@@ -1377,8 +1377,8 @@ app.get("/api/v1/insights/lease-expiration-risk", async (req: Request, res: Resp
             ELSE 'LOW'
           END AS expiration_risk
         FROM le_deduped le
-        LEFT JOIN d_deduped d ON LOWER(TRIM(le.tenant_id)) = LOWER(TRIM(d.tenant_id))
-        LEFT JOIN ar_deduped ar ON LOWER(TRIM(le.tenant_id)) = LOWER(TRIM(ar.tenant_id))
+        LEFT JOIN d_deduped d ON le.tenant_id = d.tenant_id
+        LEFT JOIN ar_deduped ar ON le.tenant_id = ar.tenant_id
       )
       SELECT COUNT(*) AS count
       FROM joined
@@ -1491,7 +1491,7 @@ app.get("/api/v1/insights/portfolio-health", async (_req: Request, res: Response
               ar.risk_score
             FROM gold_lease_expirations le
             LEFT JOIN gold_aged_receivables ar
-              ON LOWER(TRIM(le.tenant_id)) = LOWER(TRIM(ar.tenant_id))
+              ON le.tenant_id = ar.tenant_id
             ORDER BY le.tenant_id, le.lease_end_date ASC
           ) j
           WHERE days_until_expiration <= 60
@@ -1704,9 +1704,9 @@ app.get("/api/v1/insights/collections-risk", async (req: Request, res: Response)
             )
           )) AS collections_risk_score
         FROM ar_deduped ar
-        LEFT JOIN d_deduped  d  ON LOWER(TRIM(ar.tenant_id)) = LOWER(TRIM(d.tenant_id))
-        LEFT JOIN le_deduped le ON LOWER(TRIM(ar.tenant_id)) = LOWER(TRIM(le.tenant_id))
-        LEFT JOIN t_deduped  t  ON LOWER(TRIM(ar.tenant_id)) = LOWER(TRIM(t.full_name))
+        LEFT JOIN d_deduped  d  ON ar.tenant_id = d.tenant_id
+        LEFT JOIN le_deduped le ON ar.tenant_id = le.tenant_id
+        LEFT JOIN t_deduped  t  ON ar.tenant_id = t.full_name
       ),
       classified AS (
         SELECT *,
@@ -1762,8 +1762,8 @@ app.get("/api/v1/insights/collections-risk", async (req: Request, res: Response)
             END, 0)
           )) AS collections_risk_score
         FROM ar_deduped ar
-        LEFT JOIN d_deduped  d  ON LOWER(TRIM(ar.tenant_id)) = LOWER(TRIM(d.tenant_id))
-        LEFT JOIN le_deduped le ON LOWER(TRIM(ar.tenant_id)) = LOWER(TRIM(le.tenant_id))
+        LEFT JOIN d_deduped  d  ON ar.tenant_id = d.tenant_id
+        LEFT JOIN le_deduped le ON ar.tenant_id = le.tenant_id
       ),
       classified AS (
         SELECT CASE
