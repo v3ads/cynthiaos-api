@@ -1410,6 +1410,186 @@ app.get("/api/v1/insights/lease-expiration-risk", async (req: Request, res: Resp
   }
 });
 
+// ── GET /api/v1/insights/portfolio-health ────────────────────────────────────
+interface PortfolioHealthRow {
+  occupancy_rate:        string | null;
+  vacancy_rate:          string | null;
+  net_operating_income:  string | null;
+  profit_margin:         string | null;
+  total_delinquency:     string | null;
+  avg_risk_score:        string | null;
+  high_expiration_count: string | null;
+}
+
+app.get("/api/v1/insights/portfolio-health", async (_req: Request, res: Response) => {
+  let sql: ReturnType<typeof getDb> | null = null;
+  try {
+    sql = getDb();
+
+    // Gather all signals in a single query using subqueries
+    const [row] = await sql<PortfolioHealthRow[]>`
+      SELECT
+        -- Occupancy: latest snapshot
+        (
+          SELECT occupancy_rate::text
+          FROM gold_occupancy_snapshots
+          ORDER BY report_date DESC, created_at DESC
+          LIMIT 1
+        ) AS occupancy_rate,
+        (
+          SELECT vacancy_rate::text
+          FROM gold_occupancy_snapshots
+          ORDER BY report_date DESC, created_at DESC
+          LIMIT 1
+        ) AS vacancy_rate,
+        -- Financial: latest income statement
+        (
+          SELECT net_operating_income::text
+          FROM gold_income_statements
+          ORDER BY report_date DESC, created_at DESC
+          LIMIT 1
+        ) AS net_operating_income,
+        (
+          SELECT profit_margin::text
+          FROM gold_income_statements
+          ORDER BY report_date DESC, created_at DESC
+          LIMIT 1
+        ) AS profit_margin,
+        -- Risk: total delinquency balance (latest per tenant)
+        (
+          SELECT COALESCE(SUM(balance_due), 0)::text
+          FROM (
+            SELECT DISTINCT ON (tenant_id) balance_due
+            FROM gold_delinquency_records
+            ORDER BY tenant_id, created_at DESC
+          ) d
+        ) AS total_delinquency,
+        -- Risk: avg risk score (latest per tenant)
+        (
+          SELECT COALESCE(AVG(risk_score), 0)::text
+          FROM (
+            SELECT DISTINCT ON (tenant_id) risk_score
+            FROM gold_aged_receivables
+            ORDER BY tenant_id, risk_score DESC, created_at DESC
+          ) ar
+        ) AS avg_risk_score,
+        -- Risk: count of HIGH expiration-risk leases (within 60 days, with financial risk)
+        (
+          SELECT COUNT(*)::text
+          FROM (
+            SELECT DISTINCT ON (le.tenant_id)
+              le.tenant_id,
+              le.days_until_expiration,
+              ar.risk_score
+            FROM gold_lease_expirations le
+            LEFT JOIN gold_aged_receivables ar
+              ON LOWER(TRIM(le.tenant_id)) = LOWER(TRIM(ar.tenant_id))
+            ORDER BY le.tenant_id, le.lease_end_date ASC
+          ) j
+          WHERE days_until_expiration <= 60
+            AND (risk_score >= 2000 OR risk_score IS NOT NULL)
+        ) AS high_expiration_count
+    `;
+
+    // ── Parse raw values ────────────────────────────────────────────────────
+    const occupancyRate   = row.occupancy_rate   !== null ? parseFloat(row.occupancy_rate)   : null;
+    const vacancyRate     = row.vacancy_rate      !== null ? parseFloat(row.vacancy_rate)     : null;
+    const noi             = row.net_operating_income !== null ? parseFloat(row.net_operating_income) : null;
+    const profitMargin    = row.profit_margin     !== null ? parseFloat(row.profit_margin)    : null;
+    const totalDelinquency = parseFloat(row.total_delinquency ?? "0");
+    const avgRiskScore    = parseFloat(row.avg_risk_score ?? "0");
+    const highExpCount    = parseInt(row.high_expiration_count ?? "0", 10);
+
+    // ── Component scores (0–100) ────────────────────────────────────────────
+    // Occupancy health: 100 = full occupancy, scales linearly
+    // 95%+ → 100, 80% → 50, <60% → 0
+    let occupancyHealth: number;
+    if (occupancyRate === null) {
+      occupancyHealth = 50; // no data → neutral
+    } else {
+      const rate = Math.max(0, Math.min(1, occupancyRate));
+      occupancyHealth = Math.round(Math.max(0, Math.min(100, (rate - 0.6) / 0.35 * 100)));
+    }
+
+    // Financial health: based on profit_margin (0–1 range)
+    // 30%+ margin → 100, 0% → 50, negative → 0
+    let financialHealth: number;
+    if (profitMargin === null && noi === null) {
+      financialHealth = 50; // no data → neutral
+    } else if (profitMargin !== null) {
+      financialHealth = Math.round(Math.max(0, Math.min(100, (profitMargin / 0.3) * 100)));
+    } else {
+      // NOI only — positive = 60, negative = 20
+      financialHealth = noi! > 0 ? 60 : 20;
+    }
+
+    // Risk health: penalise for delinquency and high-risk aged receivables
+    // avg_risk_score 0 → 100, 10000+ → 0
+    // total_delinquency 0 → bonus, 10000+ → heavy penalty
+    // high_expiration_count 0 → no penalty, each +1 → -10
+    const riskFromAR      = Math.max(0, 100 - (avgRiskScore / 100));
+    const riskFromDelinq  = Math.max(0, 100 - (totalDelinquency / 100));
+    const riskFromExpiry  = Math.max(0, 100 - highExpCount * 10);
+    const riskHealth      = Math.round(Math.min(100, (riskFromAR * 0.4 + riskFromDelinq * 0.4 + riskFromExpiry * 0.2)));
+
+    // ── Portfolio health score (weighted average) ───────────────────────────
+    const portfolioScore = Math.round(
+      financialHealth * 0.4 +
+      occupancyHealth * 0.3 +
+      riskHealth      * 0.3
+    );
+
+    // ── Classification ─────────────────────────────────────────────────────
+    let classification: string;
+    if      (portfolioScore >= 80) classification = "Excellent";
+    else if (portfolioScore >= 60) classification = "Stable";
+    else if (portfolioScore >= 40) classification = "Warning";
+    else                           classification = "Critical";
+
+    res.status(200).json({
+      success: true,
+      portfolio_health_score: portfolioScore,
+      classification,
+      breakdown: {
+        financial: {
+          score:       financialHealth,
+          weight:      "40%",
+          description: "Derived from profit margin and NOI",
+        },
+        occupancy: {
+          score:       occupancyHealth,
+          weight:      "30%",
+          description: "Derived from latest occupancy snapshot",
+        },
+        risk: {
+          score:       riskHealth,
+          weight:      "30%",
+          description: "Derived from aged receivables risk score, delinquency balance, and high-risk expirations",
+        },
+      },
+      supporting_metrics: {
+        occupancy_rate:         occupancyRate,
+        vacancy_rate:           vacancyRate,
+        net_operating_income:   noi,
+        profit_margin:          profitMargin,
+        total_delinquency_balance: totalDelinquency,
+        avg_aged_receivables_risk_score: avgRiskScore,
+        high_expiration_risk_count: highExpCount,
+      },
+      data_availability: {
+        occupancy_data:  occupancyRate !== null,
+        financial_data:  noi !== null || profitMargin !== null,
+        risk_data:       totalDelinquency > 0 || avgRiskScore > 0,
+      },
+    });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`[${SERVICE_NAME}] GET /api/v1/insights/portfolio-health error:`, message);
+    res.status(500).json({ success: false, error: message });
+  } finally {
+    if (sql) await sql.end();
+  }
+});
 // ── API v1 root ───────────────────────────────────────────────────────────────
 app.get("/api/v1", (_req: Request, res: Response) => {
   res.status(200).json({
@@ -1430,6 +1610,7 @@ app.get("/api/v1", (_req: Request, res: Response) => {
       "GET  /api/v1/turnover",
       "GET  /api/v1/insights/at-risk-revenue",
       "GET  /api/v1/insights/lease-expiration-risk",
+      "GET  /api/v1/insights/portfolio-health",
     ],
   });
 });
