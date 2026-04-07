@@ -1067,7 +1067,7 @@ app.get("/api/v1/turnover", async (req: Request, res: Response) => {
 //
 // Joins:
 //   gold_aged_receivables  (base)
-//   LEFT JOIN gold_tenants          ON ar.tenant_id = t.full_name
+//   LEFT JOIN gold_tenants          ON ar.tenant_id = t.tenant_id
 //   LEFT JOIN gold_delinquency_records ON ar.tenant_id = d.tenant_id
 //   LEFT JOIN gold_lease_expirations   ON ar.tenant_id = le.tenant_id
 //
@@ -1132,10 +1132,10 @@ app.get("/api/v1/insights/at-risk-revenue", async (req: Request, res: Response) 
         ORDER BY tenant_id, lease_end_date ASC
       ),
       t_deduped AS (
-        SELECT DISTINCT ON (full_name)
-          full_name
+        SELECT DISTINCT ON (tenant_id)
+          tenant_id, full_name
         FROM gold_tenants
-        ORDER BY full_name, updated_at DESC
+        ORDER BY tenant_id, updated_at DESC
       ),
       joined AS (
         SELECT
@@ -1159,7 +1159,7 @@ app.get("/api/v1/insights/at-risk-revenue", async (req: Request, res: Response) 
           END AS urgency_level
         FROM ar_deduped ar
         LEFT JOIN t_deduped t
-          ON ar.tenant_id = t.full_name
+          ON ar.tenant_id = t.tenant_id
         LEFT JOIN d_deduped d
           ON ar.tenant_id = d.tenant_id
         LEFT JOIN le_deduped le
@@ -1243,7 +1243,7 @@ app.get("/api/v1/insights/at-risk-revenue", async (req: Request, res: Response) 
 // ── GET /api/v1/insights/lease-expiration-risk ─────────────────────────────────────────
 //
 // Base: gold_lease_expirations
-// LEFT JOIN gold_tenants          ON le.tenant_id = t.full_name
+// LEFT JOIN gold_tenants          ON le.tenant_id = t.tenant_id
 // LEFT JOIN gold_delinquency_records ON le.tenant_id = d.tenant_id
 // LEFT JOIN gold_aged_receivables  ON le.tenant_id = ar.tenant_id
 //
@@ -1290,10 +1290,10 @@ app.get("/api/v1/insights/lease-expiration-risk", async (req: Request, res: Resp
         ORDER BY tenant_id, lease_end_date ASC, created_at DESC
       ),
       t_deduped AS (
-        SELECT DISTINCT ON (full_name)
-          full_name
+        SELECT DISTINCT ON (tenant_id)
+          tenant_id, full_name
         FROM gold_tenants
-        ORDER BY full_name, updated_at DESC
+        ORDER BY tenant_id, updated_at DESC
       ),
       d_deduped AS (
         SELECT DISTINCT ON (tenant_id)
@@ -1327,7 +1327,7 @@ app.get("/api/v1/insights/lease-expiration-risk", async (req: Request, res: Resp
           END AS expiration_risk
         FROM le_deduped le
         LEFT JOIN t_deduped t
-          ON le.tenant_id = t.full_name
+          ON le.tenant_id = t.tenant_id
         LEFT JOIN d_deduped d
           ON le.tenant_id = d.tenant_id
         LEFT JOIN ar_deduped ar
@@ -1661,10 +1661,10 @@ app.get("/api/v1/insights/collections-risk", async (req: Request, res: Response)
         ORDER BY tenant_id, lease_end_date ASC, created_at DESC
       ),
       t_deduped AS (
-        SELECT DISTINCT ON (full_name)
-          full_name
+        SELECT DISTINCT ON (tenant_id)
+          tenant_id, full_name
         FROM gold_tenants
-        ORDER BY full_name, updated_at DESC
+        ORDER BY tenant_id, updated_at DESC
       ),
       joined AS (
         SELECT
@@ -1706,7 +1706,7 @@ app.get("/api/v1/insights/collections-risk", async (req: Request, res: Response)
         FROM ar_deduped ar
         LEFT JOIN d_deduped  d  ON ar.tenant_id = d.tenant_id
         LEFT JOIN le_deduped le ON ar.tenant_id = le.tenant_id
-        LEFT JOIN t_deduped  t  ON ar.tenant_id = t.full_name
+        LEFT JOIN t_deduped  t  ON ar.tenant_id = t.tenant_id
       ),
       classified AS (
         SELECT *,
