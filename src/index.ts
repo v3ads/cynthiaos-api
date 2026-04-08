@@ -186,12 +186,18 @@ app.get("/api/v1/leases/expirations", async (req: Request, res: Response) => {
           AND elem->>'Rent' IS NOT NULL
       ),
       tenant_lookup AS (
-        SELECT DISTINCT ON (tenant_id)
-          tenant_id, email AS contact_email,
-          REGEXP_REPLACE(phone, '^(Mobile|Phone|Home|Work|Fax):\s*', '', 'i') AS contact_phone
-        FROM gold_tenants
-        WHERE tenant_id IS NOT NULL
-        ORDER BY tenant_id, updated_at DESC NULLS LAST
+        WITH latest_td AS (SELECT MAX(report_date) AS dt FROM bronze_appfolio_reports WHERE report_type = 'tenant_directory')
+        SELECT DISTINCT ON (LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g')))
+          LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g'))       AS unit_id,
+          NULLIF(TRIM(elem->>'Emails'), '')                                      AS contact_email,
+          NULLIF(REGEXP_REPLACE(TRIM(COALESCE(elem->>'PhoneNumbers', '')),
+            '^(Mobile|Phone|Home|Work|Fax):\s*', '', 'i'), '')                  AS contact_phone
+        FROM bronze_appfolio_reports b,
+             jsonb_array_elements(b.raw_data->'results') AS elem,
+             latest_td
+        WHERE b.report_type = 'tenant_directory' AND b.report_date = latest_td.dt
+          AND elem->>'Status' NOT ILIKE '%vacant%'
+          AND elem->>'Unit' IS NOT NULL
       )
       SELECT le.id, le.bronze_report_id, le.tenant_id, le.unit_id,
              le.lease_start_date::text AS lease_start_date,
@@ -202,8 +208,8 @@ app.get("/api/v1/leases/expirations", async (req: Request, res: Response) => {
              tl.contact_phone,
              le.created_at
       FROM gold_lease_expirations le
-      LEFT JOIN rent_lookup   rl ON rl.unit_id  = le.unit_id
-      LEFT JOIN tenant_lookup tl ON tl.tenant_id = le.tenant_id
+      LEFT JOIN rent_lookup   rl ON rl.unit_id = le.unit_id
+      LEFT JOIN tenant_lookup tl ON tl.unit_id = le.unit_id
       ORDER BY le.lease_end_date ASC NULLS LAST
       LIMIT ${limit} OFFSET ${offset}
     `;
@@ -238,12 +244,18 @@ app.get("/api/v1/leases/expiring-soon", async (req: Request, res: Response) => {
           AND elem->>'Rent' IS NOT NULL
       ),
       tenant_lookup AS (
-        SELECT DISTINCT ON (tenant_id)
-          tenant_id, email AS contact_email,
-          REGEXP_REPLACE(phone, '^(Mobile|Phone|Home|Work|Fax):\s*', '', 'i') AS contact_phone
-        FROM gold_tenants
-        WHERE tenant_id IS NOT NULL
-        ORDER BY tenant_id, updated_at DESC NULLS LAST
+        WITH latest_td AS (SELECT MAX(report_date) AS dt FROM bronze_appfolio_reports WHERE report_type = 'tenant_directory')
+        SELECT DISTINCT ON (LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g')))
+          LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g'))       AS unit_id,
+          NULLIF(TRIM(elem->>'Emails'), '')                                      AS contact_email,
+          NULLIF(REGEXP_REPLACE(TRIM(COALESCE(elem->>'PhoneNumbers', '')),
+            '^(Mobile|Phone|Home|Work|Fax):\s*', '', 'i'), '')                  AS contact_phone
+        FROM bronze_appfolio_reports b,
+             jsonb_array_elements(b.raw_data->'results') AS elem,
+             latest_td
+        WHERE b.report_type = 'tenant_directory' AND b.report_date = latest_td.dt
+          AND elem->>'Status' NOT ILIKE '%vacant%'
+          AND elem->>'Unit' IS NOT NULL
       )
       SELECT le.id, le.bronze_report_id, le.tenant_id, le.unit_id,
              le.lease_start_date::text AS lease_start_date,
@@ -254,8 +266,8 @@ app.get("/api/v1/leases/expiring-soon", async (req: Request, res: Response) => {
              tl.contact_phone,
              le.created_at
       FROM gold_lease_expirations le
-      LEFT JOIN rent_lookup   rl ON rl.unit_id  = le.unit_id
-      LEFT JOIN tenant_lookup tl ON tl.tenant_id = le.tenant_id
+      LEFT JOIN rent_lookup   rl ON rl.unit_id = le.unit_id
+      LEFT JOIN tenant_lookup tl ON tl.unit_id = le.unit_id
       WHERE le.lease_end_date IS NOT NULL
         AND le.lease_end_date >= CURRENT_DATE
         AND (le.lease_end_date - CURRENT_DATE) <= ${days}
@@ -300,12 +312,18 @@ app.get("/api/v1/leases/upcoming-renewals", async (req: Request, res: Response) 
           AND elem->>'Rent' IS NOT NULL
       ),
       tenant_lookup AS (
-        SELECT DISTINCT ON (tenant_id)
-          tenant_id, email AS contact_email,
-          REGEXP_REPLACE(phone, '^(Mobile|Phone|Home|Work|Fax):\s*', '', 'i') AS contact_phone
-        FROM gold_tenants
-        WHERE tenant_id IS NOT NULL
-        ORDER BY tenant_id, updated_at DESC NULLS LAST
+        WITH latest_td AS (SELECT MAX(report_date) AS dt FROM bronze_appfolio_reports WHERE report_type = 'tenant_directory')
+        SELECT DISTINCT ON (LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g')))
+          LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g'))       AS unit_id,
+          NULLIF(TRIM(elem->>'Emails'), '')                                      AS contact_email,
+          NULLIF(REGEXP_REPLACE(TRIM(COALESCE(elem->>'PhoneNumbers', '')),
+            '^(Mobile|Phone|Home|Work|Fax):\s*', '', 'i'), '')                  AS contact_phone
+        FROM bronze_appfolio_reports b,
+             jsonb_array_elements(b.raw_data->'results') AS elem,
+             latest_td
+        WHERE b.report_type = 'tenant_directory' AND b.report_date = latest_td.dt
+          AND elem->>'Status' NOT ILIKE '%vacant%'
+          AND elem->>'Unit' IS NOT NULL
       )
       SELECT le.id, le.bronze_report_id, le.tenant_id, le.unit_id,
              le.lease_start_date::text AS lease_start_date,
@@ -316,8 +334,8 @@ app.get("/api/v1/leases/upcoming-renewals", async (req: Request, res: Response) 
              tl.contact_phone,
              le.created_at
       FROM gold_lease_expirations le
-      LEFT JOIN rent_lookup   rl ON rl.unit_id  = le.unit_id
-      LEFT JOIN tenant_lookup tl ON tl.tenant_id = le.tenant_id
+      LEFT JOIN rent_lookup   rl ON rl.unit_id = le.unit_id
+      LEFT JOIN tenant_lookup tl ON tl.unit_id = le.unit_id
       WHERE le.lease_end_date IS NOT NULL
         AND (le.lease_end_date - CURRENT_DATE) > ${fromDays}
         AND (le.lease_end_date - CURRENT_DATE) <= ${toDays}
@@ -366,12 +384,18 @@ app.get("/api/v1/leases/:id", async (req: Request, res: Response) => {
           AND elem->>'Rent' IS NOT NULL
       ),
       tenant_lookup AS (
-        SELECT DISTINCT ON (tenant_id)
-          tenant_id, email AS contact_email,
-          REGEXP_REPLACE(phone, '^(Mobile|Phone|Home|Work|Fax):\s*', '', 'i') AS contact_phone
-        FROM gold_tenants
-        WHERE tenant_id IS NOT NULL
-        ORDER BY tenant_id, updated_at DESC NULLS LAST
+        WITH latest_td AS (SELECT MAX(report_date) AS dt FROM bronze_appfolio_reports WHERE report_type = 'tenant_directory')
+        SELECT DISTINCT ON (LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g')))
+          LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g'))       AS unit_id,
+          NULLIF(TRIM(elem->>'Emails'), '')                                      AS contact_email,
+          NULLIF(REGEXP_REPLACE(TRIM(COALESCE(elem->>'PhoneNumbers', '')),
+            '^(Mobile|Phone|Home|Work|Fax):\s*', '', 'i'), '')                  AS contact_phone
+        FROM bronze_appfolio_reports b,
+             jsonb_array_elements(b.raw_data->'results') AS elem,
+             latest_td
+        WHERE b.report_type = 'tenant_directory' AND b.report_date = latest_td.dt
+          AND elem->>'Status' NOT ILIKE '%vacant%'
+          AND elem->>'Unit' IS NOT NULL
       )
       SELECT le.id, le.bronze_report_id, le.tenant_id, le.unit_id,
              le.lease_start_date::text AS lease_start_date,
@@ -382,8 +406,8 @@ app.get("/api/v1/leases/:id", async (req: Request, res: Response) => {
              tl.contact_phone,
              le.created_at
       FROM gold_lease_expirations le
-      LEFT JOIN rent_lookup   rl ON rl.unit_id  = le.unit_id
-      LEFT JOIN tenant_lookup tl ON tl.tenant_id = le.tenant_id
+      LEFT JOIN rent_lookup   rl ON rl.unit_id = le.unit_id
+      LEFT JOIN tenant_lookup tl ON tl.unit_id = le.unit_id
       WHERE le.id = ${id}
       LIMIT 1
     `;
