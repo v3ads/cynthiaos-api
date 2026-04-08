@@ -2210,6 +2210,23 @@ app.get("/api/v1/insights/unit-intelligence", async (req: Request, res: Response
           AND TRIM(elem->>'UnitName') <> ''
       ),
 
+      -- Tenant name from rent_roll Bronze: one row per unit, always the primary tenant.
+      -- Used as a reliable fallback when gold_tenants has no match (unit_id='unknown').
+      rent_roll_names AS (
+        WITH latest_rr AS (SELECT MAX(report_date) AS dt FROM bronze_appfolio_reports WHERE report_type = 'rent_roll')
+        SELECT DISTINCT ON (LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g')))
+          LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g'))  AS unit_id,
+          INITCAP(TRIM(elem->>'Tenant'))                                    AS tenant_name
+        FROM bronze_appfolio_reports b,
+             jsonb_array_elements(b.raw_data->'results') AS elem,
+             latest_rr
+        WHERE b.report_type = 'rent_roll'
+          AND b.report_date = latest_rr.dt
+          AND elem->>'Tenant' IS NOT NULL
+          AND TRIM(elem->>'Tenant') <> ''
+        ORDER BY LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g'))
+      ),
+
       latest_tenant_per_unit AS (
         SELECT DISTINCT ON (le.unit_id)
           le.unit_id,
@@ -2279,8 +2296,11 @@ app.get("/api/v1/insights/unit-intelligence", async (req: Request, res: Response
           u.unit_id,
           us.unit_status,
           -- Tenant name fallback chain:
-          -- 1. gold_tenants via latest lease  2. gold_tenants via delinquency  3. 'Unknown'
-          COALESCE(lt.tenant_name, d.delinquency_tenant_name, 'Unknown') AS tenant_name,
+          -- 1. gold_tenants via latest lease
+          -- 2. gold_tenants via delinquency tenant_id
+          -- 3. rent_roll Bronze (primary tenant, INITCAP formatted) — covers co-tenant units
+          -- 4. 'Unknown'
+          COALESCE(lt.tenant_name, d.delinquency_tenant_name, rr.tenant_name, 'Unknown') AS tenant_name,
           lt.tenant_id,
           lt.lease_end_date,
           lt.days_until_expiration,
@@ -2298,6 +2318,7 @@ app.get("/api/v1/insights/unit-intelligence", async (req: Request, res: Response
         LEFT JOIN delinquency_agg          d  ON d.unit_id  = u.unit_id
         LEFT JOIN ar_agg                   ar ON ar.unit_id  = u.unit_id
         LEFT JOIN turnover_agg             t  ON t.unit_id   = u.unit_id
+        LEFT JOIN rent_roll_names          rr ON rr.unit_id  = u.unit_id
       ),
 
       scored AS (
