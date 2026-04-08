@@ -54,7 +54,9 @@ interface GoldLeaseExpiration {
   lease_start_date: unknown;
   lease_end_date: unknown;
   days_until_expiration: number | null;
-  monthly_rent: string | null;  // sourced from rent_roll Bronze via rent_lookup CTE
+  monthly_rent: string | null;   // sourced from rent_roll Bronze via rent_lookup CTE
+  contact_email: string | null;  // sourced from gold_tenants via tenant_lookup CTE
+  contact_phone: string | null;  // sourced from gold_tenants via tenant_lookup CTE
   created_at: Date;
 }
 
@@ -148,6 +150,9 @@ function mapRow(r: GoldLeaseExpiration) {
     monthly_rent: r.monthly_rent !== null && r.monthly_rent !== undefined
       ? parseFloat(r.monthly_rent)
       : null,
+    // contact fields sourced from gold_tenants; null when no tenant record exists
+    contact_email: r.contact_email ?? null,
+    contact_phone: r.contact_phone ?? null,
     created_at: r.created_at,
   };
 }
@@ -179,15 +184,26 @@ app.get("/api/v1/leases/expirations", async (req: Request, res: Response) => {
              latest_rr
         WHERE b.report_type = 'rent_roll' AND b.report_date = latest_rr.dt
           AND elem->>'Rent' IS NOT NULL
+      ),
+      tenant_lookup AS (
+        SELECT DISTINCT ON (tenant_id)
+          tenant_id, email AS contact_email,
+          REGEXP_REPLACE(phone, '^(Mobile|Phone|Home|Work|Fax):\s*', '', 'i') AS contact_phone
+        FROM gold_tenants
+        WHERE tenant_id IS NOT NULL
+        ORDER BY tenant_id, updated_at DESC NULLS LAST
       )
       SELECT le.id, le.bronze_report_id, le.tenant_id, le.unit_id,
              le.lease_start_date::text AS lease_start_date,
              le.lease_end_date::text   AS lease_end_date,
              le.days_until_expiration,
              rl.monthly_rent::text     AS monthly_rent,
+             tl.contact_email,
+             tl.contact_phone,
              le.created_at
       FROM gold_lease_expirations le
-      LEFT JOIN rent_lookup rl ON rl.unit_id = le.unit_id
+      LEFT JOIN rent_lookup   rl ON rl.unit_id  = le.unit_id
+      LEFT JOIN tenant_lookup tl ON tl.tenant_id = le.tenant_id
       ORDER BY le.lease_end_date ASC NULLS LAST
       LIMIT ${limit} OFFSET ${offset}
     `;
@@ -220,15 +236,26 @@ app.get("/api/v1/leases/expiring-soon", async (req: Request, res: Response) => {
              latest_rr
         WHERE b.report_type = 'rent_roll' AND b.report_date = latest_rr.dt
           AND elem->>'Rent' IS NOT NULL
+      ),
+      tenant_lookup AS (
+        SELECT DISTINCT ON (tenant_id)
+          tenant_id, email AS contact_email,
+          REGEXP_REPLACE(phone, '^(Mobile|Phone|Home|Work|Fax):\s*', '', 'i') AS contact_phone
+        FROM gold_tenants
+        WHERE tenant_id IS NOT NULL
+        ORDER BY tenant_id, updated_at DESC NULLS LAST
       )
       SELECT le.id, le.bronze_report_id, le.tenant_id, le.unit_id,
              le.lease_start_date::text AS lease_start_date,
              le.lease_end_date::text   AS lease_end_date,
              (le.lease_end_date - CURRENT_DATE)::int AS days_until_expiration,
              rl.monthly_rent::text     AS monthly_rent,
+             tl.contact_email,
+             tl.contact_phone,
              le.created_at
       FROM gold_lease_expirations le
-      LEFT JOIN rent_lookup rl ON rl.unit_id = le.unit_id
+      LEFT JOIN rent_lookup   rl ON rl.unit_id  = le.unit_id
+      LEFT JOIN tenant_lookup tl ON tl.tenant_id = le.tenant_id
       WHERE le.lease_end_date IS NOT NULL
         AND le.lease_end_date >= CURRENT_DATE
         AND (le.lease_end_date - CURRENT_DATE) <= ${days}
@@ -271,15 +298,26 @@ app.get("/api/v1/leases/upcoming-renewals", async (req: Request, res: Response) 
              latest_rr
         WHERE b.report_type = 'rent_roll' AND b.report_date = latest_rr.dt
           AND elem->>'Rent' IS NOT NULL
+      ),
+      tenant_lookup AS (
+        SELECT DISTINCT ON (tenant_id)
+          tenant_id, email AS contact_email,
+          REGEXP_REPLACE(phone, '^(Mobile|Phone|Home|Work|Fax):\s*', '', 'i') AS contact_phone
+        FROM gold_tenants
+        WHERE tenant_id IS NOT NULL
+        ORDER BY tenant_id, updated_at DESC NULLS LAST
       )
       SELECT le.id, le.bronze_report_id, le.tenant_id, le.unit_id,
              le.lease_start_date::text AS lease_start_date,
              le.lease_end_date::text   AS lease_end_date,
              (le.lease_end_date - CURRENT_DATE)::int AS days_until_expiration,
              rl.monthly_rent::text     AS monthly_rent,
+             tl.contact_email,
+             tl.contact_phone,
              le.created_at
       FROM gold_lease_expirations le
-      LEFT JOIN rent_lookup rl ON rl.unit_id = le.unit_id
+      LEFT JOIN rent_lookup   rl ON rl.unit_id  = le.unit_id
+      LEFT JOIN tenant_lookup tl ON tl.tenant_id = le.tenant_id
       WHERE le.lease_end_date IS NOT NULL
         AND (le.lease_end_date - CURRENT_DATE) > ${fromDays}
         AND (le.lease_end_date - CURRENT_DATE) <= ${toDays}
@@ -326,15 +364,26 @@ app.get("/api/v1/leases/:id", async (req: Request, res: Response) => {
              latest_rr
         WHERE b.report_type = 'rent_roll' AND b.report_date = latest_rr.dt
           AND elem->>'Rent' IS NOT NULL
+      ),
+      tenant_lookup AS (
+        SELECT DISTINCT ON (tenant_id)
+          tenant_id, email AS contact_email,
+          REGEXP_REPLACE(phone, '^(Mobile|Phone|Home|Work|Fax):\s*', '', 'i') AS contact_phone
+        FROM gold_tenants
+        WHERE tenant_id IS NOT NULL
+        ORDER BY tenant_id, updated_at DESC NULLS LAST
       )
       SELECT le.id, le.bronze_report_id, le.tenant_id, le.unit_id,
              le.lease_start_date::text AS lease_start_date,
              le.lease_end_date::text   AS lease_end_date,
              le.days_until_expiration,
              rl.monthly_rent::text     AS monthly_rent,
+             tl.contact_email,
+             tl.contact_phone,
              le.created_at
       FROM gold_lease_expirations le
-      LEFT JOIN rent_lookup rl ON rl.unit_id = le.unit_id
+      LEFT JOIN rent_lookup   rl ON rl.unit_id  = le.unit_id
+      LEFT JOIN tenant_lookup tl ON tl.tenant_id = le.tenant_id
       WHERE le.id = ${id}
       LIMIT 1
     `;
