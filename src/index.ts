@@ -2751,15 +2751,27 @@ app.get("/api/v1/renewals", async (req: Request, res: Response) => {
         SELECT DISTINCT ON (LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g')))
           LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g'))       AS unit_id,
           NULLIF(TRIM(elem->>'Emails'), '')                                      AS contact_email,
-          NULLIF(REGEXP_REPLACE(TRIM(COALESCE(elem->>'PhoneNumbers', '')),
-            '^(Mobile|Phone|Home|Work|Fax):\s*', '', 'i'), '')                  AS contact_phone,
-          NULLIF(TRIM(elem->>'Name'), '')                                        AS tenant_name
+          NULLIF(TRIM(REGEXP_REPLACE(TRIM(COALESCE(elem->>'PhoneNumbers', '')),
+            '^(Mobile|Phone|Home|Work|Fax):\s*', '', 'i')), '')                 AS contact_phone
         FROM bronze_appfolio_reports b,
              jsonb_array_elements(b.raw_data->'results') AS elem,
              latest_td
         WHERE b.report_type = 'tenant_directory' AND b.report_date = latest_td.dt
           AND elem->>'Status' NOT ILIKE '%vacant%'
           AND elem->>'Unit' IS NOT NULL
+        ORDER BY LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g')),
+                 (elem->>'PrimaryTenant' = 'Yes') DESC
+      ),
+      rr_names AS (
+        WITH latest_rr AS (SELECT MAX(report_date) AS dt FROM bronze_appfolio_reports WHERE report_type = 'rent_roll')
+        SELECT DISTINCT ON (LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g')))
+          LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g'))       AS unit_id,
+          NULLIF(TRIM(elem->>'Tenant'), '')                                      AS tenant_name
+        FROM bronze_appfolio_reports b,
+             jsonb_array_elements(b.raw_data->'results') AS elem,
+             latest_rr
+        WHERE b.report_type = 'rent_roll' AND b.report_date = latest_rr.dt
+          AND elem->>'Tenant' IS NOT NULL
       )
       SELECT
         le.id, le.unit_id, le.tenant_id,
@@ -2768,7 +2780,7 @@ app.get("/api/v1/renewals", async (req: Request, res: Response) => {
         rl.monthly_rent::text,
         tl.contact_email,
         tl.contact_phone,
-        COALESCE(tl.tenant_name, 'Unknown') AS tenant_name,
+        COALESCE(rn.tenant_name, tl.contact_email, 'Unknown') AS tenant_name,
         COALESCE(rt.renewal_status, 'pending') AS renewal_status,
         rt.proposed_rent::text,
         rt.notes,
@@ -2776,6 +2788,7 @@ app.get("/api/v1/renewals", async (req: Request, res: Response) => {
       FROM gold_lease_expirations le
       LEFT JOIN rent_lookup   rl ON rl.unit_id = le.unit_id
       LEFT JOIN tenant_lookup tl ON tl.unit_id = le.unit_id
+      LEFT JOIN rr_names      rn ON rn.unit_id = le.unit_id
       LEFT JOIN renewal_tracking rt ON rt.unit_id = le.unit_id
       WHERE le.lease_end_date IS NOT NULL
         AND (le.lease_end_date - CURRENT_DATE) > ${fromDays}
