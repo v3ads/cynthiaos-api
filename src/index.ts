@@ -2093,13 +2093,17 @@ app.get("/api/v1/insights/unit-intelligence", async (req: Request, res: Response
 
       delinquency_agg AS (
         SELECT
-          unit_id,
-          SUM(balance_due)  AS delinquency_balance,
-          MAX(days_overdue) AS max_days_overdue,
-          COUNT(*)          AS delinquency_count
-        FROM gold_delinquency_records
-        WHERE unit_id IS NOT NULL AND unit_id <> 'unknown'
-        GROUP BY unit_id
+          d.unit_id,
+          SUM(d.balance_due)                          AS delinquency_balance,
+          -- Cap days_overdue at 365 to prevent score distortion from stale records
+          LEAST(MAX(d.days_overdue), 365)             AS max_days_overdue,
+          COUNT(*)                                    AS delinquency_count,
+          -- Resolve tenant name from gold_tenants via delinquency tenant_id
+          MAX(t.full_name)                            AS delinquency_tenant_name
+        FROM gold_delinquency_records d
+        LEFT JOIN gold_tenants t ON t.tenant_id = d.tenant_id
+        WHERE d.unit_id IS NOT NULL AND d.unit_id <> 'unknown'
+        GROUP BY d.unit_id
       ),
 
       ar_agg AS (
@@ -2142,7 +2146,9 @@ app.get("/api/v1/insights/unit-intelligence", async (req: Request, res: Response
         SELECT
           u.unit_id,
           us.unit_status,
-          lt.tenant_name,
+          -- Tenant name fallback chain:
+          -- 1. gold_tenants via latest lease  2. gold_tenants via delinquency  3. 'Unknown'
+          COALESCE(lt.tenant_name, d.delinquency_tenant_name, 'Unknown') AS tenant_name,
           lt.tenant_id,
           lt.lease_end_date,
           lt.days_until_expiration,
@@ -2150,6 +2156,7 @@ app.get("/api/v1/insights/unit-intelligence", async (req: Request, res: Response
           COALESCE(ar.ar_balance, 0)                                AS ar_balance,
           COALESCE(d.delinquency_balance, 0)
             + COALESCE(ar.ar_balance, 0)                            AS financial_exposure,
+          -- days_overdue already capped at 365 inside delinquency_agg
           COALESCE(d.max_days_overdue, 0)                           AS max_days_overdue,
           COALESCE(t.turnover_count, 0)                             AS turnover_count,
           COALESCE(ar.avg_ar_risk_score, 0)                         AS avg_ar_risk_score
@@ -2166,7 +2173,8 @@ app.get("/api/v1/insights/unit-intelligence", async (req: Request, res: Response
           *,
 
           -- STABILITY SCORE (0–100)
-          -- Penalises turnovers, delinquency, severe overdue, vacancy
+          -- Penalises turnovers, delinquency, severe overdue (capped at 365), vacancy
+          -- Units with no data at all default to 80 (safe/neutral baseline)
           GREATEST(0, LEAST(100,
             100
             - (turnover_count * 15)
@@ -2229,7 +2237,8 @@ app.get("/api/v1/insights/unit-intelligence", async (req: Request, res: Response
         SELECT
           unit_id,
           unit_status,
-          COALESCE(tenant_name, 'Vacant')       AS tenant_name,
+          -- tenant_name already resolved via COALESCE chain in assembled CTE
+          tenant_name,
           tenant_id,
           ROUND(financial_exposure::numeric, 2) AS financial_exposure,
           ROUND(delinquency_balance::numeric, 2) AS delinquency_balance,
@@ -2303,9 +2312,12 @@ app.get("/api/v1/insights/unit-intelligence", async (req: Request, res: Response
         LEFT JOIN latest_tenant_per_unit lt ON lt.unit_id = u.unit_id
       ),
       delinquency_agg AS (
-        SELECT unit_id, SUM(balance_due) AS delinquency_balance
-        FROM gold_delinquency_records WHERE unit_id IS NOT NULL AND unit_id <> 'unknown'
-        GROUP BY unit_id
+        SELECT d.unit_id,
+          SUM(d.balance_due)                AS delinquency_balance,
+          LEAST(MAX(d.days_overdue), 365)   AS max_days_overdue
+        FROM gold_delinquency_records d
+        WHERE d.unit_id IS NOT NULL AND d.unit_id <> 'unknown'
+        GROUP BY d.unit_id
       ),
       ar_agg AS (
         SELECT unit_id, SUM(total_balance) AS ar_balance
@@ -2320,7 +2332,8 @@ app.get("/api/v1/insights/unit-intelligence", async (req: Request, res: Response
       assembled AS (
         SELECT u.unit_id, us.unit_status,
           COALESCE(d.delinquency_balance,0)+COALESCE(ar.ar_balance,0) AS financial_exposure,
-          COALESCE(t.turnover_count,0) AS turnover_count
+          COALESCE(d.max_days_overdue,0)                              AS max_days_overdue,
+          COALESCE(t.turnover_count,0)                                AS turnover_count
         FROM unit_universe u
         LEFT JOIN unit_status_cte us ON us.unit_id = u.unit_id
         LEFT JOIN delinquency_agg d  ON d.unit_id  = u.unit_id
@@ -2328,7 +2341,7 @@ app.get("/api/v1/insights/unit-intelligence", async (req: Request, res: Response
         LEFT JOIN turnover_agg    t  ON t.unit_id   = u.unit_id
       ),
       scored AS (
-        SELECT unit_id, unit_status, turnover_count, financial_exposure,
+        SELECT unit_id, unit_status, turnover_count, financial_exposure, max_days_overdue,
           GREATEST(0,LEAST(100,
             CASE WHEN financial_exposure>20000 THEN 50 WHEN financial_exposure>10000 THEN 40
                  WHEN financial_exposure>5000 THEN 25 WHEN financial_exposure>1000 THEN 15
@@ -2337,7 +2350,13 @@ app.get("/api/v1/insights/unit-intelligence", async (req: Request, res: Response
                    WHEN turnover_count=1 THEN 8 ELSE 0 END
             + CASE WHEN unit_status='vacant' THEN 10 ELSE 0 END
           ))::integer AS risk_score,
-          GREATEST(0,LEAST(100,100-(turnover_count*15)))::integer AS stability_score
+          GREATEST(0,LEAST(100,
+            100
+            - (turnover_count*15)
+            - CASE WHEN financial_exposure>0     THEN 20 ELSE 0 END
+            - CASE WHEN max_days_overdue>90       THEN 15 ELSE 0 END
+            - CASE WHEN unit_status='vacant'      THEN 10 ELSE 0 END
+          ))::integer AS stability_score
         FROM assembled
       ),
       classified AS (
