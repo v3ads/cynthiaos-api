@@ -2058,15 +2058,24 @@ app.get("/api/v1/insights/unit-intelligence", async (req: Request, res: Response
     const rows = await sql<UnitIntelligenceRow[]>`
       WITH
 
+      -- Authoritative unit list sourced from the unit_directory Bronze report.
+      -- This ensures ALL 182 units appear regardless of activity in Gold tables.
+      -- Units with no lease/turnover/AR data will appear with null/zero values.
       unit_universe AS (
-        SELECT DISTINCT unit_id FROM gold_lease_expirations
-          WHERE unit_id IS NOT NULL AND unit_id <> 'unknown'
-        UNION
-        SELECT DISTINCT unit_id FROM gold_unit_turnover
-          WHERE unit_id IS NOT NULL AND unit_id <> 'unknown'
-        UNION
-        SELECT DISTINCT unit_id FROM gold_aged_receivables
-          WHERE unit_id IS NOT NULL AND unit_id <> 'unknown'
+        WITH latest_dir AS (
+          SELECT MAX(report_date) AS dt
+          FROM bronze_appfolio_reports
+          WHERE report_type = 'unit_directory'
+        )
+        SELECT DISTINCT
+          LOWER(REGEXP_REPLACE(TRIM(elem->>'UnitName'), '\s*-\s*', '-', 'g')) AS unit_id
+        FROM bronze_appfolio_reports b,
+             jsonb_array_elements(b.raw_data->'results') AS elem,
+             latest_dir
+        WHERE b.report_type = 'unit_directory'
+          AND b.report_date = latest_dir.dt
+          AND elem->>'UnitName' IS NOT NULL
+          AND TRIM(elem->>'UnitName') <> ''
       ),
 
       latest_tenant_per_unit AS (
@@ -2261,14 +2270,20 @@ app.get("/api/v1/insights/unit-intelligence", async (req: Request, res: Response
     const countRows = await sql<{ count: string }[]>`
       WITH
       unit_universe AS (
-        SELECT DISTINCT unit_id FROM gold_lease_expirations
-          WHERE unit_id IS NOT NULL AND unit_id <> 'unknown'
-        UNION
-        SELECT DISTINCT unit_id FROM gold_unit_turnover
-          WHERE unit_id IS NOT NULL AND unit_id <> 'unknown'
-        UNION
-        SELECT DISTINCT unit_id FROM gold_aged_receivables
-          WHERE unit_id IS NOT NULL AND unit_id <> 'unknown'
+        WITH latest_dir AS (
+          SELECT MAX(report_date) AS dt
+          FROM bronze_appfolio_reports
+          WHERE report_type = 'unit_directory'
+        )
+        SELECT DISTINCT
+          LOWER(REGEXP_REPLACE(TRIM(elem->>'UnitName'), '\s*-\s*', '-', 'g')) AS unit_id
+        FROM bronze_appfolio_reports b,
+             jsonb_array_elements(b.raw_data->'results') AS elem,
+             latest_dir
+        WHERE b.report_type = 'unit_directory'
+          AND b.report_date = latest_dir.dt
+          AND elem->>'UnitName' IS NOT NULL
+          AND TRIM(elem->>'UnitName') <> ''
       ),
       latest_tenant_per_unit AS (
         SELECT DISTINCT ON (le.unit_id)
