@@ -1323,7 +1323,8 @@ app.get("/api/v1/insights/at-risk-revenue", async (req: Request, res: Response) 
           le.days_until_expiration,
           CASE
             WHEN ar.risk_score >= 5000
-                 AND (le.days_until_expiration IS NULL OR le.days_until_expiration <= 90)
+                 AND le.days_until_expiration IS NOT NULL
+                 AND le.days_until_expiration <= 90
             THEN 'HIGH'
             WHEN ar.risk_score >= 2000
             THEN 'MEDIUM'
@@ -1365,7 +1366,8 @@ app.get("/api/v1/insights/at-risk-revenue", async (req: Request, res: Response) 
           le.days_until_expiration,
           CASE
             WHEN ar.risk_score >= 5000
-                 AND (le.days_until_expiration IS NULL OR le.days_until_expiration <= 90)
+                 AND le.days_until_expiration IS NOT NULL
+                 AND le.days_until_expiration <= 90
             THEN 'HIGH'
             WHEN ar.risk_score >= 2000
             THEN 'MEDIUM'
@@ -1480,17 +1482,10 @@ app.get("/api/v1/insights/lease-expiration-risk", async (req: Request, res: Resp
         FROM gold_tenants
         ORDER BY tenant_id, updated_at DESC
       ),
-      all_tenants AS (
-        SELECT tenant_id FROM le_deduped
-        UNION
-        SELECT tenant_id FROM ar_deduped
-        UNION
-        SELECT tenant_id FROM d_deduped
-      ),
       joined AS (
         SELECT
-          at.tenant_id,
-          COALESCE(t.full_name, at.tenant_id)         AS full_name,
+          le.tenant_id,
+          COALESCE(t.full_name, le.tenant_id)         AS full_name,
           COALESCE(le.unit_id, ar.ar_unit_id)         AS unit_id,
           le.lease_end_date,
           le.days_until_expiration,
@@ -1507,11 +1502,10 @@ app.get("/api/v1/insights/lease-expiration-risk", async (req: Request, res: Resp
             THEN 'HIGH'
             ELSE 'LOW'
           END AS expiration_risk
-        FROM all_tenants at
-        LEFT JOIN t_deduped  t  ON at.tenant_id = t.tenant_id
-        LEFT JOIN le_deduped le ON at.tenant_id = le.tenant_id
-        LEFT JOIN ar_deduped ar ON at.tenant_id = ar.tenant_id
-        LEFT JOIN d_deduped  d  ON at.tenant_id = d.tenant_id
+        FROM le_deduped le
+        LEFT JOIN t_deduped  t  ON le.tenant_id = t.tenant_id
+        LEFT JOIN ar_deduped ar ON le.tenant_id = ar.tenant_id
+        LEFT JOIN d_deduped  d  ON le.tenant_id = d.tenant_id
       )
       SELECT *
       FROM joined
@@ -1546,16 +1540,9 @@ app.get("/api/v1/insights/lease-expiration-risk", async (req: Request, res: Resp
         FROM gold_delinquency_records
         ORDER BY tenant_id, days_overdue DESC NULLS LAST, created_at DESC
       ),
-      all_tenants AS (
-        SELECT tenant_id FROM le_deduped
-        UNION
-        SELECT tenant_id FROM ar_deduped
-        UNION
-        SELECT tenant_id FROM d_deduped
-      ),
       joined AS (
         SELECT
-          at.tenant_id,
+          le.tenant_id,
           le.days_until_expiration,
           ar.risk_score,
           d.delinquency_level,
@@ -1569,10 +1556,9 @@ app.get("/api/v1/insights/lease-expiration-risk", async (req: Request, res: Resp
             THEN 'HIGH'
             ELSE 'LOW'
           END AS expiration_risk
-        FROM all_tenants at
-        LEFT JOIN le_deduped le ON at.tenant_id = le.tenant_id
-        LEFT JOIN ar_deduped ar ON at.tenant_id = ar.tenant_id
-        LEFT JOIN d_deduped  d  ON at.tenant_id = d.tenant_id
+        FROM le_deduped le
+        LEFT JOIN ar_deduped ar ON le.tenant_id = ar.tenant_id
+        LEFT JOIN d_deduped  d  ON le.tenant_id = d.tenant_id
       )
       SELECT COUNT(*) AS count
       FROM joined
@@ -1890,7 +1876,7 @@ app.get("/api/v1/insights/collections-risk", async (req: Request, res: Response)
             ) +
             COALESCE(
               CASE
-                WHEN le.days_until_expiration IS NULL THEN 25
+                WHEN le.days_until_expiration IS NULL THEN 0
                 WHEN le.days_until_expiration <= 30   THEN 25
                 WHEN le.days_until_expiration <= 60   THEN 18
                 WHEN le.days_until_expiration <= 90   THEN 10
@@ -1949,7 +1935,7 @@ app.get("/api/v1/insights/collections-risk", async (req: Request, res: Response)
               THEN (ar.bucket_90_plus / ar.total_balance) * 40 ELSE 0 END, 0) +
             COALESCE(LEAST(35, (d.days_overdue::numeric / 90.0) * 35), 0) +
             COALESCE(CASE
-              WHEN le.days_until_expiration IS NULL THEN 25
+              WHEN le.days_until_expiration IS NULL THEN 0
               WHEN le.days_until_expiration <= 30   THEN 25
               WHEN le.days_until_expiration <= 60   THEN 18
               WHEN le.days_until_expiration <= 90   THEN 10
@@ -2532,20 +2518,124 @@ app.get("/api/v1/insights/unit-intelligence", async (req: Request, res: Response
 
     const total = parseInt(countRows[0]?.count ?? "0", 10);
 
-    // ── Portfolio summary ──────────────────────────────────────────────────────
-    const avgRisk         = rows.length > 0
-      ? Math.round(rows.reduce((s, r) => s + parseInt(String(r.risk_score), 10), 0) / rows.length)
-      : 0;
-    const avgStability    = rows.length > 0
-      ? Math.round(rows.reduce((s, r) => s + parseInt(String(r.stability_score), 10), 0) / rows.length)
-      : 0;
-    const totalExposure   = rows.reduce((s, r) => s + parseFloat(String(r.financial_exposure)), 0);
+    // ── Portfolio summary — computed over ALL units, independent of pagination ────────────
+    interface SummaryRow {
+      avg_risk_score:      string;
+      avg_stability_score: string;
+      total_exposure:      string;
+      classification:      string;
+      unit_status:         string;
+      unit_count:          string;
+    }
+    const summaryRows = await sql<SummaryRow[]>`
+      WITH
+      unit_universe AS (
+        WITH latest_dir AS (
+          SELECT MAX(report_date) AS dt FROM bronze_appfolio_reports WHERE report_type = 'unit_directory'
+        )
+        SELECT DISTINCT
+          LOWER(REGEXP_REPLACE(TRIM(elem->>'UnitName'), '\s*-\s*', '-', 'g')) AS unit_id
+        FROM bronze_appfolio_reports b,
+             jsonb_array_elements(b.raw_data->'results') AS elem,
+             latest_dir
+        WHERE b.report_type = 'unit_directory'
+          AND b.report_date = latest_dir.dt
+          AND elem->>'UnitName' IS NOT NULL
+          AND TRIM(elem->>'UnitName') <> ''
+      ),
+      latest_lease AS (
+        SELECT DISTINCT ON (unit_id) unit_id, lease_end_date, days_until_expiration
+        FROM gold_lease_expirations ORDER BY unit_id, lease_end_date DESC NULLS LAST
+      ),
+      unit_status_cte AS (
+        SELECT u.unit_id,
+          CASE
+            WHEN ll.lease_end_date IS NULL THEN 'vacant'
+            WHEN ll.days_until_expiration BETWEEN 0 AND 60 THEN 'notice'
+            WHEN ll.days_until_expiration < 0 THEN 'vacant'
+            ELSE 'occupied'
+          END AS unit_status
+        FROM unit_universe u LEFT JOIN latest_lease ll ON ll.unit_id = u.unit_id
+      ),
+      delinquency_agg AS (
+        SELECT unit_id, SUM(balance_due) AS delinquency_balance, LEAST(MAX(days_overdue),365) AS max_days_overdue
+        FROM gold_delinquency_records WHERE unit_id IS NOT NULL AND unit_id <> 'unknown' GROUP BY unit_id
+      ),
+      ar_agg AS (
+        SELECT unit_id, SUM(total_balance) AS ar_balance
+        FROM gold_aged_receivables WHERE unit_id IS NOT NULL AND unit_id <> 'unknown' GROUP BY unit_id
+      ),
+      turnover_agg AS (
+        SELECT unit_id, COUNT(*) AS turnover_count
+        FROM gold_unit_turnover WHERE unit_id IS NOT NULL AND unit_id <> 'unknown' GROUP BY unit_id
+      ),
+      assembled AS (
+        SELECT u.unit_id, us.unit_status,
+          COALESCE(d.delinquency_balance,0)+COALESCE(ar.ar_balance,0) AS financial_exposure,
+          COALESCE(d.max_days_overdue,0) AS max_days_overdue,
+          COALESCE(t.turnover_count,0)   AS turnover_count
+        FROM unit_universe u
+        LEFT JOIN unit_status_cte us ON us.unit_id = u.unit_id
+        LEFT JOIN delinquency_agg d  ON d.unit_id  = u.unit_id
+        LEFT JOIN ar_agg          ar ON ar.unit_id  = u.unit_id
+        LEFT JOIN turnover_agg    t  ON t.unit_id   = u.unit_id
+      ),
+      scored AS (
+        SELECT unit_id, unit_status, financial_exposure, turnover_count, max_days_overdue,
+          GREATEST(0,LEAST(100,
+            CASE WHEN financial_exposure>20000 THEN 50 WHEN financial_exposure>10000 THEN 40
+                 WHEN financial_exposure>5000 THEN 25 WHEN financial_exposure>1000 THEN 15
+                 WHEN financial_exposure>0 THEN 5 ELSE 0 END
+            + CASE WHEN turnover_count>=3 THEN 25 WHEN turnover_count=2 THEN 15
+                   WHEN turnover_count=1 THEN 8 ELSE 0 END
+            + CASE WHEN unit_status='vacant' THEN 10 ELSE 0 END
+          ))::integer AS risk_score,
+          GREATEST(0,LEAST(100,
+            100 - (turnover_count*15)
+            - CASE WHEN financial_exposure>0 THEN 20 ELSE 0 END
+            - CASE WHEN max_days_overdue>90  THEN 15 ELSE 0 END
+            - CASE WHEN unit_status='vacant' THEN 10 ELSE 0 END
+          ))::integer AS stability_score
+        FROM assembled
+      ),
+      classified AS (
+        SELECT unit_id, unit_status, risk_score, stability_score, financial_exposure,
+          CASE
+            WHEN risk_score>=55 THEN 'High Risk Unit'
+            WHEN unit_status='vacant' AND turnover_count>=2 THEN 'Turnover Heavy'
+            WHEN unit_status IN ('vacant','notice') AND turnover_count>=1 THEN 'Vacancy Risk'
+            WHEN stability_score>=75 AND risk_score<20 THEN 'Stable Performer'
+            WHEN turnover_count>=3 THEN 'Turnover Heavy'
+            ELSE 'Neutral'
+          END AS classification
+        FROM scored
+      )
+      SELECT
+        ROUND(AVG(risk_score))::text      AS avg_risk_score,
+        ROUND(AVG(stability_score))::text AS avg_stability_score,
+        SUM(financial_exposure)::text     AS total_exposure,
+        classification,
+        unit_status,
+        COUNT(*)::text                    AS unit_count
+      FROM classified
+      GROUP BY GROUPING SETS ((classification), (unit_status), ())
+    `;
 
+    // Parse the GROUPING SETS result into structured summary
+    let avgRisk = 0, avgStability = 0, totalExposure = 0;
     const classificationCounts: Record<string, number> = {};
     const statusCounts: Record<string, number> = {};
-    for (const r of rows) {
-      classificationCounts[r.classification] = (classificationCounts[r.classification] ?? 0) + 1;
-      statusCounts[r.unit_status] = (statusCounts[r.unit_status] ?? 0) + 1;
+    for (const r of summaryRows) {
+      if (r.classification === null && r.unit_status === null) {
+        // Grand total row
+        avgRisk = Math.round(parseFloat(r.avg_risk_score ?? '0'));
+        avgStability = Math.round(parseFloat(r.avg_stability_score ?? '0'));
+        totalExposure = parseFloat(r.total_exposure ?? '0');
+      } else if (r.classification !== null && r.unit_status === null) {
+        classificationCounts[r.classification] = parseInt(r.unit_count, 10);
+      } else if (r.classification === null && r.unit_status !== null) {
+        statusCounts[r.unit_status] = parseInt(r.unit_count, 10);
+      }
     }
 
     res.status(200).json({
