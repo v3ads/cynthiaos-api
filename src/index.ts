@@ -72,6 +72,7 @@ interface GoldDelinquencyRecord {
   id: string;
   bronze_report_id: string | null;
   tenant_id: string;
+  display_name: string | null;  // enriched from gold_tenants JOIN
   unit_id: string;
   balance_due: string; // NUMERIC returns as string from postgres driver
   days_overdue: number | null;
@@ -84,6 +85,7 @@ function mapDelinquencyRow(r: GoldDelinquencyRecord) {
     id: r.id,
     bronze_report_id: r.bronze_report_id,
     tenant_id: r.tenant_id,
+    display_name: r.display_name ?? r.tenant_id,  // human-readable name, falls back to tenant_id
     unit_id: r.unit_id,
     balance_due: parseFloat(r.balance_due),
     days_overdue: r.days_overdue,
@@ -96,6 +98,7 @@ interface GoldAgedReceivable {
   id: string;
   bronze_report_id: string | null;
   tenant_id: string;
+  display_name: string | null;  // enriched from gold_tenants JOIN
   unit_id: string;
   total_balance: string;
   bucket_0_30: string;
@@ -112,6 +115,7 @@ function mapARRow(r: GoldAgedReceivable) {
     id: r.id,
     bronze_report_id: r.bronze_report_id,
     tenant_id: r.tenant_id,
+    display_name: r.display_name ?? r.tenant_id,  // human-readable name, falls back to tenant_id
     unit_id: r.unit_id,
     total_balance:  parseFloat(r.total_balance),
     bucket_0_30:    parseFloat(r.bucket_0_30),
@@ -411,33 +415,48 @@ app.get("/api/v1/aged-receivables", async (req: Request, res: Response) => {
 
     sql = getDb();
 
-    // Deduplicate to one row per tenant (most recent ingestion wins)
+    // Deduplicate to one row per tenant (most recent ingestion wins).
+    // LEFT JOIN gold_tenants to enrich with human-readable display_name.
     const rows = dominantBucket
       ? await sql<GoldAgedReceivable[]>`
-          SELECT DISTINCT ON (tenant_id)
-                 id, bronze_report_id, tenant_id, unit_id,
-                 total_balance::text  AS total_balance,
-                 bucket_0_30::text    AS bucket_0_30,
-                 bucket_31_60::text   AS bucket_31_60,
-                 bucket_61_90::text   AS bucket_61_90,
-                 bucket_90_plus::text AS bucket_90_plus,
-                 dominant_bucket, risk_score::text AS risk_score, created_at
-          FROM gold_aged_receivables
-          WHERE dominant_bucket = ${dominantBucket}
-          ORDER BY tenant_id, created_at DESC, risk_score::numeric DESC
+          SELECT DISTINCT ON (ar.tenant_id)
+                 ar.id, ar.bronze_report_id, ar.tenant_id,
+                 COALESCE(t.full_name, ar.tenant_id) AS display_name,
+                 ar.unit_id,
+                 ar.total_balance::text  AS total_balance,
+                 ar.bucket_0_30::text    AS bucket_0_30,
+                 ar.bucket_31_60::text   AS bucket_31_60,
+                 ar.bucket_61_90::text   AS bucket_61_90,
+                 ar.bucket_90_plus::text AS bucket_90_plus,
+                 ar.dominant_bucket, ar.risk_score::text AS risk_score, ar.created_at
+          FROM gold_aged_receivables ar
+          LEFT JOIN LATERAL (
+            SELECT full_name FROM gold_tenants
+            WHERE tenant_id = ar.tenant_id
+            ORDER BY updated_at DESC LIMIT 1
+          ) t ON true
+          WHERE ar.dominant_bucket = ${dominantBucket}
+          ORDER BY ar.tenant_id, ar.created_at DESC, ar.risk_score::numeric DESC
           LIMIT ${limit} OFFSET ${offset}
         `
       : await sql<GoldAgedReceivable[]>`
-          SELECT DISTINCT ON (tenant_id)
-                 id, bronze_report_id, tenant_id, unit_id,
-                 total_balance::text  AS total_balance,
-                 bucket_0_30::text    AS bucket_0_30,
-                 bucket_31_60::text   AS bucket_31_60,
-                 bucket_61_90::text   AS bucket_61_90,
-                 bucket_90_plus::text AS bucket_90_plus,
-                 dominant_bucket, risk_score::text AS risk_score, created_at
-          FROM gold_aged_receivables
-          ORDER BY tenant_id, created_at DESC, risk_score::numeric DESC
+          SELECT DISTINCT ON (ar.tenant_id)
+                 ar.id, ar.bronze_report_id, ar.tenant_id,
+                 COALESCE(t.full_name, ar.tenant_id) AS display_name,
+                 ar.unit_id,
+                 ar.total_balance::text  AS total_balance,
+                 ar.bucket_0_30::text    AS bucket_0_30,
+                 ar.bucket_31_60::text   AS bucket_31_60,
+                 ar.bucket_61_90::text   AS bucket_61_90,
+                 ar.bucket_90_plus::text AS bucket_90_plus,
+                 ar.dominant_bucket, ar.risk_score::text AS risk_score, ar.created_at
+          FROM gold_aged_receivables ar
+          LEFT JOIN LATERAL (
+            SELECT full_name FROM gold_tenants
+            WHERE tenant_id = ar.tenant_id
+            ORDER BY updated_at DESC LIMIT 1
+          ) t ON true
+          ORDER BY ar.tenant_id, ar.created_at DESC, ar.risk_score::numeric DESC
           LIMIT ${limit} OFFSET ${offset}
         `;
 
@@ -480,25 +499,40 @@ app.get("/api/v1/delinquency", async (req: Request, res: Response) => {
 
     sql = getDb();
 
-    // Deduplicate to one row per tenant (most recent ingestion wins)
+    // Deduplicate to one row per tenant (most recent ingestion wins).
+    // LEFT JOIN gold_tenants to enrich with human-readable display_name.
     const rows = riskLevel
       ? await sql<GoldDelinquencyRecord[]>`
-          SELECT DISTINCT ON (tenant_id)
-                 id, bronze_report_id, tenant_id, unit_id,
-                 balance_due::text AS balance_due,
-                 days_overdue, risk_level, created_at
-          FROM gold_delinquency_records
-          WHERE risk_level = ${riskLevel}
-          ORDER BY tenant_id, created_at DESC, balance_due::numeric DESC
+          SELECT DISTINCT ON (d.tenant_id)
+                 d.id, d.bronze_report_id, d.tenant_id,
+                 COALESCE(t.full_name, d.tenant_id) AS display_name,
+                 d.unit_id,
+                 d.balance_due::text AS balance_due,
+                 d.days_overdue, d.risk_level, d.created_at
+          FROM gold_delinquency_records d
+          LEFT JOIN LATERAL (
+            SELECT full_name FROM gold_tenants
+            WHERE tenant_id = d.tenant_id
+            ORDER BY updated_at DESC LIMIT 1
+          ) t ON true
+          WHERE d.risk_level = ${riskLevel}
+          ORDER BY d.tenant_id, d.created_at DESC, d.balance_due::numeric DESC
           LIMIT ${limit} OFFSET ${offset}
         `
       : await sql<GoldDelinquencyRecord[]>`
-          SELECT DISTINCT ON (tenant_id)
-                 id, bronze_report_id, tenant_id, unit_id,
-                 balance_due::text AS balance_due,
-                 days_overdue, risk_level, created_at
-          FROM gold_delinquency_records
-          ORDER BY tenant_id, created_at DESC, balance_due::numeric DESC
+          SELECT DISTINCT ON (d.tenant_id)
+                 d.id, d.bronze_report_id, d.tenant_id,
+                 COALESCE(t.full_name, d.tenant_id) AS display_name,
+                 d.unit_id,
+                 d.balance_due::text AS balance_due,
+                 d.days_overdue, d.risk_level, d.created_at
+          FROM gold_delinquency_records d
+          LEFT JOIN LATERAL (
+            SELECT full_name FROM gold_tenants
+            WHERE tenant_id = d.tenant_id
+            ORDER BY updated_at DESC LIMIT 1
+          ) t ON true
+          ORDER BY d.tenant_id, d.created_at DESC, d.balance_due::numeric DESC
           LIMIT ${limit} OFFSET ${offset}
         `;
 
