@@ -1294,7 +1294,7 @@ app.get("/api/v1/insights/at-risk-revenue", async (req: Request, res: Response) 
 
 interface LeaseExpirationRiskRow {
   tenant_id:             string;
-  full_name:             string;
+  full_name:             string;  // human-readable name from gold_tenants CTE
   unit_id:               string;
   lease_end_date:        string | null;
   days_until_expiration: number | null;
@@ -1461,7 +1461,8 @@ app.get("/api/v1/insights/lease-expiration-risk", async (req: Request, res: Resp
       days_window:  daysWindow,
       data: rows.map((r) => ({
         tenant_id:             r.tenant_id,
-        full_name:             r.full_name,
+        display_name:          r.full_name ?? r.tenant_id,  // consistent with delinquency/AR endpoints
+        full_name:             r.full_name,                 // kept for backward compatibility
         unit_id:               r.unit_id,
         lease_end_date:        r.lease_end_date,
         days_until_expiration: r.days_until_expiration,
