@@ -2005,6 +2005,408 @@ app.get("/api/v1/insights/turnover-velocity", async (req: Request, res: Response
     if (sql) await sql.end();
   }
 });
+// ── GET /api/v1/insights/unit-intelligence ─────────────────────────────────────────────
+//
+// Hybrid operational + analytical view of every unit in the portfolio.
+// Combines data from gold_lease_expirations, gold_unit_turnover,
+// gold_aged_receivables, gold_delinquency_records, and gold_tenants
+// into a single ranked, filterable unit-level intelligence feed.
+//
+// Query params:
+//   sort_by       : risk_score | stability_score | profitability_score (default: risk_score)
+//   sort_dir      : desc | asc (default: desc)
+//   unit_status   : occupied | vacant | notice
+//   classification: High Risk Unit | Stable Performer | Vacancy Risk | Turnover Heavy | Neutral
+//   limit         : max 200 (default 50)
+//   offset        : pagination offset (default 0)
+// ─────────────────────────────────────────────────────────────────────────────────────────
+
+interface UnitIntelligenceRow {
+  unit_id:               string;
+  unit_status:           string;
+  tenant_name:           string;
+  tenant_id:             string | null;
+  financial_exposure:    string;
+  delinquency_balance:   string;
+  ar_balance:            string;
+  max_days_overdue:      string;
+  turnover_count:        string;
+  stability_score:       string;
+  profitability_score:   string;
+  risk_score:            string;
+  classification:        string;
+  lease_end_date:        string | null;
+  days_until_expiration: string | null;
+}
+
+app.get("/api/v1/insights/unit-intelligence", async (req: Request, res: Response) => {
+  let sql: ReturnType<typeof getDb> | null = null;
+  try {
+    const limit      = Math.min(parseInt(String(req.query.limit  ?? "50"),  10), 200);
+    const offset     = parseInt(String(req.query.offset ?? "0"),  10);
+    const sortBy     = ["risk_score", "stability_score", "profitability_score"]
+                         .includes(String(req.query.sort_by ?? ""))
+                       ? String(req.query.sort_by)
+                       : "risk_score";
+    const sortDir    = String(req.query.sort_dir ?? "desc").toLowerCase() === "asc" ? "ASC" : "DESC";
+    const filterStatus = req.query.unit_status     ? String(req.query.unit_status)     : null;
+    const filterClass  = req.query.classification  ? String(req.query.classification)  : null;
+
+    sql = getDb();
+
+    // ── Full CTE pipeline ──────────────────────────────────────────────────────
+    const rows = await sql<UnitIntelligenceRow[]>`
+      WITH
+
+      unit_universe AS (
+        SELECT DISTINCT unit_id FROM gold_lease_expirations
+          WHERE unit_id IS NOT NULL AND unit_id <> 'unknown'
+        UNION
+        SELECT DISTINCT unit_id FROM gold_unit_turnover
+          WHERE unit_id IS NOT NULL AND unit_id <> 'unknown'
+        UNION
+        SELECT DISTINCT unit_id FROM gold_aged_receivables
+          WHERE unit_id IS NOT NULL AND unit_id <> 'unknown'
+      ),
+
+      latest_tenant_per_unit AS (
+        SELECT DISTINCT ON (le.unit_id)
+          le.unit_id,
+          le.tenant_id,
+          t.full_name              AS tenant_name,
+          t.lease_status,
+          le.lease_end_date,
+          le.days_until_expiration
+        FROM gold_lease_expirations le
+        LEFT JOIN gold_tenants t ON t.tenant_id = le.tenant_id
+        ORDER BY le.unit_id, le.lease_end_date DESC NULLS LAST
+      ),
+
+      delinquency_agg AS (
+        SELECT
+          unit_id,
+          SUM(balance_due)  AS delinquency_balance,
+          MAX(days_overdue) AS max_days_overdue,
+          COUNT(*)          AS delinquency_count
+        FROM gold_delinquency_records
+        WHERE unit_id IS NOT NULL AND unit_id <> 'unknown'
+        GROUP BY unit_id
+      ),
+
+      ar_agg AS (
+        SELECT
+          unit_id,
+          SUM(total_balance) AS ar_balance,
+          AVG(risk_score)    AS avg_ar_risk_score
+        FROM gold_aged_receivables
+        WHERE unit_id IS NOT NULL AND unit_id <> 'unknown'
+        GROUP BY unit_id
+      ),
+
+      turnover_agg AS (
+        SELECT
+          unit_id,
+          COUNT(*)              AS turnover_count,
+          AVG(days_to_complete) AS avg_days_to_complete,
+          MAX(move_out_date)    AS last_move_out_date
+        FROM gold_unit_turnover
+        WHERE unit_id IS NOT NULL AND unit_id <> 'unknown'
+        GROUP BY unit_id
+      ),
+
+      unit_status_cte AS (
+        SELECT
+          u.unit_id,
+          CASE
+            WHEN lt.lease_end_date IS NULL                                          THEN 'vacant'
+            WHEN lt.days_until_expiration IS NOT NULL
+                 AND lt.days_until_expiration BETWEEN 0 AND 60                      THEN 'notice'
+            WHEN lt.days_until_expiration IS NOT NULL
+                 AND lt.days_until_expiration < 0                                   THEN 'vacant'
+            ELSE 'occupied'
+          END AS unit_status
+        FROM unit_universe u
+        LEFT JOIN latest_tenant_per_unit lt ON lt.unit_id = u.unit_id
+      ),
+
+      assembled AS (
+        SELECT
+          u.unit_id,
+          us.unit_status,
+          lt.tenant_name,
+          lt.tenant_id,
+          lt.lease_end_date,
+          lt.days_until_expiration,
+          COALESCE(d.delinquency_balance, 0)                        AS delinquency_balance,
+          COALESCE(ar.ar_balance, 0)                                AS ar_balance,
+          COALESCE(d.delinquency_balance, 0)
+            + COALESCE(ar.ar_balance, 0)                            AS financial_exposure,
+          COALESCE(d.max_days_overdue, 0)                           AS max_days_overdue,
+          COALESCE(t.turnover_count, 0)                             AS turnover_count,
+          COALESCE(ar.avg_ar_risk_score, 0)                         AS avg_ar_risk_score
+        FROM unit_universe u
+        LEFT JOIN unit_status_cte          us ON us.unit_id = u.unit_id
+        LEFT JOIN latest_tenant_per_unit   lt ON lt.unit_id = u.unit_id
+        LEFT JOIN delinquency_agg          d  ON d.unit_id  = u.unit_id
+        LEFT JOIN ar_agg                   ar ON ar.unit_id  = u.unit_id
+        LEFT JOIN turnover_agg             t  ON t.unit_id   = u.unit_id
+      ),
+
+      scored AS (
+        SELECT
+          *,
+
+          -- STABILITY SCORE (0–100)
+          -- Penalises turnovers, delinquency, severe overdue, vacancy
+          GREATEST(0, LEAST(100,
+            100
+            - (turnover_count * 15)
+            - CASE WHEN delinquency_balance > 0    THEN 20 ELSE 0 END
+            - CASE WHEN max_days_overdue > 90       THEN 15 ELSE 0 END
+            - CASE WHEN unit_status = 'vacant'      THEN 10 ELSE 0 END
+          ))::integer AS stability_score,
+
+          -- PROFITABILITY SCORE (0–100)
+          -- Proxy: occupancy status + low delinquency + low turnover + clean AR
+          GREATEST(0, LEAST(100,
+            CASE WHEN unit_status = 'occupied' THEN 60
+                 WHEN unit_status = 'notice'   THEN 40
+                 ELSE 10
+            END
+            - CASE WHEN delinquency_balance > 5000  THEN 25
+                   WHEN delinquency_balance > 1000  THEN 15
+                   WHEN delinquency_balance > 0     THEN 5
+                   ELSE 0
+              END
+            - CASE WHEN turnover_count >= 3 THEN 20
+                   WHEN turnover_count = 2  THEN 10
+                   WHEN turnover_count = 1  THEN 5
+                   ELSE 0
+              END
+            + CASE WHEN financial_exposure = 0
+                        AND unit_status = 'occupied' THEN 20 ELSE 0 END
+          ))::integer AS profitability_score,
+
+          -- RISK SCORE (0–100)
+          -- Driven by financial exposure, turnover frequency, lease urgency, vacancy
+          GREATEST(0, LEAST(100,
+            CASE WHEN financial_exposure > 20000 THEN 50
+                 WHEN financial_exposure > 10000 THEN 40
+                 WHEN financial_exposure > 5000  THEN 25
+                 WHEN financial_exposure > 1000  THEN 15
+                 WHEN financial_exposure > 0     THEN 5
+                 ELSE 0
+            END
+            + CASE WHEN turnover_count >= 3 THEN 25
+                   WHEN turnover_count = 2  THEN 15
+                   WHEN turnover_count = 1  THEN 8
+                   ELSE 0
+              END
+            + CASE WHEN days_until_expiration IS NOT NULL
+                        AND days_until_expiration BETWEEN 0 AND 30  THEN 25
+                   WHEN days_until_expiration IS NOT NULL
+                        AND days_until_expiration BETWEEN 31 AND 60 THEN 15
+                   WHEN days_until_expiration IS NOT NULL
+                        AND days_until_expiration BETWEEN 61 AND 90 THEN 8
+                   ELSE 0
+              END
+            + CASE WHEN unit_status = 'vacant' THEN 10 ELSE 0 END
+          ))::integer AS risk_score
+
+        FROM assembled
+      ),
+
+      classified AS (
+        SELECT
+          unit_id,
+          unit_status,
+          COALESCE(tenant_name, 'Vacant')       AS tenant_name,
+          tenant_id,
+          ROUND(financial_exposure::numeric, 2) AS financial_exposure,
+          ROUND(delinquency_balance::numeric, 2) AS delinquency_balance,
+          ROUND(ar_balance::numeric, 2)          AS ar_balance,
+          max_days_overdue,
+          turnover_count,
+          stability_score,
+          profitability_score,
+          risk_score,
+          CASE
+            WHEN risk_score >= 55                                     THEN 'High Risk Unit'
+            WHEN unit_status = 'vacant' AND turnover_count >= 2       THEN 'Turnover Heavy'
+            WHEN unit_status IN ('vacant','notice') AND turnover_count >= 1 THEN 'Vacancy Risk'
+            WHEN stability_score >= 75 AND risk_score < 20            THEN 'Stable Performer'
+            WHEN turnover_count >= 3                                  THEN 'Turnover Heavy'
+            ELSE 'Neutral'
+          END AS classification,
+          lease_end_date::text            AS lease_end_date,
+          days_until_expiration::text     AS days_until_expiration
+        FROM scored
+      )
+
+      SELECT * FROM classified
+      WHERE
+        (${filterStatus}::text IS NULL OR unit_status = ${filterStatus}::text)
+        AND (${filterClass}::text IS NULL OR classification = ${filterClass}::text)
+      ORDER BY
+        CASE WHEN ${sortBy} = 'stability_score'     THEN stability_score     END ${sql.unsafe(sortDir)},
+        CASE WHEN ${sortBy} = 'profitability_score' THEN profitability_score END ${sql.unsafe(sortDir)},
+        CASE WHEN ${sortBy} = 'risk_score' OR ${sortBy} NOT IN ('stability_score','profitability_score')
+             THEN risk_score END ${sql.unsafe(sortDir)},
+        financial_exposure DESC,
+        unit_id ASC
+      LIMIT ${limit} OFFSET ${offset}
+    `;
+
+    // Count query for pagination (same filters, no ORDER/LIMIT)
+    const countRows = await sql<{ count: string }[]>`
+      WITH
+      unit_universe AS (
+        SELECT DISTINCT unit_id FROM gold_lease_expirations
+          WHERE unit_id IS NOT NULL AND unit_id <> 'unknown'
+        UNION
+        SELECT DISTINCT unit_id FROM gold_unit_turnover
+          WHERE unit_id IS NOT NULL AND unit_id <> 'unknown'
+        UNION
+        SELECT DISTINCT unit_id FROM gold_aged_receivables
+          WHERE unit_id IS NOT NULL AND unit_id <> 'unknown'
+      ),
+      latest_tenant_per_unit AS (
+        SELECT DISTINCT ON (le.unit_id)
+          le.unit_id, le.tenant_id, le.lease_end_date, le.days_until_expiration
+        FROM gold_lease_expirations le
+        ORDER BY le.unit_id, le.lease_end_date DESC NULLS LAST
+      ),
+      unit_status_cte AS (
+        SELECT u.unit_id,
+          CASE
+            WHEN lt.lease_end_date IS NULL THEN 'vacant'
+            WHEN lt.days_until_expiration BETWEEN 0 AND 60 THEN 'notice'
+            WHEN lt.days_until_expiration < 0 THEN 'vacant'
+            ELSE 'occupied'
+          END AS unit_status
+        FROM unit_universe u
+        LEFT JOIN latest_tenant_per_unit lt ON lt.unit_id = u.unit_id
+      ),
+      delinquency_agg AS (
+        SELECT unit_id, SUM(balance_due) AS delinquency_balance
+        FROM gold_delinquency_records WHERE unit_id IS NOT NULL AND unit_id <> 'unknown'
+        GROUP BY unit_id
+      ),
+      ar_agg AS (
+        SELECT unit_id, SUM(total_balance) AS ar_balance
+        FROM gold_aged_receivables WHERE unit_id IS NOT NULL AND unit_id <> 'unknown'
+        GROUP BY unit_id
+      ),
+      turnover_agg AS (
+        SELECT unit_id, COUNT(*) AS turnover_count
+        FROM gold_unit_turnover WHERE unit_id IS NOT NULL AND unit_id <> 'unknown'
+        GROUP BY unit_id
+      ),
+      assembled AS (
+        SELECT u.unit_id, us.unit_status,
+          COALESCE(d.delinquency_balance,0)+COALESCE(ar.ar_balance,0) AS financial_exposure,
+          COALESCE(t.turnover_count,0) AS turnover_count
+        FROM unit_universe u
+        LEFT JOIN unit_status_cte us ON us.unit_id = u.unit_id
+        LEFT JOIN delinquency_agg d  ON d.unit_id  = u.unit_id
+        LEFT JOIN ar_agg          ar ON ar.unit_id  = u.unit_id
+        LEFT JOIN turnover_agg    t  ON t.unit_id   = u.unit_id
+      ),
+      scored AS (
+        SELECT unit_id, unit_status, turnover_count, financial_exposure,
+          GREATEST(0,LEAST(100,
+            CASE WHEN financial_exposure>20000 THEN 50 WHEN financial_exposure>10000 THEN 40
+                 WHEN financial_exposure>5000 THEN 25 WHEN financial_exposure>1000 THEN 15
+                 WHEN financial_exposure>0 THEN 5 ELSE 0 END
+            + CASE WHEN turnover_count>=3 THEN 25 WHEN turnover_count=2 THEN 15
+                   WHEN turnover_count=1 THEN 8 ELSE 0 END
+            + CASE WHEN unit_status='vacant' THEN 10 ELSE 0 END
+          ))::integer AS risk_score,
+          GREATEST(0,LEAST(100,100-(turnover_count*15)))::integer AS stability_score
+        FROM assembled
+      ),
+      classified AS (
+        SELECT unit_id, unit_status, turnover_count, risk_score, stability_score,
+          CASE
+            WHEN risk_score>=55 THEN 'High Risk Unit'
+            WHEN unit_status='vacant' AND turnover_count>=2 THEN 'Turnover Heavy'
+            WHEN unit_status IN ('vacant','notice') AND turnover_count>=1 THEN 'Vacancy Risk'
+            WHEN stability_score>=75 AND risk_score<20 THEN 'Stable Performer'
+            WHEN turnover_count>=3 THEN 'Turnover Heavy'
+            ELSE 'Neutral'
+          END AS classification
+        FROM scored
+      )
+      SELECT COUNT(*)::text AS count FROM classified
+      WHERE
+        (${filterStatus}::text IS NULL OR unit_status = ${filterStatus}::text)
+        AND (${filterClass}::text IS NULL OR classification = ${filterClass}::text)
+    `;
+
+    const total = parseInt(countRows[0]?.count ?? "0", 10);
+
+    // ── Portfolio summary ──────────────────────────────────────────────────────
+    const avgRisk         = rows.length > 0
+      ? Math.round(rows.reduce((s, r) => s + parseInt(String(r.risk_score), 10), 0) / rows.length)
+      : 0;
+    const avgStability    = rows.length > 0
+      ? Math.round(rows.reduce((s, r) => s + parseInt(String(r.stability_score), 10), 0) / rows.length)
+      : 0;
+    const totalExposure   = rows.reduce((s, r) => s + parseFloat(String(r.financial_exposure)), 0);
+
+    const classificationCounts: Record<string, number> = {};
+    const statusCounts: Record<string, number> = {};
+    for (const r of rows) {
+      classificationCounts[r.classification] = (classificationCounts[r.classification] ?? 0) + 1;
+      statusCounts[r.unit_status] = (statusCounts[r.unit_status] ?? 0) + 1;
+    }
+
+    res.status(200).json({
+      success: true,
+      total,
+      limit,
+      offset,
+      sort_by:  sortBy,
+      sort_dir: sortDir.toLowerCase(),
+      filters: {
+        unit_status:    filterStatus,
+        classification: filterClass,
+      },
+      summary: {
+        avg_risk_score:      avgRisk,
+        avg_stability_score: avgStability,
+        total_financial_exposure: parseFloat(totalExposure.toFixed(2)),
+        classification_breakdown: classificationCounts,
+        status_breakdown:         statusCounts,
+      },
+      data: rows.map((r) => ({
+        unit_id:               r.unit_id,
+        unit_status:           r.unit_status,
+        tenant_name:           r.tenant_name,
+        financial_exposure:    parseFloat(String(r.financial_exposure)),
+        delinquency_balance:   parseFloat(String(r.delinquency_balance)),
+        ar_balance:            parseFloat(String(r.ar_balance)),
+        max_days_overdue:      parseInt(String(r.max_days_overdue), 10),
+        turnover_count:        parseInt(String(r.turnover_count), 10),
+        stability_score:       parseInt(String(r.stability_score), 10),
+        profitability_score:   parseInt(String(r.profitability_score), 10),
+        risk_score:            parseInt(String(r.risk_score), 10),
+        classification:        r.classification,
+        lease_end_date:        r.lease_end_date ?? null,
+        days_until_expiration: r.days_until_expiration !== null
+          ? parseInt(String(r.days_until_expiration), 10)
+          : null,
+      })),
+    });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`[${SERVICE_NAME}] GET /api/v1/insights/unit-intelligence error:`, message);
+    res.status(500).json({ success: false, error: message });
+  } finally {
+    if (sql) await sql.end();
+  }
+});
+
 // ── API v1 root ───────────────────────────────────────────────────────────────
 app.get("/api/v1", (_req: Request, res: Response) => {
   res.status(200).json({
@@ -2028,6 +2430,7 @@ app.get("/api/v1", (_req: Request, res: Response) => {
       "GET  /api/v1/insights/portfolio-health",
       "GET  /api/v1/insights/collections-risk",
       "GET  /api/v1/insights/turnover-velocity",
+      "GET  /api/v1/insights/unit-intelligence",
     ],
   });
 });
