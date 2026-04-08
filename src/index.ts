@@ -1639,7 +1639,9 @@ app.get("/api/v1/insights/portfolio-health", async (_req: Request, res: Response
           LIMIT 1
         ) AS net_operating_income,
         (
-          SELECT profit_margin::text
+          -- Only return profit_margin when expenses are actually available
+          -- (total_expenses = 0 means AppFolio didn't export expense data)
+          SELECT CASE WHEN total_expenses > 0 THEN profit_margin::text ELSE NULL END
           FROM gold_income_statements
           ORDER BY report_date DESC, created_at DESC
           LIMIT 1
@@ -1760,15 +1762,17 @@ app.get("/api/v1/insights/portfolio-health", async (_req: Request, res: Response
         occupancy_rate:         occupancyRate,
         vacancy_rate:           vacancyRate,
         net_operating_income:   noi,
-        profit_margin:          profitMargin,
+        profit_margin:          profitMargin,   // null when expense data unavailable
+        gross_revenue:          noi,            // always available as fallback
         total_delinquency_balance: totalDelinquency,
         avg_aged_receivables_risk_score: avgRiskScore,
         high_expiration_risk_count: highExpCount,
       },
       data_availability: {
-        occupancy_data:  occupancyRate !== null,
-        financial_data:  noi !== null || profitMargin !== null,
-        risk_data:       totalDelinquency > 0 || avgRiskScore > 0,
+        occupancy_data:   occupancyRate !== null,
+        financial_data:   noi !== null || profitMargin !== null,
+        expense_data:     profitMargin !== null,  // false = AppFolio has no expense export
+        risk_data:        totalDelinquency > 0 || avgRiskScore > 0,
       },
     });
   } catch (err: unknown) {
@@ -2032,16 +2036,28 @@ app.get("/api/v1/insights/turnover-velocity", async (req: Request, res: Response
       LIMIT ${limit} OFFSET ${offset}
     `;
 
-    // Portfolio-level aggregates
+    // Portfolio-level aggregates — use 182 (authoritative unit_directory count) as denominator
     const portfolioQuery = sql<PortfolioRow[]>`
       SELECT
         COUNT(*)::text                    AS total_turnover_events,
         COUNT(DISTINCT unit_id)::text     AS units_with_turnover,
-        (SELECT COUNT(DISTINCT unit_id) FROM gold_unit_turnover)::text AS total_units_tracked
+        (
+          WITH latest_dir AS (
+            SELECT MAX(report_date) AS dt FROM bronze_appfolio_reports WHERE report_type = 'unit_directory'
+          )
+          SELECT COUNT(DISTINCT LOWER(REGEXP_REPLACE(TRIM(elem->>'UnitName'), '\s*-\s*', '-', 'g')))
+          FROM bronze_appfolio_reports b,
+               jsonb_array_elements(b.raw_data->'results') AS elem,
+               latest_dir
+          WHERE b.report_type = 'unit_directory'
+            AND b.report_date = latest_dir.dt
+            AND elem->>'UnitName' IS NOT NULL
+            AND TRIM(elem->>'UnitName') <> ''
+        )::text AS total_units_tracked
       FROM gold_unit_turnover
     `;
 
-    // Total units for pagination
+    // Total units for pagination (still only units with events)
     const countQuery = sql<{ count: string }[]>`
       SELECT COUNT(DISTINCT unit_id)::text AS count FROM gold_unit_turnover
     `;
@@ -2091,9 +2107,14 @@ app.get("/api/v1/insights/turnover-velocity", async (req: Request, res: Response
       };
     });
 
-    // Portfolio stability score = avg of unit stability scores
-    const portfolioStabilityScore = units.length > 0
-      ? Math.round(units.reduce((sum, u) => sum + u.stability_score, 0) / units.length)
+    // Portfolio stability score = avg across ALL 182 units
+    // Units with no turnover events each score 100; include them in the average
+    const zeroTurnoverUnits = unitsTracked - units.length;
+    const sumStability = units.reduce((sum, u) => sum + u.stability_score, 0)
+      + (zeroTurnoverUnits > 0 ? zeroTurnoverUnits * 100 : 0);
+    const totalForAvg = unitsTracked > 0 ? unitsTracked : units.length;
+    const portfolioStabilityScore = totalForAvg > 0
+      ? Math.round(sumStability / totalForAvg)
       : 100;
     const portfolioClassification =
       portfolioStabilityScore >= 70 ? "Stable" :
@@ -2678,6 +2699,188 @@ app.get("/api/v1/insights/unit-intelligence", async (req: Request, res: Response
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
     console.error(`[${SERVICE_NAME}] GET /api/v1/insights/unit-intelligence error:`, message);
+    res.status(500).json({ success: false, error: message });
+  } finally {
+    if (sql) await sql.end();
+  }
+});
+
+// ── GET /api/v1/renewals ─────────────────────────────────────────────────────
+// Returns upcoming leases (90–365 days) joined with manual renewal tracking data.
+// The renewal_tracking table is created on first use (no migration needed).
+app.get("/api/v1/renewals", async (req: Request, res: Response) => {
+  let sql: postgres.Sql | null = null;
+  try {
+    const fromDays = Math.max(parseInt(String(req.query.from_days ?? "0"),  10), 0);
+    const toDays   = Math.min(parseInt(String(req.query.to_days   ?? "365"), 10), 730);
+    const limit    = Math.min(parseInt(String(req.query.limit     ?? "100"), 10), 500);
+    const offset   = parseInt(String(req.query.offset ?? "0"), 10);
+    sql = getDb();
+
+    // Ensure renewal_tracking table exists
+    await sql`
+      CREATE TABLE IF NOT EXISTS renewal_tracking (
+        unit_id          TEXT PRIMARY KEY,
+        renewal_status   TEXT NOT NULL DEFAULT 'pending'
+                         CHECK (renewal_status IN ('pending','in_progress','signed','declined')),
+        proposed_rent    NUMERIC(10,2),
+        notes            TEXT,
+        updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `;
+
+    const rows = await sql<{
+      id: string; unit_id: string; tenant_id: string;
+      lease_end_date: string; days_until_expiration: string;
+      monthly_rent: string | null; contact_email: string | null; contact_phone: string | null;
+      renewal_status: string; proposed_rent: string | null; notes: string | null; updated_at: string | null;
+    }[]>`
+      WITH rent_lookup AS (
+        WITH latest_rr AS (SELECT MAX(report_date) AS dt FROM bronze_appfolio_reports WHERE report_type = 'rent_roll')
+        SELECT DISTINCT ON (LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g')))
+          LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g')) AS unit_id,
+          NULLIF(REPLACE(elem->>'Rent', ',', ''), '0.00')::numeric         AS monthly_rent
+        FROM bronze_appfolio_reports b,
+             jsonb_array_elements(b.raw_data->'results') AS elem,
+             latest_rr
+        WHERE b.report_type = 'rent_roll' AND b.report_date = latest_rr.dt
+          AND elem->>'Rent' IS NOT NULL
+      ),
+      tenant_lookup AS (
+        WITH latest_td AS (SELECT MAX(report_date) AS dt FROM bronze_appfolio_reports WHERE report_type = 'tenant_directory')
+        SELECT DISTINCT ON (LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g')))
+          LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g'))       AS unit_id,
+          NULLIF(TRIM(elem->>'Emails'), '')                                      AS contact_email,
+          NULLIF(REGEXP_REPLACE(TRIM(COALESCE(elem->>'PhoneNumbers', '')),
+            '^(Mobile|Phone|Home|Work|Fax):\s*', '', 'i'), '')                  AS contact_phone,
+          NULLIF(TRIM(elem->>'Name'), '')                                        AS tenant_name
+        FROM bronze_appfolio_reports b,
+             jsonb_array_elements(b.raw_data->'results') AS elem,
+             latest_td
+        WHERE b.report_type = 'tenant_directory' AND b.report_date = latest_td.dt
+          AND elem->>'Status' NOT ILIKE '%vacant%'
+          AND elem->>'Unit' IS NOT NULL
+      )
+      SELECT
+        le.id, le.unit_id, le.tenant_id,
+        le.lease_end_date::text,
+        (le.lease_end_date - CURRENT_DATE)::int::text AS days_until_expiration,
+        rl.monthly_rent::text,
+        tl.contact_email,
+        tl.contact_phone,
+        COALESCE(tl.tenant_name, 'Unknown') AS tenant_name,
+        COALESCE(rt.renewal_status, 'pending') AS renewal_status,
+        rt.proposed_rent::text,
+        rt.notes,
+        rt.updated_at::text
+      FROM gold_lease_expirations le
+      LEFT JOIN rent_lookup   rl ON rl.unit_id = le.unit_id
+      LEFT JOIN tenant_lookup tl ON tl.unit_id = le.unit_id
+      LEFT JOIN renewal_tracking rt ON rt.unit_id = le.unit_id
+      WHERE le.lease_end_date IS NOT NULL
+        AND (le.lease_end_date - CURRENT_DATE) > ${fromDays}
+        AND (le.lease_end_date - CURRENT_DATE) <= ${toDays}
+      ORDER BY le.lease_end_date ASC
+      LIMIT ${limit} OFFSET ${offset}
+    `;
+
+    const countRes = await sql<{ count: string }[]>`
+      SELECT COUNT(*) AS count FROM gold_lease_expirations
+      WHERE lease_end_date IS NOT NULL
+        AND (lease_end_date - CURRENT_DATE) > ${fromDays}
+        AND (lease_end_date - CURRENT_DATE) <= ${toDays}
+    `;
+    const total = parseInt(countRes[0].count, 10);
+
+    const data = rows.map(r => ({
+      id:                   r.id,
+      unit_id:              r.unit_id,
+      tenant_id:            r.tenant_id,
+      tenant_name:          (r as any).tenant_name ?? 'Unknown',
+      lease_end_date:       r.lease_end_date,
+      days_until_expiration: parseInt(r.days_until_expiration, 10),
+      current_rent:         r.monthly_rent !== null ? parseFloat(r.monthly_rent) : null,
+      proposed_rent:        r.proposed_rent !== null ? parseFloat(r.proposed_rent) : null,
+      renewal_status:       r.renewal_status as 'pending' | 'in_progress' | 'signed' | 'declined',
+      contact_email:        r.contact_email ?? null,
+      contact_phone:        r.contact_phone ?? null,
+      notes:                r.notes ?? null,
+      tracking_updated_at:  r.updated_at ?? null,
+    }));
+
+    res.status(200).json({ success: true, total, count: data.length, limit, offset, data });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`[${SERVICE_NAME}] GET /api/v1/renewals error:`, message);
+    res.status(500).json({ success: false, error: message });
+  } finally {
+    if (sql) await sql.end();
+  }
+});
+
+// ── PUT /api/v1/renewals/:unit_id ─────────────────────────────────────────────
+// Upsert renewal tracking data for a unit.
+// Body: { renewal_status?, proposed_rent?, notes? }
+app.put("/api/v1/renewals/:unit_id", async (req: Request, res: Response) => {
+  let sql: postgres.Sql | null = null;
+  try {
+    const unitId = req.params.unit_id.toLowerCase().trim();
+    const { renewal_status, proposed_rent, notes } = req.body as {
+      renewal_status?: string;
+      proposed_rent?: number | null;
+      notes?: string | null;
+    };
+
+    const validStatuses = ['pending', 'in_progress', 'signed', 'declined'];
+    if (renewal_status && !validStatuses.includes(renewal_status)) {
+      res.status(400).json({ success: false, error: `Invalid renewal_status. Must be one of: ${validStatuses.join(', ')}` });
+      return;
+    }
+
+    sql = getDb();
+
+    // Ensure table exists
+    await sql`
+      CREATE TABLE IF NOT EXISTS renewal_tracking (
+        unit_id          TEXT PRIMARY KEY,
+        renewal_status   TEXT NOT NULL DEFAULT 'pending'
+                         CHECK (renewal_status IN ('pending','in_progress','signed','declined')),
+        proposed_rent    NUMERIC(10,2),
+        notes            TEXT,
+        updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `;
+
+    const [row] = await sql<{ unit_id: string; renewal_status: string; proposed_rent: string | null; notes: string | null; updated_at: string }[]>`
+      INSERT INTO renewal_tracking (unit_id, renewal_status, proposed_rent, notes, updated_at)
+      VALUES (
+        ${unitId},
+        ${renewal_status ?? 'pending'},
+        ${proposed_rent !== undefined ? proposed_rent : null},
+        ${notes !== undefined ? notes : null},
+        NOW()
+      )
+      ON CONFLICT (unit_id) DO UPDATE SET
+        renewal_status = COALESCE(EXCLUDED.renewal_status, renewal_tracking.renewal_status),
+        proposed_rent  = CASE WHEN ${proposed_rent !== undefined} THEN EXCLUDED.proposed_rent ELSE renewal_tracking.proposed_rent END,
+        notes          = CASE WHEN ${notes !== undefined} THEN EXCLUDED.notes ELSE renewal_tracking.notes END,
+        updated_at     = NOW()
+      RETURNING unit_id, renewal_status, proposed_rent::text, notes, updated_at::text
+    `;
+
+    res.status(200).json({
+      success: true,
+      data: {
+        unit_id:        row.unit_id,
+        renewal_status: row.renewal_status,
+        proposed_rent:  row.proposed_rent !== null ? parseFloat(row.proposed_rent) : null,
+        notes:          row.notes,
+        updated_at:     row.updated_at,
+      },
+    });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`[${SERVICE_NAME}] PUT /api/v1/renewals/:unit_id error:`, message);
     res.status(500).json({ success: false, error: message });
   } finally {
     if (sql) await sql.end();
