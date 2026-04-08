@@ -54,6 +54,7 @@ interface GoldLeaseExpiration {
   lease_start_date: unknown;
   lease_end_date: unknown;
   days_until_expiration: number | null;
+  monthly_rent: string | null;  // sourced from rent_roll Bronze via rent_lookup CTE
   created_at: Date;
 }
 
@@ -143,6 +144,10 @@ function mapRow(r: GoldLeaseExpiration) {
     lease_start_date: toDateStr(r.lease_start_date),
     lease_end_date: toDateStr(r.lease_end_date),
     days_until_expiration: r.days_until_expiration,
+    // monthly_rent sourced from rent_roll Bronze; null for vacant/unrented units
+    monthly_rent: r.monthly_rent !== null && r.monthly_rent !== undefined
+      ? parseFloat(r.monthly_rent)
+      : null,
     created_at: r.created_at,
   };
 }
@@ -164,12 +169,26 @@ app.get("/api/v1/leases/expirations", async (req: Request, res: Response) => {
     const offset = Math.max(parseInt(String(req.query.offset ?? "0"),   10), 0);
     sql = getDb();
     const rows = await sql<GoldLeaseExpiration[]>`
-      SELECT id, bronze_report_id, tenant_id, unit_id,
-             lease_start_date::text AS lease_start_date,
-             lease_end_date::text   AS lease_end_date,
-             days_until_expiration, created_at
-      FROM gold_lease_expirations
-      ORDER BY lease_end_date ASC NULLS LAST
+      WITH rent_lookup AS (
+        WITH latest_rr AS (SELECT MAX(report_date) AS dt FROM bronze_appfolio_reports WHERE report_type = 'rent_roll')
+        SELECT DISTINCT ON (LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g')))
+          LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g')) AS unit_id,
+          NULLIF(REPLACE(elem->>'Rent', ',', ''), '0.00')::numeric         AS monthly_rent
+        FROM bronze_appfolio_reports b,
+             jsonb_array_elements(b.raw_data->'results') AS elem,
+             latest_rr
+        WHERE b.report_type = 'rent_roll' AND b.report_date = latest_rr.dt
+          AND elem->>'Rent' IS NOT NULL
+      )
+      SELECT le.id, le.bronze_report_id, le.tenant_id, le.unit_id,
+             le.lease_start_date::text AS lease_start_date,
+             le.lease_end_date::text   AS lease_end_date,
+             le.days_until_expiration,
+             rl.monthly_rent::text     AS monthly_rent,
+             le.created_at
+      FROM gold_lease_expirations le
+      LEFT JOIN rent_lookup rl ON rl.unit_id = le.unit_id
+      ORDER BY le.lease_end_date ASC NULLS LAST
       LIMIT ${limit} OFFSET ${offset}
     `;
     const total = await sql<{ count: string }[]>`SELECT COUNT(*) AS count FROM gold_lease_expirations`;
@@ -191,16 +210,29 @@ app.get("/api/v1/leases/expiring-soon", async (req: Request, res: Response) => {
     const limit = Math.min(parseInt(String(req.query.limit ?? "100"), 10), 500);
     sql = getDb();
     const rows = await sql<GoldLeaseExpiration[]>`
-      SELECT id, bronze_report_id, tenant_id, unit_id,
-             lease_start_date::text AS lease_start_date,
-             lease_end_date::text   AS lease_end_date,
-             (lease_end_date - CURRENT_DATE)::int AS days_until_expiration,
-             created_at
-      FROM gold_lease_expirations
-      WHERE lease_end_date IS NOT NULL
-        AND lease_end_date >= CURRENT_DATE
-        AND (lease_end_date - CURRENT_DATE) <= ${days}
-      ORDER BY lease_end_date ASC
+      WITH rent_lookup AS (
+        WITH latest_rr AS (SELECT MAX(report_date) AS dt FROM bronze_appfolio_reports WHERE report_type = 'rent_roll')
+        SELECT DISTINCT ON (LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g')))
+          LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g')) AS unit_id,
+          NULLIF(REPLACE(elem->>'Rent', ',', ''), '0.00')::numeric         AS monthly_rent
+        FROM bronze_appfolio_reports b,
+             jsonb_array_elements(b.raw_data->'results') AS elem,
+             latest_rr
+        WHERE b.report_type = 'rent_roll' AND b.report_date = latest_rr.dt
+          AND elem->>'Rent' IS NOT NULL
+      )
+      SELECT le.id, le.bronze_report_id, le.tenant_id, le.unit_id,
+             le.lease_start_date::text AS lease_start_date,
+             le.lease_end_date::text   AS lease_end_date,
+             (le.lease_end_date - CURRENT_DATE)::int AS days_until_expiration,
+             rl.monthly_rent::text     AS monthly_rent,
+             le.created_at
+      FROM gold_lease_expirations le
+      LEFT JOIN rent_lookup rl ON rl.unit_id = le.unit_id
+      WHERE le.lease_end_date IS NOT NULL
+        AND le.lease_end_date >= CURRENT_DATE
+        AND (le.lease_end_date - CURRENT_DATE) <= ${days}
+      ORDER BY le.lease_end_date ASC
       LIMIT ${limit}
     `;
     const countRes = await sql<{ count: string }[]>`
@@ -229,16 +261,29 @@ app.get("/api/v1/leases/upcoming-renewals", async (req: Request, res: Response) 
     const limit    = Math.min(parseInt(String(req.query.limit     ?? "100"), 10), 500);
     sql = getDb();
     const rows = await sql<GoldLeaseExpiration[]>`
-      SELECT id, bronze_report_id, tenant_id, unit_id,
-             lease_start_date::text AS lease_start_date,
-             lease_end_date::text   AS lease_end_date,
-             (lease_end_date - CURRENT_DATE)::int AS days_until_expiration,
-             created_at
-      FROM gold_lease_expirations
-      WHERE lease_end_date IS NOT NULL
-        AND (lease_end_date - CURRENT_DATE) > ${fromDays}
-        AND (lease_end_date - CURRENT_DATE) <= ${toDays}
-      ORDER BY lease_end_date ASC
+      WITH rent_lookup AS (
+        WITH latest_rr AS (SELECT MAX(report_date) AS dt FROM bronze_appfolio_reports WHERE report_type = 'rent_roll')
+        SELECT DISTINCT ON (LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g')))
+          LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g')) AS unit_id,
+          NULLIF(REPLACE(elem->>'Rent', ',', ''), '0.00')::numeric         AS monthly_rent
+        FROM bronze_appfolio_reports b,
+             jsonb_array_elements(b.raw_data->'results') AS elem,
+             latest_rr
+        WHERE b.report_type = 'rent_roll' AND b.report_date = latest_rr.dt
+          AND elem->>'Rent' IS NOT NULL
+      )
+      SELECT le.id, le.bronze_report_id, le.tenant_id, le.unit_id,
+             le.lease_start_date::text AS lease_start_date,
+             le.lease_end_date::text   AS lease_end_date,
+             (le.lease_end_date - CURRENT_DATE)::int AS days_until_expiration,
+             rl.monthly_rent::text     AS monthly_rent,
+             le.created_at
+      FROM gold_lease_expirations le
+      LEFT JOIN rent_lookup rl ON rl.unit_id = le.unit_id
+      WHERE le.lease_end_date IS NOT NULL
+        AND (le.lease_end_date - CURRENT_DATE) > ${fromDays}
+        AND (le.lease_end_date - CURRENT_DATE) <= ${toDays}
+      ORDER BY le.lease_end_date ASC
       LIMIT ${limit}
     `;
     const countRes = await sql<{ count: string }[]>`
@@ -271,12 +316,26 @@ app.get("/api/v1/leases/:id", async (req: Request, res: Response) => {
     }
     sql = getDb();
     const rows = await sql<GoldLeaseExpiration[]>`
-      SELECT id, bronze_report_id, tenant_id, unit_id,
-             lease_start_date::text AS lease_start_date,
-             lease_end_date::text   AS lease_end_date,
-             days_until_expiration, created_at
-      FROM gold_lease_expirations
-      WHERE id = ${id}
+      WITH rent_lookup AS (
+        WITH latest_rr AS (SELECT MAX(report_date) AS dt FROM bronze_appfolio_reports WHERE report_type = 'rent_roll')
+        SELECT DISTINCT ON (LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g')))
+          LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g')) AS unit_id,
+          NULLIF(REPLACE(elem->>'Rent', ',', ''), '0.00')::numeric         AS monthly_rent
+        FROM bronze_appfolio_reports b,
+             jsonb_array_elements(b.raw_data->'results') AS elem,
+             latest_rr
+        WHERE b.report_type = 'rent_roll' AND b.report_date = latest_rr.dt
+          AND elem->>'Rent' IS NOT NULL
+      )
+      SELECT le.id, le.bronze_report_id, le.tenant_id, le.unit_id,
+             le.lease_start_date::text AS lease_start_date,
+             le.lease_end_date::text   AS lease_end_date,
+             le.days_until_expiration,
+             rl.monthly_rent::text     AS monthly_rent,
+             le.created_at
+      FROM gold_lease_expirations le
+      LEFT JOIN rent_lookup rl ON rl.unit_id = le.unit_id
+      WHERE le.id = ${id}
       LIMIT 1
     `;
     if (rows.length === 0) {
