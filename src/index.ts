@@ -2283,7 +2283,7 @@ app.get("/api/v1/insights/unit-intelligence", async (req: Request, res: Response
           -- 2. gold_tenants via delinquency tenant_id
           -- 3. rent_roll Bronze (primary tenant, INITCAP formatted) — covers co-tenant units
           -- 4. 'Unknown'
-          COALESCE(lt.tenant_name, d.delinquency_tenant_name, rr.tenant_name, 'Unknown') AS tenant_name,
+          TRIM(REGEXP_REPLACE(COALESCE(lt.tenant_name, d.delinquency_tenant_name, rr.tenant_name, 'Unknown'), '[[:space:]]{2,}', ' ', 'g')) AS tenant_name,
           lt.tenant_id,
           lt.lease_end_date,
           lt.days_until_expiration,
