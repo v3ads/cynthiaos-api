@@ -2937,6 +2937,244 @@ app.get("/api/v1/units", async (_req: Request, res: Response) => {
   }
 });
 
+// ── GET /api/v1/insights/leasing-funnel ──────────────────────────────────────
+//
+// Funnel metrics derived from Bronze AppFolio reports:
+//   - guest_cards        → Leads    (date field: Received  "MM/DD/YYYY at HH:MM AM/PM")
+//   - rental_applications → Applications (date field: DecisionMadeAt)
+//   - lease_history      → Leases   (date field: LeaseStart "MM/DD/YYYY")
+//
+// Query params:
+//   from  YYYY-MM-DD  default: 90 days ago
+//   to    YYYY-MM-DD  default: today
+
+interface LeasingFunnelMonthRow {
+  period:       string;  // YYYY-MM
+  leads:        string;
+  applications: string;
+  leases:       string;
+}
+
+app.get("/api/v1/insights/leasing-funnel", async (req: Request, res: Response) => {
+  let sql: ReturnType<typeof getDb> | null = null;
+  try {
+    sql = getDb();
+
+    // ── Date range defaults ────────────────────────────────────────────────
+    const today = new Date();
+    const defaultFrom = new Date(today);
+    defaultFrom.setDate(defaultFrom.getDate() - 90);
+
+    const fromStr = typeof req.query.from === "string" && /^\d{4}-\d{2}-\d{2}$/.test(req.query.from)
+      ? req.query.from
+      : defaultFrom.toISOString().slice(0, 10);
+    const toStr = typeof req.query.to === "string" && /^\d{4}-\d{2}-\d{2}$/.test(req.query.to)
+      ? req.query.to
+      : today.toISOString().slice(0, 10);
+
+    // ── Helper: parse AppFolio date strings ────────────────────────────────
+    // Formats seen: "04/07/2026 at 09:11 AM"  "03/23/2026 at 11:12 AM"  "01/01/2026"
+    // We extract the date portion (first 10 chars after stripping) and convert MM/DD/YYYY → YYYY-MM-DD
+    // In SQL: use REGEXP_REPLACE to extract MM/DD/YYYY then TO_DATE
+    //   TO_DATE(REGEXP_REPLACE(elem->>'Received', ' at .*$', ''), 'MM/DD/YYYY')
+
+    // ── Aggregate counts by month in a single query ────────────────────────
+    // We use the latest Bronze report per report_type (highest report_date)
+    // and expand the results array, then parse dates.
+    const monthRows = await sql<LeasingFunnelMonthRow[]>`
+      WITH
+      -- Latest guest_cards Bronze report
+      latest_gc AS (
+        SELECT MAX(report_date) AS dt FROM bronze_appfolio_reports WHERE report_type = 'guest_cards'
+      ),
+      -- Latest rental_applications Bronze report
+      latest_ra AS (
+        SELECT MAX(report_date) AS dt FROM bronze_appfolio_reports WHERE report_type = 'rental_applications'
+      ),
+      -- Latest lease_history Bronze report
+      latest_lh AS (
+        SELECT MAX(report_date) AS dt FROM bronze_appfolio_reports WHERE report_type = 'lease_history'
+      ),
+
+      -- Leads: one row per guest card, filtered to date range
+      leads_raw AS (
+        SELECT
+          TO_DATE(
+            REGEXP_REPLACE(TRIM(elem->>'Received'), ' at .*$', ''),
+            'MM/DD/YYYY'
+          ) AS rec_date
+        FROM bronze_appfolio_reports bar, jsonb_array_elements(bar.raw_data->'results') AS elem, latest_gc
+        WHERE bar.report_type = 'guest_cards'
+          AND bar.report_date = latest_gc.dt
+          AND elem->>'Received' IS NOT NULL
+      ),
+      leads_filtered AS (
+        SELECT rec_date,
+               TO_CHAR(rec_date, 'YYYY-MM') AS period
+        FROM leads_raw
+        WHERE rec_date >= ${fromStr}::date
+          AND rec_date <= ${toStr}::date
+      ),
+
+      -- Applications: one row per application, filtered to date range
+      apps_raw AS (
+        SELECT
+          TO_DATE(
+            REGEXP_REPLACE(TRIM(elem->>'DecisionMadeAt'), ' at .*$', ''),
+            'MM/DD/YYYY'
+          ) AS app_date
+        FROM bronze_appfolio_reports bar, jsonb_array_elements(bar.raw_data->'results') AS elem, latest_ra
+        WHERE bar.report_type = 'rental_applications'
+          AND bar.report_date = latest_ra.dt
+          AND elem->>'DecisionMadeAt' IS NOT NULL
+      ),
+      apps_filtered AS (
+        SELECT app_date,
+               TO_CHAR(app_date, 'YYYY-MM') AS period
+        FROM apps_raw
+        WHERE app_date >= ${fromStr}::date
+          AND app_date <= ${toStr}::date
+      ),
+
+      -- Leases: one row per lease, filtered to date range
+      leases_raw AS (
+        SELECT
+          TO_DATE(TRIM(elem->>'LeaseStart'), 'MM/DD/YYYY') AS lease_date
+        FROM bronze_appfolio_reports bar, jsonb_array_elements(bar.raw_data->'results') AS elem, latest_lh
+        WHERE bar.report_type = 'lease_history'
+          AND bar.report_date = latest_lh.dt
+          AND elem->>'LeaseStart' IS NOT NULL
+      ),
+      leases_filtered AS (
+        SELECT lease_date,
+               TO_CHAR(lease_date, 'YYYY-MM') AS period
+        FROM leases_raw
+        WHERE lease_date >= ${fromStr}::date
+          AND lease_date <= ${toStr}::date
+      ),
+
+      -- All months that appear in any of the three datasets
+      all_periods AS (
+        SELECT period FROM leads_filtered
+        UNION
+        SELECT period FROM apps_filtered
+        UNION
+        SELECT period FROM leases_filtered
+      ),
+
+      -- Monthly aggregates
+      monthly AS (
+        SELECT
+          ap.period,
+          COUNT(DISTINCT lf.rec_date || lf.rec_date::text || ROW_NUMBER() OVER (PARTITION BY lf.period ORDER BY lf.rec_date)::text) AS leads,
+          COUNT(DISTINCT af.app_date || af.app_date::text || ROW_NUMBER() OVER (PARTITION BY af.period ORDER BY af.app_date)::text) AS applications,
+          COUNT(DISTINCT lsf.lease_date || lsf.lease_date::text || ROW_NUMBER() OVER (PARTITION BY lsf.period ORDER BY lsf.lease_date)::text) AS leases
+        FROM all_periods ap
+        LEFT JOIN leads_filtered  lf  ON lf.period  = ap.period
+        LEFT JOIN apps_filtered   af  ON af.period   = ap.period
+        LEFT JOIN leases_filtered lsf ON lsf.period  = ap.period
+        GROUP BY ap.period
+      )
+
+      SELECT
+        period,
+        COUNT(lf.rec_date)::text   AS leads,
+        COUNT(af.app_date)::text   AS applications,
+        COUNT(lsf.lease_date)::text AS leases
+      FROM all_periods ap
+      LEFT JOIN leads_filtered  lf  ON lf.period  = ap.period
+      LEFT JOIN apps_filtered   af  ON af.period   = ap.period
+      LEFT JOIN leases_filtered lsf ON lsf.period  = ap.period
+      GROUP BY ap.period
+      ORDER BY ap.period
+    `;
+
+    // ── Totals ─────────────────────────────────────────────────────────────
+    const totalLeads        = monthRows.reduce((s, r) => s + parseInt(r.leads,        10), 0);
+    const totalApplications = monthRows.reduce((s, r) => s + parseInt(r.applications, 10), 0);
+    const totalLeases       = monthRows.reduce((s, r) => s + parseInt(r.leases,       10), 0);
+
+    // ── Conversion rates (rounded integers, no division by zero) ──────────
+    const pct = (num: number, den: number): number =>
+      den === 0 ? 0 : Math.round((num / den) * 100);
+
+    const leadToAppPct   = pct(totalApplications, totalLeads);
+    const appToLeasePct  = pct(totalLeases,       totalApplications);
+    const leadToLeasePct = pct(totalLeases,       totalLeads);
+
+    // ── Funnel stages ──────────────────────────────────────────────────────
+    const funnel = [
+      {
+        stage:                  "Leads",
+        count:                  totalLeads,
+        conversion_from_prev:   null,
+        drop_off_from_prev:     null,
+        conversion_from_leads:  100,
+      },
+      {
+        stage:                  "Applications",
+        count:                  totalApplications,
+        conversion_from_prev:   leadToAppPct,
+        drop_off_from_prev:     totalLeads > 0 ? Math.round(((totalLeads - totalApplications) / totalLeads) * 100) : 0,
+        conversion_from_leads:  leadToAppPct,
+      },
+      {
+        stage:                  "Leases",
+        count:                  totalLeases,
+        conversion_from_prev:   appToLeasePct,
+        drop_off_from_prev:     totalApplications > 0 ? Math.round(((totalApplications - totalLeases) / totalApplications) * 100) : 0,
+        conversion_from_leads:  leadToLeasePct,
+      },
+    ];
+
+    // ── Trend (monthly breakdown) ──────────────────────────────────────────
+    const MONTH_LABELS: Record<string, string> = {
+      "01": "Jan", "02": "Feb", "03": "Mar", "04": "Apr",
+      "05": "May", "06": "Jun", "07": "Jul", "08": "Aug",
+      "09": "Sep", "10": "Oct", "11": "Nov", "12": "Dec",
+    };
+    const trend = monthRows.map((r) => {
+      const [yr, mo] = r.period.split("-");
+      const leads        = parseInt(r.leads,        10);
+      const applications = parseInt(r.applications, 10);
+      const leases       = parseInt(r.leases,       10);
+      return {
+        period:            r.period,
+        period_label:      `${MONTH_LABELS[mo] ?? mo} ${yr}`,
+        leads,
+        applications,
+        leases,
+        lead_to_app_pct:   pct(applications, leads),
+        app_to_lease_pct:  pct(leases,       applications),
+        lead_to_lease_pct: pct(leases,       leads),
+      };
+    });
+
+    res.status(200).json({
+      success: true,
+      summary: {
+        total_leads:         totalLeads,
+        total_applications:  totalApplications,
+        total_leases:        totalLeases,
+        lead_to_app_pct:     leadToAppPct,
+        app_to_lease_pct:    appToLeasePct,
+        lead_to_lease_pct:   leadToLeasePct,
+        period_from:         fromStr,
+        period_to:           toStr,
+      },
+      funnel,
+      trend,
+    });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`[${SERVICE_NAME}] GET /api/v1/insights/leasing-funnel error:`, message);
+    res.status(500).json({ success: false, error: message });
+  } finally {
+    if (sql) await sql.end();
+  }
+});
+
+
 // ── TEMP DEBUG: sample bronze raw_data for leasing report types ─────────────
 app.get("/api/v1/debug/bronze-sample", async (req: Request, res: Response) => {
   let sql: ReturnType<typeof getDb> | null = null;
@@ -2994,6 +3232,7 @@ app.get("/api/v1", (_req: Request, res: Response) => {
       "GET  /api/v1/insights/collections-risk",
       "GET  /api/v1/insights/turnover-velocity",
       "GET  /api/v1/insights/unit-intelligence",
+      "GET  /api/v1/insights/leasing-funnel",
       "GET  /api/v1/units",
       "GET  /api/v1/renewals",
       "PUT  /api/v1/renewals/:unit_id",
