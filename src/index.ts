@@ -2199,7 +2199,7 @@ app.get("/api/v1/insights/unit-intelligence", async (req: Request, res: Response
         WITH latest_rr AS (SELECT MAX(report_date) AS dt FROM bronze_appfolio_reports WHERE report_type = 'rent_roll')
         SELECT DISTINCT ON (LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g')))
           LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g'))  AS unit_id,
-          TRIM(REGEXP_REPLACE(INITCAP(TRIM(elem->>'Tenant')), '\s{2,}', ' ', 'g')) AS tenant_name
+          TRIM(REGEXP_REPLACE(INITCAP(TRIM(elem->>'Tenant')), '[[:space:]]{2,}', ' ', 'g')) AS tenant_name
         FROM bronze_appfolio_reports b,
              jsonb_array_elements(b.raw_data->'results') AS elem,
              latest_rr
@@ -2718,7 +2718,7 @@ app.get("/api/v1/renewals", async (req: Request, res: Response) => {
         WITH latest_rr AS (SELECT MAX(report_date) AS dt FROM bronze_appfolio_reports WHERE report_type = 'rent_roll')
         SELECT DISTINCT ON (LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g')))
           LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g'))       AS unit_id,
-          NULLIF(TRIM(REGEXP_REPLACE(TRIM(elem->>'Tenant'), '\s{2,}', ' ', 'g')), '') AS tenant_name
+          NULLIF(TRIM(REGEXP_REPLACE(TRIM(elem->>'Tenant'), '[[:space:]]{2,}', ' ', 'g')), '') AS tenant_name
         FROM bronze_appfolio_reports b,
              jsonb_array_elements(b.raw_data->'results') AS elem,
              latest_rr
@@ -2732,7 +2732,7 @@ app.get("/api/v1/renewals", async (req: Request, res: Response) => {
         rl.monthly_rent::text,
         tl.contact_email,
         tl.contact_phone,
-        NULLIF(TRIM(REGEXP_REPLACE(COALESCE(rn.tenant_name, ''), '\s{2,}', ' ', 'g')), '') AS tenant_name,
+        NULLIF(TRIM(REGEXP_REPLACE(COALESCE(rn.tenant_name, ''), '[[:space:]]{2,}', ' ', 'g')), '') AS tenant_name,
         COALESCE(rt.renewal_status, 'pending') AS renewal_status,
         rt.proposed_rent::text,
         rt.notes,
