@@ -2855,12 +2855,36 @@ app.get("/api/v1/units", async (_req: Request, res: Response) => {
   let sql: ReturnType<typeof getDb> | null = null;
   try {
     sql = getDb();
+    // Enrich unit_status from the latest occupancy snapshot's unit_vacancy data
     const rows = await sql<{ unit_id: string; unit_status: string | null; created_at: string }[]>`
-      SELECT unit_id, unit_status, created_at::text FROM gold_units ORDER BY unit_id ASC
+      SELECT
+        gu.unit_id,
+        COALESCE(
+          (
+            SELECT
+              CASE
+                WHEN elem->>'Status' ILIKE '%notice%' THEN 'notice'
+                WHEN elem->>'Status' ILIKE '%vacant%' OR elem->>'Status' ILIKE '%unoccupied%' THEN 'vacant'
+                ELSE 'occupied'
+              END
+            FROM bronze_appfolio_reports bar
+            CROSS JOIN LATERAL jsonb_array_elements(bar.raw_data) AS elem
+            WHERE bar.report_type = 'unit_vacancy'
+              AND REGEXP_REPLACE(LOWER(TRIM(elem->>'Unit')), '\s*-\s*', '-', 'g') = gu.unit_id
+            ORDER BY bar.created_at DESC
+            LIMIT 1
+          ),
+          gu.unit_status
+        ) AS unit_status,
+        gu.created_at::text
+      FROM gold_units gu
+      ORDER BY gu.unit_id ASC
     `;
     res.status(200).json({
+      success: true,
       total: rows.length,
-      units: rows,
+      source: 'gold_units',
+      data: rows,
     });
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
