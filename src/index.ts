@@ -1603,8 +1603,10 @@ app.get("/api/v1/insights/lease-expiration-risk", async (req: Request, res: Resp
 
 // ── GET /api/v1/insights/portfolio-health ────────────────────────────────────
 interface PortfolioHealthRow {
-  occupancy_rate:        string | null;
-  vacancy_rate:          string | null;
+  total_units:           string | null;
+  occupied_units:        string | null;
+  vacant_units:          string | null;
+  notice_units:          string | null;
   net_operating_income:  string | null;
   profit_margin:         string | null;
   total_delinquency:     string | null;
@@ -1619,20 +1621,40 @@ app.get("/api/v1/insights/portfolio-health", async (_req: Request, res: Response
 
     // Gather all signals in a single query using subqueries
     const [row] = await sql<PortfolioHealthRow[]>`
+      WITH latest_uv AS (
+        SELECT MAX(report_date) AS dt FROM bronze_appfolio_reports WHERE report_type = 'unit_vacancy'
+      ),
+      vacancy_status AS (
+        SELECT DISTINCT ON (LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g')))
+          LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g')) AS unit_id,
+          CASE
+            WHEN (elem->>'UnitStatus') ILIKE '%notice%' THEN 'notice'
+            WHEN (elem->>'UnitStatus') ILIKE '%vacant%' OR (elem->>'UnitStatus') ILIKE '%unoccupied%' THEN 'vacant'
+            ELSE 'occupied'
+          END AS unit_status
+        FROM bronze_appfolio_reports bar,
+             jsonb_array_elements(bar.raw_data->'results') AS elem,
+             latest_uv
+        WHERE bar.report_type = 'unit_vacancy'
+          AND bar.report_date = latest_uv.dt
+          AND elem->>'Unit' IS NOT NULL
+        ORDER BY LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g'))
+      ),
+      unit_counts AS (
+        SELECT
+          COUNT(*)                                                                   AS total_units,
+          COUNT(*) FILTER (WHERE COALESCE(vs.unit_status, 'occupied') = 'occupied') AS occupied_units,
+          COUNT(*) FILTER (WHERE COALESCE(vs.unit_status, 'occupied') = 'vacant')   AS vacant_units,
+          COUNT(*) FILTER (WHERE COALESCE(vs.unit_status, 'occupied') = 'notice')   AS notice_units
+        FROM gold_units gu
+        LEFT JOIN vacancy_status vs ON vs.unit_id = gu.unit_id
+      )
       SELECT
-        -- Occupancy: latest snapshot
-        (
-          SELECT occupancy_rate::text
-          FROM gold_occupancy_snapshots
-          ORDER BY report_date DESC, created_at DESC
-          LIMIT 1
-        ) AS occupancy_rate,
-        (
-          SELECT vacancy_rate::text
-          FROM gold_occupancy_snapshots
-          ORDER BY report_date DESC, created_at DESC
-          LIMIT 1
-        ) AS vacancy_rate,
+        -- Occupancy: derived from canonical gold_units (182-unit universe)
+        uc.total_units::text,
+        uc.occupied_units::text,
+        uc.vacant_units::text,
+        uc.notice_units::text,
         -- Financial: latest income statement
         (
           SELECT net_operating_income::text
@@ -1682,11 +1704,18 @@ app.get("/api/v1/insights/portfolio-health", async (_req: Request, res: Response
           WHERE days_until_expiration <= 60
             AND (risk_score >= 2000 OR risk_score IS NOT NULL)
         ) AS high_expiration_count
+      FROM unit_counts uc
     `;
 
     // ── Parse raw values ────────────────────────────────────────────────────
-    const occupancyRate   = row.occupancy_rate   !== null ? parseFloat(row.occupancy_rate)   : null;
-    const vacancyRate     = row.vacancy_rate      !== null ? parseFloat(row.vacancy_rate)     : null;
+    // Occupancy: derived from canonical gold_units universe (182 units)
+    const totalUnits    = parseInt(row.total_units    ?? "182", 10);
+    const occupiedUnits = parseInt(row.occupied_units ?? "0",   10);
+    const vacantUnits   = parseInt(row.vacant_units   ?? "0",   10);
+    const noticeUnits   = parseInt(row.notice_units   ?? "0",   10);
+    // Rates computed from canonical denominator
+    const occupancyRate = totalUnits > 0 ? occupiedUnits / totalUnits : null;
+    const vacancyRate   = totalUnits > 0 ? (vacantUnits + noticeUnits) / totalUnits : null;
     const noi             = row.net_operating_income !== null ? parseFloat(row.net_operating_income) : null;
     const profitMargin    = row.profit_margin     !== null ? parseFloat(row.profit_margin)    : null;
     const totalDelinquency = parseFloat(row.total_delinquency ?? "0");
@@ -1752,7 +1781,7 @@ app.get("/api/v1/insights/portfolio-health", async (_req: Request, res: Response
         occupancy: {
           score:       occupancyHealth,
           weight:      "30%",
-          description: "Derived from latest occupancy snapshot",
+          description: "Derived from canonical gold_units universe (182 units)",
         },
         risk: {
           score:       riskHealth,
@@ -1761,8 +1790,15 @@ app.get("/api/v1/insights/portfolio-health", async (_req: Request, res: Response
         },
       },
       supporting_metrics: {
-        occupancy_rate:         occupancyRate,
-        vacancy_rate:           vacancyRate,
+        // Unit counts — canonical 182-unit universe
+        total_units:            totalUnits,
+        occupied_units:         occupiedUnits,
+        vacant_units:           vacantUnits,
+        notice_units:           noticeUnits,
+        // Rates computed from canonical denominator
+        occupancy_rate:         occupancyRate !== null ? Math.round(occupancyRate * 10000) / 10000 : null,
+        vacancy_rate:           vacancyRate   !== null ? Math.round(vacancyRate   * 10000) / 10000 : null,
+        // Financial
         net_operating_income:   noi,
         profit_margin:          profitMargin,   // null when expense data unavailable
         gross_revenue:          noi,            // always available as fallback
@@ -1771,7 +1807,7 @@ app.get("/api/v1/insights/portfolio-health", async (_req: Request, res: Response
         high_expiration_risk_count: highExpCount,
       },
       data_availability: {
-        occupancy_data:   occupancyRate !== null,
+        occupancy_data:   totalUnits > 0,
         financial_data:   noi !== null || profitMargin !== null,
         expense_data:     profitMargin !== null,  // false = AppFolio has no expense export
         risk_data:        totalDelinquency > 0 || avgRiskScore > 0,
