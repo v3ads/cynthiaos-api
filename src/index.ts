@@ -2036,24 +2036,12 @@ app.get("/api/v1/insights/turnover-velocity", async (req: Request, res: Response
       LIMIT ${limit} OFFSET ${offset}
     `;
 
-    // Portfolio-level aggregates — use 182 (authoritative unit_directory count) as denominator
+    // Portfolio-level aggregates — use gold_units (canonical unit roster) as denominator
     const portfolioQuery = sql<PortfolioRow[]>`
       SELECT
         COUNT(*)::text                    AS total_turnover_events,
         COUNT(DISTINCT unit_id)::text     AS units_with_turnover,
-        (
-          WITH latest_dir AS (
-            SELECT MAX(report_date) AS dt FROM bronze_appfolio_reports WHERE report_type = 'unit_directory'
-          )
-          SELECT COUNT(DISTINCT LOWER(REGEXP_REPLACE(TRIM(elem->>'UnitName'), '\s*-\s*', '-', 'g')))
-          FROM bronze_appfolio_reports b,
-               jsonb_array_elements(b.raw_data->'results') AS elem,
-               latest_dir
-          WHERE b.report_type = 'unit_directory'
-            AND b.report_date = latest_dir.dt
-            AND elem->>'UnitName' IS NOT NULL
-            AND TRIM(elem->>'UnitName') <> ''
-        )::text AS total_units_tracked
+        (SELECT COUNT(*)::text FROM gold_units) AS total_units_tracked
       FROM gold_unit_turnover
     `;
 
@@ -2197,24 +2185,10 @@ app.get("/api/v1/insights/unit-intelligence", async (req: Request, res: Response
     const rows = await sql<UnitIntelligenceRow[]>`
       WITH
 
-      -- Authoritative unit list sourced from the unit_directory Bronze report.
-      -- This ensures ALL 182 units appear regardless of activity in Gold tables.
-      -- Units with no lease/turnover/AR data will appear with null/zero values.
+      -- Canonical unit list from gold_units (populated daily by unit_directory strategy).
+      -- This is the single authoritative source for all 182 units in the portfolio.
       unit_universe AS (
-        WITH latest_dir AS (
-          SELECT MAX(report_date) AS dt
-          FROM bronze_appfolio_reports
-          WHERE report_type = 'unit_directory'
-        )
-        SELECT DISTINCT
-          LOWER(REGEXP_REPLACE(TRIM(elem->>'UnitName'), '\s*-\s*', '-', 'g')) AS unit_id
-        FROM bronze_appfolio_reports b,
-             jsonb_array_elements(b.raw_data->'results') AS elem,
-             latest_dir
-        WHERE b.report_type = 'unit_directory'
-          AND b.report_date = latest_dir.dt
-          AND elem->>'UnitName' IS NOT NULL
-          AND TRIM(elem->>'UnitName') <> ''
+        SELECT unit_id FROM gold_units
       ),
 
       -- Tenant name from rent_roll Bronze: one row per unit, always the primary tenant.
@@ -2439,20 +2413,7 @@ app.get("/api/v1/insights/unit-intelligence", async (req: Request, res: Response
     const countRows = await sql<{ count: string }[]>`
       WITH
       unit_universe AS (
-        WITH latest_dir AS (
-          SELECT MAX(report_date) AS dt
-          FROM bronze_appfolio_reports
-          WHERE report_type = 'unit_directory'
-        )
-        SELECT DISTINCT
-          LOWER(REGEXP_REPLACE(TRIM(elem->>'UnitName'), '\s*-\s*', '-', 'g')) AS unit_id
-        FROM bronze_appfolio_reports b,
-             jsonb_array_elements(b.raw_data->'results') AS elem,
-             latest_dir
-        WHERE b.report_type = 'unit_directory'
-          AND b.report_date = latest_dir.dt
-          AND elem->>'UnitName' IS NOT NULL
-          AND TRIM(elem->>'UnitName') <> ''
+        SELECT unit_id FROM gold_units
       ),
       latest_tenant_per_unit AS (
         SELECT DISTINCT ON (le.unit_id)
@@ -2551,18 +2512,7 @@ app.get("/api/v1/insights/unit-intelligence", async (req: Request, res: Response
     const summaryRows = await sql<SummaryRow[]>`
       WITH
       unit_universe AS (
-        WITH latest_dir AS (
-          SELECT MAX(report_date) AS dt FROM bronze_appfolio_reports WHERE report_type = 'unit_directory'
-        )
-        SELECT DISTINCT
-          LOWER(REGEXP_REPLACE(TRIM(elem->>'UnitName'), '\s*-\s*', '-', 'g')) AS unit_id
-        FROM bronze_appfolio_reports b,
-             jsonb_array_elements(b.raw_data->'results') AS elem,
-             latest_dir
-        WHERE b.report_type = 'unit_directory'
-          AND b.report_date = latest_dir.dt
-          AND elem->>'UnitName' IS NOT NULL
-          AND TRIM(elem->>'UnitName') <> ''
+        SELECT unit_id FROM gold_units
       ),
       latest_lease AS (
         SELECT DISTINCT ON (unit_id) unit_id, lease_end_date, days_until_expiration
@@ -2900,6 +2850,27 @@ app.put("/api/v1/renewals/:unit_id", async (req: Request, res: Response) => {
   }
 });
 
+// ── Canonical unit roster ────────────────────────────────────────────────────
+app.get("/api/v1/units", async (_req: Request, res: Response) => {
+  let sql: ReturnType<typeof getDb> | null = null;
+  try {
+    sql = getDb();
+    const rows = await sql<{ unit_id: string; unit_status: string | null; created_at: string }[]>`
+      SELECT unit_id, unit_status, created_at::text FROM gold_units ORDER BY unit_id ASC
+    `;
+    res.status(200).json({
+      total: rows.length,
+      units: rows,
+    });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`[${SERVICE_NAME}] GET /api/v1/units error:`, message);
+    res.status(500).json({ success: false, error: message });
+  } finally {
+    if (sql) await sql.end();
+  }
+});
+
 // ── API v1 root ───────────────────────────────────────────────────────────────
 app.get("/api/v1", (_req: Request, res: Response) => {
   res.status(200).json({
@@ -2924,6 +2895,9 @@ app.get("/api/v1", (_req: Request, res: Response) => {
       "GET  /api/v1/insights/collections-risk",
       "GET  /api/v1/insights/turnover-velocity",
       "GET  /api/v1/insights/unit-intelligence",
+      "GET  /api/v1/units",
+      "GET  /api/v1/renewals",
+      "PUT  /api/v1/renewals/:unit_id",
     ],
   });
 });
@@ -2944,6 +2918,43 @@ app.use((_req: Request, res: Response) => {
 app.listen(PORT, "0.0.0.0", async () => {
   console.log(`[${SERVICE_NAME}] listening on port ${PORT}`);
   await checkDatabaseConnectivity();
+
+  // Bootstrap gold_units if not yet populated by the transform worker.
+  // This ensures unit-intelligence and turnover-velocity work immediately
+  // without waiting for the next scheduled cron run.
+  try {
+    const boot = getDb();
+    await boot`
+      CREATE TABLE IF NOT EXISTS gold_units (
+        unit_id    TEXT PRIMARY KEY,
+        unit_status TEXT,
+        created_at  TIMESTAMPTZ DEFAULT NOW()
+      )
+    `;
+    const [cnt] = await boot<{ n: string }[]>`SELECT COUNT(*)::text AS n FROM gold_units`;
+    if (parseInt(cnt.n, 10) === 0) {
+      console.log(`[${SERVICE_NAME}] gold_units empty — seeding from Bronze unit_directory...`);
+      await boot`
+        INSERT INTO gold_units (unit_id)
+        SELECT DISTINCT
+          LOWER(REGEXP_REPLACE(TRIM(elem->>'UnitName'), '\s*-\s*', '-', 'g')) AS unit_id
+        FROM bronze_appfolio_reports b,
+             jsonb_array_elements(b.raw_data->'results') AS elem
+        WHERE b.report_type = 'unit_directory'
+          AND b.report_date = (SELECT MAX(report_date) FROM bronze_appfolio_reports WHERE report_type = 'unit_directory')
+          AND elem->>'UnitName' IS NOT NULL
+          AND TRIM(elem->>'UnitName') <> ''
+        ON CONFLICT (unit_id) DO NOTHING
+      `;
+      const [after] = await boot<{ n: string }[]>`SELECT COUNT(*)::text AS n FROM gold_units`;
+      console.log(`[${SERVICE_NAME}] gold_units seeded: ${after.n} units`);
+    } else {
+      console.log(`[${SERVICE_NAME}] gold_units already populated: ${cnt.n} units`);
+    }
+    await boot.end();
+  } catch (e) {
+    console.error(`[${SERVICE_NAME}] gold_units bootstrap error:`, e);
+  }
 });
 
 export default app;
