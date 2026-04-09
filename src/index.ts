@@ -2937,6 +2937,39 @@ app.get("/api/v1/units", async (_req: Request, res: Response) => {
   }
 });
 
+// ── TEMP DEBUG: sample bronze raw_data for leasing report types ─────────────
+app.get("/api/v1/debug/bronze-sample", async (req: Request, res: Response) => {
+  let sql: ReturnType<typeof getDb> | null = null;
+  try {
+    sql = getDb();
+    const rtype = (req.query.report_type as string) || "guest_cards";
+    const rows = await sql<{ report_date: string; raw_data: unknown }[]>`
+      SELECT report_date, raw_data
+      FROM bronze_appfolio_reports
+      WHERE report_type = ${rtype}
+      ORDER BY report_date DESC, ingested_at DESC
+      LIMIT 1
+    `;
+    if (!rows.length) return res.json({ found: false, report_type: rtype });
+    const row = rows[0];
+    const rd = row.raw_data as Record<string, unknown>;
+    const results = (rd?.results ?? rd) as unknown[];
+    const sample = Array.isArray(results) ? results.slice(0, 2) : results;
+    res.json({
+      found: true,
+      report_type: rtype,
+      report_date: row.report_date,
+      top_keys: typeof rd === "object" && rd ? Object.keys(rd) : [],
+      sample,
+    });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    res.status(500).json({ error: message });
+  } finally {
+    if (sql) await sql.end();
+  }
+});
+
 // ── API v1 root ───────────────────────────────────────────────────────────────
 app.get("/api/v1", (_req: Request, res: Response) => {
   res.status(200).json({
