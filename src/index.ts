@@ -1510,7 +1510,8 @@ app.get("/api/v1/insights/lease-expiration-risk", async (req: Request, res: Resp
       SELECT *
       FROM joined
       WHERE
-        ${riskFilter ? sql`expiration_risk = ${riskFilter}` : sql`TRUE`}
+        days_until_expiration > 0
+        AND ${riskFilter ? sql`expiration_risk = ${riskFilter}` : sql`TRUE`}
         AND ${daysWindow ? sql`days_until_expiration <= ${daysWindow}` : sql`TRUE`}
       ORDER BY
         CASE expiration_risk WHEN 'HIGH' THEN 1 WHEN 'MEDIUM' THEN 2 ELSE 3 END,
@@ -1563,7 +1564,8 @@ app.get("/api/v1/insights/lease-expiration-risk", async (req: Request, res: Resp
       SELECT COUNT(*) AS count
       FROM joined
       WHERE
-        ${riskFilter ? sql`expiration_risk = ${riskFilter}` : sql`TRUE`}
+        days_until_expiration > 0
+        AND ${riskFilter ? sql`expiration_risk = ${riskFilter}` : sql`TRUE`}
         AND ${daysWindow ? sql`days_until_expiration <= ${daysWindow}` : sql`TRUE`}
     `;
 
@@ -2197,7 +2199,7 @@ app.get("/api/v1/insights/unit-intelligence", async (req: Request, res: Response
         WITH latest_rr AS (SELECT MAX(report_date) AS dt FROM bronze_appfolio_reports WHERE report_type = 'rent_roll')
         SELECT DISTINCT ON (LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g')))
           LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g'))  AS unit_id,
-          INITCAP(TRIM(elem->>'Tenant'))                                    AS tenant_name
+          TRIM(REGEXP_REPLACE(INITCAP(TRIM(elem->>'Tenant')), '\s{2,}', ' ', 'g')) AS tenant_name
         FROM bronze_appfolio_reports b,
              jsonb_array_elements(b.raw_data->'results') AS elem,
              latest_rr
@@ -2716,21 +2718,21 @@ app.get("/api/v1/renewals", async (req: Request, res: Response) => {
         WITH latest_rr AS (SELECT MAX(report_date) AS dt FROM bronze_appfolio_reports WHERE report_type = 'rent_roll')
         SELECT DISTINCT ON (LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g')))
           LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g'))       AS unit_id,
-          NULLIF(TRIM(elem->>'Tenant'), '')                                      AS tenant_name
+          NULLIF(TRIM(REGEXP_REPLACE(TRIM(elem->>'Tenant'), '\s{2,}', ' ', 'g')), '') AS tenant_name
         FROM bronze_appfolio_reports b,
              jsonb_array_elements(b.raw_data->'results') AS elem,
              latest_rr
         WHERE b.report_type = 'rent_roll' AND b.report_date = latest_rr.dt
           AND elem->>'Tenant' IS NOT NULL
       )
-      SELECT
+      SELECT DISTINCT ON (le.unit_id)
         le.id, le.unit_id, le.tenant_id,
         le.lease_end_date::text,
         (le.lease_end_date - CURRENT_DATE)::int::text AS days_until_expiration,
         rl.monthly_rent::text,
         tl.contact_email,
         tl.contact_phone,
-        COALESCE(rn.tenant_name, tl.contact_email, 'Unknown') AS tenant_name,
+        NULLIF(TRIM(REGEXP_REPLACE(COALESCE(rn.tenant_name, ''), '\s{2,}', ' ', 'g')), '') AS tenant_name,
         COALESCE(rt.renewal_status, 'pending') AS renewal_status,
         rt.proposed_rent::text,
         rt.notes,
@@ -2743,7 +2745,7 @@ app.get("/api/v1/renewals", async (req: Request, res: Response) => {
       WHERE le.lease_end_date IS NOT NULL
         AND (le.lease_end_date - CURRENT_DATE) > ${fromDays}
         AND (le.lease_end_date - CURRENT_DATE) <= ${toDays}
-      ORDER BY le.lease_end_date ASC
+      ORDER BY le.unit_id, le.lease_end_date ASC
       LIMIT ${limit} OFFSET ${offset}
     `;
 
@@ -2759,7 +2761,7 @@ app.get("/api/v1/renewals", async (req: Request, res: Response) => {
       id:                   r.id,
       unit_id:              r.unit_id,
       tenant_id:            r.tenant_id,
-      tenant_name:          (r as any).tenant_name ?? 'Unknown',
+      tenant_name:          (r as any).tenant_name ?? r.contact_email ?? 'Unknown',
       lease_end_date:       r.lease_end_date,
       days_until_expiration: parseInt(r.days_until_expiration, 10),
       current_rent:         r.monthly_rent !== null ? parseFloat(r.monthly_rent) : null,
@@ -2855,29 +2857,33 @@ app.get("/api/v1/units", async (_req: Request, res: Response) => {
   let sql: ReturnType<typeof getDb> | null = null;
   try {
     sql = getDb();
-    // Enrich unit_status from the latest occupancy snapshot's unit_vacancy data
+    // Enrich unit_status from the latest unit_vacancy Bronze report
     const rows = await sql<{ unit_id: string; unit_status: string | null; created_at: string }[]>`
+      WITH latest_uv AS (
+        SELECT MAX(report_date) AS dt FROM bronze_appfolio_reports WHERE report_type = 'unit_vacancy'
+      ),
+      vacancy_status AS (
+        SELECT DISTINCT ON (LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g')))
+          LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g')) AS unit_id,
+          CASE
+            WHEN (elem->>'UnitStatus') ILIKE '%notice%' THEN 'notice'
+            WHEN (elem->>'UnitStatus') ILIKE '%vacant%' OR (elem->>'UnitStatus') ILIKE '%unoccupied%' THEN 'vacant'
+            ELSE 'occupied'
+          END AS unit_status
+        FROM bronze_appfolio_reports bar,
+             jsonb_array_elements(bar.raw_data->'results') AS elem,
+             latest_uv
+        WHERE bar.report_type = 'unit_vacancy'
+          AND bar.report_date = latest_uv.dt
+          AND elem->>'Unit' IS NOT NULL
+        ORDER BY LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g'))
+      )
       SELECT
         gu.unit_id,
-        COALESCE(
-          (
-            SELECT
-              CASE
-                WHEN elem->>'Status' ILIKE '%notice%' THEN 'notice'
-                WHEN elem->>'Status' ILIKE '%vacant%' OR elem->>'Status' ILIKE '%unoccupied%' THEN 'vacant'
-                ELSE 'occupied'
-              END
-            FROM bronze_appfolio_reports bar
-            CROSS JOIN LATERAL jsonb_array_elements(bar.raw_data) AS elem
-            WHERE bar.report_type = 'unit_vacancy'
-              AND REGEXP_REPLACE(LOWER(TRIM(elem->>'Unit')), '\s*-\s*', '-', 'g') = gu.unit_id
-            ORDER BY bar.created_at DESC
-            LIMIT 1
-          ),
-          gu.unit_status
-        ) AS unit_status,
+        COALESCE(vs.unit_status, gu.unit_status, 'occupied') AS unit_status,
         gu.created_at::text
       FROM gold_units gu
+      LEFT JOIN vacancy_status vs ON vs.unit_id = gu.unit_id
       ORDER BY gu.unit_id ASC
     `;
     res.status(200).json({
