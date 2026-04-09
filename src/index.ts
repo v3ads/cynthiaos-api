@@ -3053,39 +3053,36 @@ app.get("/api/v1/insights/leasing-funnel", async (req: Request, res: Response) =
           AND lease_date <= ${toStr}::date
       ),
 
+      -- Monthly lead counts
+      leads_by_month AS (
+        SELECT period, COUNT(*) AS cnt FROM leads_filtered GROUP BY period
+      ),
+      -- Monthly application counts
+      apps_by_month AS (
+        SELECT period, COUNT(*) AS cnt FROM apps_filtered GROUP BY period
+      ),
+      -- Monthly lease counts
+      leases_by_month AS (
+        SELECT period, COUNT(*) AS cnt FROM leases_filtered GROUP BY period
+      ),
       -- All months that appear in any of the three datasets
       all_periods AS (
-        SELECT period FROM leads_filtered
+        SELECT period FROM leads_by_month
         UNION
-        SELECT period FROM apps_filtered
+        SELECT period FROM apps_by_month
         UNION
-        SELECT period FROM leases_filtered
-      ),
-
-      -- Monthly aggregates
-      monthly AS (
-        SELECT
-          ap.period,
-          COUNT(DISTINCT lf.rec_date || lf.rec_date::text || ROW_NUMBER() OVER (PARTITION BY lf.period ORDER BY lf.rec_date)::text) AS leads,
-          COUNT(DISTINCT af.app_date || af.app_date::text || ROW_NUMBER() OVER (PARTITION BY af.period ORDER BY af.app_date)::text) AS applications,
-          COUNT(DISTINCT lsf.lease_date || lsf.lease_date::text || ROW_NUMBER() OVER (PARTITION BY lsf.period ORDER BY lsf.lease_date)::text) AS leases
-        FROM all_periods ap
-        LEFT JOIN leads_filtered  lf  ON lf.period  = ap.period
-        LEFT JOIN apps_filtered   af  ON af.period   = ap.period
-        LEFT JOIN leases_filtered lsf ON lsf.period  = ap.period
-        GROUP BY ap.period
+        SELECT period FROM leases_by_month
       )
 
       SELECT
-        period,
-        COUNT(lf.rec_date)::text   AS leads,
-        COUNT(af.app_date)::text   AS applications,
-        COUNT(lsf.lease_date)::text AS leases
+        ap.period,
+        COALESCE(lm.cnt, 0)::text  AS leads,
+        COALESCE(am.cnt, 0)::text  AS applications,
+        COALESCE(lsm.cnt, 0)::text AS leases
       FROM all_periods ap
-      LEFT JOIN leads_filtered  lf  ON lf.period  = ap.period
-      LEFT JOIN apps_filtered   af  ON af.period   = ap.period
-      LEFT JOIN leases_filtered lsf ON lsf.period  = ap.period
-      GROUP BY ap.period
+      LEFT JOIN leads_by_month  lm  ON lm.period  = ap.period
+      LEFT JOIN apps_by_month   am  ON am.period   = ap.period
+      LEFT JOIN leases_by_month lsm ON lsm.period  = ap.period
       ORDER BY ap.period
     `;
 
