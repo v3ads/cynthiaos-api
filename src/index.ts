@@ -729,6 +729,12 @@ interface GoldIncomeStatement {
   operating_expenses: string;
   net_operating_income: string;
   profit_margin: string | null;
+  total_income_mtd: string;
+  rental_income_mtd: string;
+  other_income_mtd: string;
+  total_expenses_mtd: string;
+  operating_expenses_mtd: string;
+  net_operating_income_mtd: string;
   created_at: Date;
 }
 
@@ -737,6 +743,7 @@ function mapISRow(r: GoldIncomeStatement) {
     id: r.id,
     bronze_report_id: r.bronze_report_id,
     report_date:          toDateStr(r.report_date),
+    // YTD figures
     total_income:         parseFloat(r.total_income),
     rental_income:        parseFloat(r.rental_income),
     other_income:         parseFloat(r.other_income),
@@ -744,6 +751,13 @@ function mapISRow(r: GoldIncomeStatement) {
     operating_expenses:   parseFloat(r.operating_expenses),
     net_operating_income: parseFloat(r.net_operating_income),
     profit_margin:        r.profit_margin !== null ? parseFloat(r.profit_margin) : null,
+    // MTD figures
+    total_income_mtd:         parseFloat(r.total_income_mtd ?? "0"),
+    rental_income_mtd:        parseFloat(r.rental_income_mtd ?? "0"),
+    other_income_mtd:         parseFloat(r.other_income_mtd ?? "0"),
+    total_expenses_mtd:       parseFloat(r.total_expenses_mtd ?? "0"),
+    operating_expenses_mtd:   parseFloat(r.operating_expenses_mtd ?? "0"),
+    net_operating_income_mtd: parseFloat(r.net_operating_income_mtd ?? "0"),
     created_at: r.created_at,
   };
 }
@@ -766,7 +780,10 @@ app.get("/api/v1/income", async (req: Request, res: Response) => {
         SELECT id, bronze_report_id, report_date::text AS report_date,
                total_income::text, rental_income::text, other_income::text,
                total_expenses::text, operating_expenses::text,
-               net_operating_income::text, profit_margin::text, created_at
+               net_operating_income::text, profit_margin::text,
+               total_income_mtd::text, rental_income_mtd::text, other_income_mtd::text,
+               total_expenses_mtd::text, operating_expenses_mtd::text,
+               net_operating_income_mtd::text, created_at
         FROM gold_income_statements
         WHERE report_date BETWEEN ${dateFrom}::date AND ${dateTo}::date
         ORDER BY report_date DESC
@@ -781,7 +798,10 @@ app.get("/api/v1/income", async (req: Request, res: Response) => {
         SELECT id, bronze_report_id, report_date::text AS report_date,
                total_income::text, rental_income::text, other_income::text,
                total_expenses::text, operating_expenses::text,
-               net_operating_income::text, profit_margin::text, created_at
+               net_operating_income::text, profit_margin::text,
+               total_income_mtd::text, rental_income_mtd::text, other_income_mtd::text,
+               total_expenses_mtd::text, operating_expenses_mtd::text,
+               net_operating_income_mtd::text, created_at
         FROM gold_income_statements
         WHERE report_date >= ${dateFrom}::date
         ORDER BY report_date DESC
@@ -795,7 +815,10 @@ app.get("/api/v1/income", async (req: Request, res: Response) => {
         SELECT id, bronze_report_id, report_date::text AS report_date,
                total_income::text, rental_income::text, other_income::text,
                total_expenses::text, operating_expenses::text,
-               net_operating_income::text, profit_margin::text, created_at
+               net_operating_income::text, profit_margin::text,
+               total_income_mtd::text, rental_income_mtd::text, other_income_mtd::text,
+               total_expenses_mtd::text, operating_expenses_mtd::text,
+               net_operating_income_mtd::text, created_at
         FROM gold_income_statements
         WHERE report_date <= ${dateTo}::date
         ORDER BY report_date DESC
@@ -809,7 +832,10 @@ app.get("/api/v1/income", async (req: Request, res: Response) => {
         SELECT id, bronze_report_id, report_date::text AS report_date,
                total_income::text, rental_income::text, other_income::text,
                total_expenses::text, operating_expenses::text,
-               net_operating_income::text, profit_margin::text, created_at
+               net_operating_income::text, profit_margin::text,
+               total_income_mtd::text, rental_income_mtd::text, other_income_mtd::text,
+               total_expenses_mtd::text, operating_expenses_mtd::text,
+               net_operating_income_mtd::text, created_at
         FROM gold_income_statements
         ORDER BY report_date DESC
         LIMIT ${limit} OFFSET ${offset}
