@@ -3259,8 +3259,154 @@ app.get("/api/v1", (_req: Request, res: Response) => {
       "GET  /api/v1/units",
       "GET  /api/v1/renewals",
       "PUT  /api/v1/renewals/:unit_id",
+      "GET  /api/v1/maintenance",
     ],
   });
+});
+
+// ── GET /api/v1/maintenance ─────────────────────────────────────────────────
+//
+// Returns work orders from the latest Bronze AppFolio work_order report.
+// Supports filtering by status, priority, unit, and date range.
+//
+// Query params:
+//   status    string   filter by Status (e.g. "Open", "Completed")
+//   priority  string   filter by Priority (e.g. "Normal", "Urgent")
+//   unit      string   filter by unit number
+//   from      YYYY-MM-DD  filter by CreatedAt >= from
+//   to        YYYY-MM-DD  filter by CreatedAt <= to
+//   limit     number   max records to return (default 200)
+
+interface MaintenanceWorkOrder {
+  work_order_id:    string | null;
+  work_order_number: string | null;
+  status:           string | null;
+  priority:         string | null;
+  unit_id:          string | null;
+  vendor:           string | null;
+  amount:           number | null;
+  issue:            string | null;
+  description:      string | null;
+  primary_tenant:   string | null;
+  created_at:       string | null;
+  completed_on:     string | null;
+  scheduled_start:  string | null;
+  scheduled_end:    string | null;
+  submitted_by_tenant: boolean | null;
+}
+
+app.get("/api/v1/maintenance", async (req: Request, res: Response) => {
+  let sql: ReturnType<typeof getDb> | null = null;
+  try {
+    sql = getDb();
+
+    const statusFilter   = (req.query.status   as string | undefined)?.toLowerCase();
+    const priorityFilter = (req.query.priority as string | undefined)?.toLowerCase();
+    const unitFilter     = (req.query.unit     as string | undefined);
+    const fromFilter     = (req.query.from     as string | undefined);
+    const toFilter       = (req.query.to       as string | undefined);
+    const limitParam     = parseInt((req.query.limit as string) || "200", 10);
+    const limit          = isNaN(limitParam) || limitParam < 1 ? 200 : Math.min(limitParam, 1000);
+
+    // Pull from the latest Bronze work_order report
+    const bronzeRows = await sql<{ raw_data: Record<string, unknown> }[]>`
+      SELECT raw_data
+      FROM bronze_appfolio_reports
+      WHERE report_type = 'work_order'
+      ORDER BY ingested_at DESC
+      LIMIT 1
+    `;
+
+    if (!bronzeRows.length) {
+      return res.status(200).json({
+        success: true,
+        total: 0,
+        source: 'bronze_work_order',
+        data: [],
+        message: 'No work_order report found in Bronze layer',
+      });
+    }
+
+    const raw = bronzeRows[0].raw_data as { results?: Record<string, unknown>[] };
+    const allRows: Record<string, unknown>[] = raw.results ?? [];
+
+    // Parse and filter
+    const parseDate = (s: unknown): string | null => {
+      if (!s || typeof s !== 'string') return null;
+      // AppFolio format: MM/DD/YYYY
+      const m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})/);
+      if (m) return `${m[3]}-${m[1].padStart(2,'0')}-${m[2].padStart(2,'0')}`;
+      return s.slice(0, 10); // fallback: take first 10 chars
+    };
+
+    const parseAmt = (v: unknown): number | null => {
+      if (v == null || v === '') return null;
+      const n = parseFloat(String(v).replace(/,/g, ''));
+      return isNaN(n) ? null : n;
+    };
+
+    const workOrders: MaintenanceWorkOrder[] = [];
+    for (const r of allRows) {
+      const createdAt = parseDate(r.CreatedAt);
+      const status    = String(r.Status    ?? '').trim();
+      const priority  = String(r.Priority  ?? '').trim();
+      const unitName  = String(r.UnitName  ?? '').trim();
+
+      // Apply filters
+      if (statusFilter   && !status.toLowerCase().includes(statusFilter))   continue;
+      if (priorityFilter && !priority.toLowerCase().includes(priorityFilter)) continue;
+      if (unitFilter     && unitName !== unitFilter)                          continue;
+      if (fromFilter     && createdAt && createdAt < fromFilter)              continue;
+      if (toFilter       && createdAt && createdAt > toFilter)                continue;
+
+      workOrders.push({
+        work_order_id:       String(r.WorkOrderId    ?? '').trim() || null,
+        work_order_number:   String(r.WorkOrderNumber ?? '').trim() || null,
+        status:              status  || null,
+        priority:            priority || null,
+        unit_id:             unitName || null,
+        vendor:              String(r.Vendor ?? '').trim() || null,
+        amount:              parseAmt(r.Amount),
+        issue:               String(r.WorkOrderIssue   ?? '').trim() || null,
+        description:         String(r.JobDescription   ?? '').trim() || null,
+        primary_tenant:      String(r.PrimaryTenant    ?? '').trim() || null,
+        created_at:          createdAt,
+        completed_on:        parseDate(r.CompletedOn),
+        scheduled_start:     parseDate(r.ScheduledStart),
+        scheduled_end:       parseDate(r.ScheduledEnd),
+        submitted_by_tenant: r.SubmittedByTenant === true || r.SubmittedByTenant === 'true' || null,
+      });
+
+      if (workOrders.length >= limit) break;
+    }
+
+    // Summary stats
+    const allFiltered = workOrders;
+    const statusCounts: Record<string, number> = {};
+    const priorityCounts: Record<string, number> = {};
+    for (const wo of allFiltered) {
+      if (wo.status)   statusCounts[wo.status]     = (statusCounts[wo.status]     || 0) + 1;
+      if (wo.priority) priorityCounts[wo.priority] = (priorityCounts[wo.priority] || 0) + 1;
+    }
+
+    res.status(200).json({
+      success: true,
+      total: workOrders.length,
+      source: 'bronze_work_order',
+      summary: {
+        by_status:   statusCounts,
+        by_priority: priorityCounts,
+        total_amount: workOrders.reduce((s, wo) => s + (wo.amount ?? 0), 0),
+      },
+      data: workOrders,
+    });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`[${SERVICE_NAME}] GET /api/v1/maintenance error:`, message);
+    res.status(500).json({ success: false, error: message });
+  } finally {
+    if (sql) await sql.end();
+  }
 });
 
 // ── Error handler ─────────────────────────────────────────────────────────────
