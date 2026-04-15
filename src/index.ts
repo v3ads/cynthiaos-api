@@ -2282,6 +2282,7 @@ interface UnitIntelligenceRow {
   classification:        string;
   lease_end_date:        string | null;
   days_until_expiration: string | null;
+  unit_group:            string | null;
 }
 
 app.get("/api/v1/insights/unit-intelligence", async (req: Request, res: Response) => {
@@ -2306,7 +2307,7 @@ app.get("/api/v1/insights/unit-intelligence", async (req: Request, res: Response
       -- Canonical unit list from gold_units (populated daily by unit_directory strategy).
       -- This is the single authoritative source for all 182 units in the portfolio.
       unit_universe AS (
-        SELECT unit_id FROM gold_units
+        SELECT unit_id, unit_group FROM gold_units
       ),
 
       -- Tenant name from rent_roll Bronze: one row per unit, always the primary tenant.
@@ -2393,6 +2394,7 @@ app.get("/api/v1/insights/unit-intelligence", async (req: Request, res: Response
       assembled AS (
         SELECT
           u.unit_id,
+          u.unit_group,
           us.unit_status,
           -- Tenant name fallback chain:
           -- 1. gold_tenants via latest lease
@@ -2488,6 +2490,7 @@ app.get("/api/v1/insights/unit-intelligence", async (req: Request, res: Response
       classified AS (
         SELECT
           unit_id,
+          unit_group,
           unit_status,
           -- tenant_name already resolved via COALESCE chain in assembled CTE
           tenant_name,
@@ -2747,6 +2750,7 @@ app.get("/api/v1/insights/unit-intelligence", async (req: Request, res: Response
       },
       data: rows.map((r) => ({
         unit_id:               r.unit_id,
+        unit_group:            r.unit_group ?? null,
         unit_status:           r.unit_status,
         tenant_name:           r.tenant_name,
         financial_exposure:    parseFloat(String(r.financial_exposure)),
@@ -3492,6 +3496,25 @@ app.listen(PORT, "0.0.0.0", async () => {
         created_at  TIMESTAMPTZ DEFAULT NOW()
       )
     `;
+    // ── unit_group column migration (idempotent) ───────────────────────────
+    // Adds unit_group TEXT to gold_units if it doesn't already exist.
+    // This column is the authoritative source for logical unit groupings
+    // (e.g. 'picinich_family') so the frontend never needs hardcoded lists.
+    await boot`
+      ALTER TABLE gold_units
+        ADD COLUMN IF NOT EXISTS unit_group TEXT DEFAULT NULL
+    `;
+    // ── Seed picinich_family group ─────────────────────────────────────────
+    // Units 115, 116, 202, 313, 318 are occupied by the Picinich family.
+    // We use UPDATE … WHERE unit_id IN (…) so this is safe to re-run on
+    // every cold-start without overwriting other groups.
+    await boot`
+      UPDATE gold_units
+      SET    unit_group = 'picinich_family'
+      WHERE  unit_id IN ('115', '116', '202', '313', '318')
+        AND  (unit_group IS NULL OR unit_group = 'picinich_family')
+    `;
+    console.log(`[${SERVICE_NAME}] gold_units unit_group migration applied`);
     const [cnt] = await boot<{ n: string }[]>`SELECT COUNT(*)::text AS n FROM gold_units`;
     if (parseInt(cnt.n, 10) === 0) {
       console.log(`[${SERVICE_NAME}] gold_units empty — seeding from Bronze unit_directory...`);
