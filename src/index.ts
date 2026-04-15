@@ -1242,6 +1242,24 @@ app.get("/api/v1/turnover", async (req: Request, res: Response) => {
     }
 
     const total = parseInt(countRes[0].count, 10);
+
+    // Compute portfolio_summary: total events, units with turnover, units tracked, avg events/unit
+    const summaryRes = await sql<{ total_events: string; units_with_turnover: string; units_tracked: string }[]>`
+      SELECT
+        COUNT(*)::text                    AS total_events,
+        COUNT(DISTINCT unit_id)::text     AS units_with_turnover,
+        (SELECT COUNT(DISTINCT unit_id)::text FROM gold_units) AS units_tracked
+      FROM gold_unit_turnover
+    `;
+    const se = summaryRes[0];
+    const totalEvents       = parseInt(se.total_events, 10);
+    const unitsWithTurnover = parseInt(se.units_with_turnover, 10);
+    const unitsTracked      = parseInt(se.units_tracked, 10);
+    const avgEventsPerUnit  = unitsTracked > 0 ? Math.round((totalEvents / unitsTracked) * 10) / 10 : 0;
+    const stabilityScore    = unitsTracked > 0
+      ? Math.round(((unitsTracked - unitsWithTurnover) / unitsTracked) * 100)
+      : 100;
+
     res.status(200).json({
       success:            true,
       total,
@@ -1250,6 +1268,14 @@ app.get("/api/v1/turnover", async (req: Request, res: Response) => {
       event_type_filter:  eventType,
       date_from_filter:   dateFrom,
       date_to_filter:     dateTo,
+      portfolio_summary: {
+        total_events:        totalEvents,
+        units_with_turnover: unitsWithTurnover,
+        units_tracked:       unitsTracked,
+        avg_events_per_unit: avgEventsPerUnit,
+        stability_score:     stabilityScore,
+        classification:      stabilityScore >= 90 ? "Stable" : stabilityScore >= 70 ? "Moderate" : "High Churn",
+      },
       data: rows.map(mapTurnoverRow),
     });
   } catch (err: unknown) {
