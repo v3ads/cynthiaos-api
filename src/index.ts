@@ -1387,6 +1387,8 @@ app.get("/api/v1/insights/at-risk-revenue", async (req: Request, res: Response) 
           le.lease_end_date,
           le.days_until_expiration,
           CASE
+            WHEN d.days_overdue >= 90
+            THEN 'HIGH'
             WHEN ar.risk_score >= 5000
                  AND le.days_until_expiration IS NOT NULL
                  AND le.days_until_expiration <= 90
@@ -1424,12 +1426,21 @@ app.get("/api/v1/insights/at-risk-revenue", async (req: Request, res: Response) 
         FROM gold_lease_expirations
         ORDER BY tenant_id, lease_end_date ASC
       ),
+      d_deduped AS (
+        SELECT DISTINCT ON (tenant_id)
+          tenant_id, days_overdue
+        FROM gold_delinquency_records
+        ORDER BY tenant_id, days_overdue DESC NULLS LAST, created_at DESC
+      ),
       joined AS (
         SELECT
           ar.tenant_id,
           ar.risk_score,
           le.days_until_expiration,
+          d.days_overdue,
           CASE
+            WHEN d.days_overdue >= 90
+            THEN 'HIGH'
             WHEN ar.risk_score >= 5000
                  AND le.days_until_expiration IS NOT NULL
                  AND le.days_until_expiration <= 90
@@ -1441,6 +1452,8 @@ app.get("/api/v1/insights/at-risk-revenue", async (req: Request, res: Response) 
         FROM ar_deduped ar
         LEFT JOIN le_deduped le
           ON ar.tenant_id = le.tenant_id
+        LEFT JOIN d_deduped d
+          ON ar.tenant_id = d.tenant_id
       )
       SELECT COUNT(*) AS count
       FROM joined
