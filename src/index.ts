@@ -1724,6 +1724,7 @@ app.get("/api/v1/insights/portfolio-health", async (_req: Request, res: Response
         (
           SELECT net_operating_income::text
           FROM gold_income_statements
+          WHERE total_income > 0
           ORDER BY report_date DESC, created_at DESC
           LIMIT 1
         ) AS net_operating_income,
@@ -1732,6 +1733,7 @@ app.get("/api/v1/insights/portfolio-health", async (_req: Request, res: Response
           -- (total_expenses = 0 means AppFolio didn't export expense data)
           SELECT CASE WHEN total_expenses > 0 THEN profit_margin::text ELSE NULL END
           FROM gold_income_statements
+          WHERE total_income > 0
           ORDER BY report_date DESC, created_at DESC
           LIMIT 1
         ) AS profit_margin,
