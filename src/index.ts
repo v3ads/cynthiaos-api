@@ -57,6 +57,9 @@ interface GoldLeaseExpiration {
   monthly_rent: string | null;   // sourced from rent_roll Bronze via rent_lookup CTE
   contact_email: string | null;  // sourced from gold_tenants via tenant_lookup CTE
   contact_phone: string | null;  // sourced from gold_tenants via tenant_lookup CTE
+  tenant_name: string | null;    // display name from tenant_directory Bronze
+  unit: string | null;           // display unit number (e.g. '918')
+  property: string | null;       // property name from tenant_directory Bronze
   created_at: Date;
 }
 
@@ -143,6 +146,10 @@ function mapRow(r: GoldLeaseExpiration) {
     bronze_report_id: r.bronze_report_id,
     tenant_id: r.tenant_id,
     unit_id: r.unit_id,
+    // Frontend display fields
+    tenant_name: r.tenant_name ?? r.tenant_id.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase()),
+    unit: r.unit ?? r.unit_id,
+    property: r.property ?? 'Cynthia Gardens',
     lease_start_date: toDateStr(r.lease_start_date),
     lease_end_date: toDateStr(r.lease_end_date),
     days_until_expiration: r.days_until_expiration,
@@ -191,7 +198,10 @@ app.get("/api/v1/leases/expirations", async (req: Request, res: Response) => {
           LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g'))       AS unit_id,
           NULLIF(TRIM(elem->>'Emails'), '')                                      AS contact_email,
           NULLIF(REGEXP_REPLACE(TRIM(COALESCE(elem->>'PhoneNumbers', '')),
-            '^(Mobile|Phone|Home|Work|Fax):\s*', '', 'i'), '')                  AS contact_phone
+            '^(Mobile|Phone|Home|Work|Fax):\s*', '', 'i'), '')                  AS contact_phone,
+          NULLIF(TRIM(REGEXP_REPLACE(TRIM(COALESCE(elem->>'Tenant','')), '[[:space:]]{2,}', ' ', 'g')), '') AS tenant_name,
+          TRIM(elem->>'Unit')                                                    AS unit_display,
+          NULLIF(TRIM(elem->>'Property'), '')                                    AS property
         FROM bronze_appfolio_reports b,
              jsonb_array_elements(b.raw_data->'results') AS elem,
              latest_td
@@ -206,6 +216,9 @@ app.get("/api/v1/leases/expirations", async (req: Request, res: Response) => {
              rl.monthly_rent::text     AS monthly_rent,
              tl.contact_email,
              tl.contact_phone,
+             tl.tenant_name,
+             tl.unit_display           AS unit,
+             tl.property,
              le.created_at
       FROM gold_lease_expirations le
       LEFT JOIN rent_lookup   rl ON rl.unit_id = le.unit_id
