@@ -1726,6 +1726,7 @@ app.get("/api/v1/insights/portfolio-health", async (_req: Request, res: Response
           COUNT(*) FILTER (WHERE COALESCE(vs.unit_status, 'occupied') = 'notice')   AS notice_units
         FROM gold_units gu
         LEFT JOIN vacancy_status vs ON vs.unit_id = gu.unit_id
+        WHERE gu.exclude_from_occupancy IS NOT TRUE
       )
       SELECT
         -- Occupancy: derived from canonical gold_units (182-unit universe)
@@ -1789,7 +1790,7 @@ app.get("/api/v1/insights/portfolio-health", async (_req: Request, res: Response
 
     // ── Parse raw values ────────────────────────────────────────────────────
     // Occupancy: derived from canonical gold_units universe (182 units)
-    const totalUnits    = parseInt(row.total_units    ?? "182", 10);
+    const totalUnits    = parseInt(row.total_units    ?? "180", 10);
     const occupiedUnits = parseInt(row.occupied_units ?? "0",   10);
     const vacantUnits   = parseInt(row.vacant_units   ?? "0",   10);
     const noticeUnits   = parseInt(row.notice_units   ?? "0",   10);
@@ -2159,7 +2160,7 @@ app.get("/api/v1/insights/turnover-velocity", async (req: Request, res: Response
       SELECT
         COUNT(*)::text                    AS total_turnover_events,
         COUNT(DISTINCT unit_id)::text     AS units_with_turnover,
-        (SELECT COUNT(*)::text FROM gold_units) AS total_units_tracked
+        (SELECT COUNT(*)::text FROM gold_units WHERE exclude_from_occupancy IS NOT TRUE) AS total_units_tracked
       FROM gold_unit_turnover
     `;
 
@@ -2305,9 +2306,10 @@ app.get("/api/v1/insights/unit-intelligence", async (req: Request, res: Response
       WITH
 
       -- Canonical unit list from gold_units (populated daily by unit_directory strategy).
-      -- This is the single authoritative source for all 182 units in the portfolio.
+      -- Excludes units flagged exclude_from_occupancy (e.g. family-held vacant units)
+      -- so they do not appear in the table or skew any metrics.
       unit_universe AS (
-        SELECT unit_id, unit_group FROM gold_units
+        SELECT unit_id, unit_group FROM gold_units WHERE exclude_from_occupancy IS NOT TRUE
       ),
 
       -- Tenant name from rent_roll Bronze: one row per unit, always the primary tenant.
@@ -2534,7 +2536,7 @@ app.get("/api/v1/insights/unit-intelligence", async (req: Request, res: Response
     const countRows = await sql<{ count: string }[]>`
       WITH
       unit_universe AS (
-        SELECT unit_id FROM gold_units
+        SELECT unit_id FROM gold_units WHERE exclude_from_occupancy IS NOT TRUE
       ),
       latest_tenant_per_unit AS (
         SELECT DISTINCT ON (le.unit_id)
@@ -2633,7 +2635,7 @@ app.get("/api/v1/insights/unit-intelligence", async (req: Request, res: Response
     const summaryRows = await sql<SummaryRow[]>`
       WITH
       unit_universe AS (
-        SELECT unit_id FROM gold_units
+        SELECT unit_id FROM gold_units WHERE exclude_from_occupancy IS NOT TRUE
       ),
       latest_lease AS (
         SELECT DISTINCT ON (unit_id) unit_id, lease_end_date, days_until_expiration
@@ -3004,6 +3006,7 @@ app.get("/api/v1/units", async (_req: Request, res: Response) => {
         gu.created_at::text
       FROM gold_units gu
       LEFT JOIN vacancy_status vs ON vs.unit_id = gu.unit_id
+      WHERE gu.exclude_from_occupancy IS NOT TRUE
       ORDER BY gu.unit_id ASC
     `;
     res.status(200).json({
@@ -3514,7 +3517,23 @@ app.listen(PORT, "0.0.0.0", async () => {
       WHERE  unit_id IN ('115', '116', '202', '313', '318')
         AND  (unit_group IS NULL OR unit_group = 'picinich_family')
     `;
-    console.log(`[${SERVICE_NAME}] gold_units unit_group migration applied`);
+    // ── exclude_from_occupancy column migration (idempotent) ──────────────
+    // Units flagged TRUE are intentionally held off-market (e.g. family-held
+    // vacant units) and must be excluded from all occupancy denominators so
+    // they do not inflate the vacancy rate.
+    await boot`
+      ALTER TABLE gold_units
+        ADD COLUMN IF NOT EXISTS exclude_from_occupancy BOOLEAN DEFAULT FALSE
+    `;
+    // ── Seed excluded units ────────────────────────────────────────────────
+    // Units 202 and 313 are Picinich family units intentionally held vacant.
+    // They are not available to lease and must not count as vacancies.
+    await boot`
+      UPDATE gold_units
+      SET    exclude_from_occupancy = TRUE
+      WHERE  unit_id IN ('202', '313')
+    `;
+    console.log(`[${SERVICE_NAME}] gold_units unit_group + exclude_from_occupancy migrations applied`);
     const [cnt] = await boot<{ n: string }[]>`SELECT COUNT(*)::text AS n FROM gold_units`;
     if (parseInt(cnt.n, 10) === 0) {
       console.log(`[${SERVICE_NAME}] gold_units empty — seeding from Bronze unit_directory...`);
