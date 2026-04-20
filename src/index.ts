@@ -439,40 +439,40 @@ app.get("/api/v1/leases/:id", async (req: Request, res: Response) => {
 });
 
 // ── GET /api/v1/units/:id/notes ─────────────────────────────────────────────
-// Returns the note for a unit. Checks unit_notes first; if empty, falls back
-// to the active lease's lease_actions note so notes saved via the Lease Drawer
-// are visible here too.
+// Returns notes + contacted + flagged for a unit.
+// Checks unit_notes first; falls back to lease_actions for notes and contacted/flagged.
 app.get("/api/v1/units/:id/notes", async (req: Request, res: Response) => {
   let sql: postgres.Sql | null = null;
   try {
     const unitId = req.params.id.toLowerCase().trim();
     sql = getDb();
-    // 1. Check unit_notes table
-    const unitNoteRows = await sql<{ notes: string; updated_at: string; updated_by: string | null }[]>`
-      SELECT notes, updated_at::text AS updated_at, updated_by
+    // 1. Check unit_notes table (authoritative for Unit Intelligence actions)
+    const unitNoteRows = await sql<{ notes: string; contacted: boolean; flagged: boolean; updated_at: string; updated_by: string | null }[]>`
+      SELECT notes, contacted, flagged, updated_at::text AS updated_at, updated_by
       FROM unit_notes
       WHERE unit_id = ${unitId}
       LIMIT 1
     `;
-    if (unitNoteRows.length > 0 && unitNoteRows[0].notes.trim() !== '') {
-      res.status(200).json({ success: true, data: { notes: unitNoteRows[0].notes, updated_at: unitNoteRows[0].updated_at, source: 'unit_notes' } });
+    if (unitNoteRows.length > 0) {
+      const r = unitNoteRows[0];
+      res.status(200).json({ success: true, data: { notes: r.notes, contacted: r.contacted, flagged: r.flagged, updated_at: r.updated_at, source: 'unit_notes' } });
       return;
     }
-    // 2. Fall back to active lease_actions note
-    const leaseNoteRows = await sql<{ notes: string | null; last_action_at: string | null }[]>`
-      SELECT la.notes, la.last_action_at::text AS last_action_at
+    // 2. Fall back to active lease_actions (notes + contacted + flagged)
+    const leaseNoteRows = await sql<{ notes: string | null; contacted: boolean; flagged: boolean; last_action_at: string | null }[]>`
+      SELECT la.notes, la.contacted, la.flagged, la.last_action_at::text AS last_action_at
       FROM gold_lease_expirations le
       JOIN lease_actions la ON la.lease_id = le.id
       WHERE le.unit_id = ${unitId}
-        AND la.notes IS NOT NULL AND la.notes <> ''
       ORDER BY la.last_action_at DESC NULLS LAST
       LIMIT 1
     `;
     if (leaseNoteRows.length > 0) {
-      res.status(200).json({ success: true, data: { notes: leaseNoteRows[0].notes ?? '', updated_at: leaseNoteRows[0].last_action_at, source: 'lease_actions' } });
+      const r = leaseNoteRows[0];
+      res.status(200).json({ success: true, data: { notes: r.notes ?? '', contacted: r.contacted, flagged: r.flagged, updated_at: r.last_action_at, source: 'lease_actions' } });
       return;
     }
-    res.status(200).json({ success: true, data: { notes: '', updated_at: null, source: null } });
+    res.status(200).json({ success: true, data: { notes: '', contacted: false, flagged: false, updated_at: null, source: null } });
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
     console.error(`[${SERVICE_NAME}] GET /api/v1/units/:id/notes error:`, message);
@@ -483,30 +483,40 @@ app.get("/api/v1/units/:id/notes", async (req: Request, res: Response) => {
 });
 
 // ── PUT /api/v1/units/:id/notes ───────────────────────────────────────────────
-// Upserts a note for a unit into unit_notes. Also mirrors to the active
-// lease_actions record (if one exists) so the Lease Drawer stays in sync.
+// Upserts notes + contacted + flagged for a unit into unit_notes.
+// Also mirrors all three fields to the active lease_actions record so the
+// Lease Drawer stays in sync.
 app.put("/api/v1/units/:id/notes", async (req: Request, res: Response) => {
   let sql: postgres.Sql | null = null;
   try {
     const unitId = req.params.id.toLowerCase().trim();
-    const body = req.body as { notes?: string; updated_by?: string };
-    if (body.notes === undefined) {
-      res.status(400).json({ success: false, error: 'notes field required' });
+    const body = req.body as { notes?: string; contacted?: boolean; flagged?: boolean; updated_by?: string };
+    if (body.notes === undefined && body.contacted === undefined && body.flagged === undefined) {
+      res.status(400).json({ success: false, error: 'at least one of notes, contacted, or flagged is required' });
       return;
     }
-    const notes = body.notes;
     const updatedBy = body.updated_by ?? null;
     sql = getDb();
-    // 1. Upsert into unit_notes
+    // 1. Read existing unit_notes row so we can merge partial updates
+    const existing = await sql<{ notes: string; contacted: boolean; flagged: boolean }[]>`
+      SELECT notes, contacted, flagged FROM unit_notes WHERE unit_id = ${unitId} LIMIT 1
+    `;
+    const cur = existing[0] ?? { notes: '', contacted: false, flagged: false };
+    const newNotes     = body.notes     !== undefined ? body.notes     : cur.notes;
+    const newContacted = body.contacted !== undefined ? body.contacted : cur.contacted;
+    const newFlagged   = body.flagged   !== undefined ? body.flagged   : cur.flagged;
+    // 2. Upsert into unit_notes
     await sql`
-      INSERT INTO unit_notes (unit_id, notes, updated_at, updated_by)
-      VALUES (${unitId}, ${notes}, NOW(), ${updatedBy})
+      INSERT INTO unit_notes (unit_id, notes, contacted, flagged, updated_at, updated_by)
+      VALUES (${unitId}, ${newNotes}, ${newContacted}, ${newFlagged}, NOW(), ${updatedBy})
       ON CONFLICT (unit_id) DO UPDATE SET
         notes      = EXCLUDED.notes,
+        contacted  = EXCLUDED.contacted,
+        flagged    = EXCLUDED.flagged,
         updated_at = NOW(),
         updated_by = EXCLUDED.updated_by
     `;
-    // 2. Mirror to lease_actions if an active lease exists
+    // 3. Mirror to lease_actions if an active lease exists
     const leaseRows = await sql<{ id: string }[]>`
       SELECT id FROM gold_lease_expirations
       WHERE unit_id = ${unitId}
@@ -515,16 +525,26 @@ app.put("/api/v1/units/:id/notes", async (req: Request, res: Response) => {
     `;
     if (leaseRows.length > 0) {
       const leaseId = leaseRows[0].id;
+      // Read existing lease_actions to merge
+      const existingLa = await sql<{ contacted: boolean; flagged: boolean; notes: string | null }[]>`
+        SELECT contacted, flagged, notes FROM lease_actions WHERE lease_id = ${leaseId} LIMIT 1
+      `;
+      const curLa = existingLa[0] ?? { contacted: false, flagged: false, notes: null };
+      const laContacted = body.contacted !== undefined ? body.contacted : curLa.contacted;
+      const laFlagged   = body.flagged   !== undefined ? body.flagged   : curLa.flagged;
+      const laNotes     = body.notes     !== undefined ? body.notes     : (curLa.notes ?? '');
       await sql`
         INSERT INTO lease_actions (lease_id, contacted, flagged, notes, last_action_at, updated_at)
-        VALUES (${leaseId}, false, false, ${notes}, NOW(), NOW())
+        VALUES (${leaseId}, ${laContacted}, ${laFlagged}, ${laNotes}, NOW(), NOW())
         ON CONFLICT (lease_id) DO UPDATE SET
+          contacted  = EXCLUDED.contacted,
+          flagged    = EXCLUDED.flagged,
           notes      = EXCLUDED.notes,
           last_action_at = NOW(),
           updated_at = NOW()
       `;
     }
-    res.status(200).json({ success: true, data: { unit_id: unitId, notes, updated_at: new Date().toISOString() } });
+    res.status(200).json({ success: true, data: { unit_id: unitId, notes: newNotes, contacted: newContacted, flagged: newFlagged, updated_at: new Date().toISOString() } });
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
     console.error(`[${SERVICE_NAME}] PUT /api/v1/units/:id/notes error:`, message);
