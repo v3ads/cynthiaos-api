@@ -2274,6 +2274,7 @@ interface UnitIntelligenceRow {
   tenant_id:             string | null;
   financial_exposure:    string;
   delinquency_balance:   string;
+  prior_term_balance:    string; // carry-over from past lease term; excluded from risk score
   ar_balance:            string;
   max_days_overdue:      string;
   turnover_count:        string;
@@ -2345,9 +2346,14 @@ app.get("/api/v1/insights/unit-intelligence", async (req: Request, res: Response
       delinquency_agg AS (
         SELECT
           d.unit_id,
-          SUM(d.balance_due)                          AS delinquency_balance,
+          -- Only current-tenant balances count toward risk score and financial exposure
+          SUM(CASE WHEN d.tenant_status = 'current' THEN d.balance_due ELSE 0 END) AS delinquency_balance,
+          -- Prior-term balances (past tenants) are tracked separately and shown as a
+          -- distinct label in the UI — they do NOT affect risk/stability/profitability scores
+          SUM(CASE WHEN d.tenant_status = 'past'    THEN d.balance_due ELSE 0 END) AS prior_term_balance,
           -- Cap days_overdue at 365 to prevent score distortion from stale records
-          LEAST(MAX(d.days_overdue), 365)             AS max_days_overdue,
+          -- Only consider current-tenant overdue days for scoring
+          LEAST(MAX(CASE WHEN d.tenant_status = 'current' THEN d.days_overdue ELSE 0 END), 365) AS max_days_overdue,
           COUNT(*)                                    AS delinquency_count,
           -- Resolve tenant name from gold_tenants via delinquency tenant_id
           MAX(t.full_name)                            AS delinquency_tenant_name
@@ -2408,10 +2414,13 @@ app.get("/api/v1/insights/unit-intelligence", async (req: Request, res: Response
           lt.lease_end_date,
           lt.days_until_expiration,
           COALESCE(d.delinquency_balance, 0)                        AS delinquency_balance,
+          -- prior_term_balance: carry-over from a past lease term; shown in UI but excluded from scores
+          COALESCE(d.prior_term_balance, 0)                         AS prior_term_balance,
           COALESCE(ar.ar_balance, 0)                                AS ar_balance,
+          -- financial_exposure only counts current-tenant delinquency + aged receivables
           COALESCE(d.delinquency_balance, 0)
             + COALESCE(ar.ar_balance, 0)                            AS financial_exposure,
-          -- days_overdue already capped at 365 inside delinquency_agg
+          -- days_overdue already capped at 365 inside delinquency_agg (current tenants only)
           COALESCE(d.max_days_overdue, 0)                           AS max_days_overdue,
           COALESCE(t.turnover_count, 0)                             AS turnover_count,
           COALESCE(ar.avg_ar_risk_score, 0)                         AS avg_ar_risk_score
@@ -2497,9 +2506,10 @@ app.get("/api/v1/insights/unit-intelligence", async (req: Request, res: Response
           -- tenant_name already resolved via COALESCE chain in assembled CTE
           tenant_name,
           tenant_id,
-          ROUND(financial_exposure::numeric, 2) AS financial_exposure,
-          ROUND(delinquency_balance::numeric, 2) AS delinquency_balance,
-          ROUND(ar_balance::numeric, 2)          AS ar_balance,
+          ROUND(financial_exposure::numeric, 2)   AS financial_exposure,
+          ROUND(delinquency_balance::numeric, 2)   AS delinquency_balance,
+          ROUND(prior_term_balance::numeric, 2)    AS prior_term_balance,
+          ROUND(ar_balance::numeric, 2)            AS ar_balance,
           max_days_overdue,
           turnover_count,
           stability_score,
@@ -2757,6 +2767,7 @@ app.get("/api/v1/insights/unit-intelligence", async (req: Request, res: Response
         tenant_name:           r.tenant_name,
         financial_exposure:    parseFloat(String(r.financial_exposure)),
         delinquency_balance:   parseFloat(String(r.delinquency_balance)),
+        prior_term_balance:    parseFloat(String(r.prior_term_balance ?? '0')),
         ar_balance:            parseFloat(String(r.ar_balance)),
         max_days_overdue:      parseInt(String(r.max_days_overdue), 10),
         turnover_count:        parseInt(String(r.turnover_count), 10),
