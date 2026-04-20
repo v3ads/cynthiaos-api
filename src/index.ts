@@ -438,6 +438,102 @@ app.get("/api/v1/leases/:id", async (req: Request, res: Response) => {
   }
 });
 
+// ── GET /api/v1/units/:id/notes ─────────────────────────────────────────────
+// Returns the note for a unit. Checks unit_notes first; if empty, falls back
+// to the active lease's lease_actions note so notes saved via the Lease Drawer
+// are visible here too.
+app.get("/api/v1/units/:id/notes", async (req: Request, res: Response) => {
+  let sql: postgres.Sql | null = null;
+  try {
+    const unitId = req.params.id.toLowerCase().trim();
+    sql = getDb();
+    // 1. Check unit_notes table
+    const unitNoteRows = await sql<{ notes: string; updated_at: string; updated_by: string | null }[]>`
+      SELECT notes, updated_at::text AS updated_at, updated_by
+      FROM unit_notes
+      WHERE unit_id = ${unitId}
+      LIMIT 1
+    `;
+    if (unitNoteRows.length > 0 && unitNoteRows[0].notes.trim() !== '') {
+      res.status(200).json({ success: true, data: { notes: unitNoteRows[0].notes, updated_at: unitNoteRows[0].updated_at, source: 'unit_notes' } });
+      return;
+    }
+    // 2. Fall back to active lease_actions note
+    const leaseNoteRows = await sql<{ notes: string | null; last_action_at: string | null }[]>`
+      SELECT la.notes, la.last_action_at::text AS last_action_at
+      FROM gold_lease_expirations le
+      JOIN lease_actions la ON la.lease_id = le.id
+      WHERE le.unit_id = ${unitId}
+        AND la.notes IS NOT NULL AND la.notes <> ''
+      ORDER BY la.last_action_at DESC NULLS LAST
+      LIMIT 1
+    `;
+    if (leaseNoteRows.length > 0) {
+      res.status(200).json({ success: true, data: { notes: leaseNoteRows[0].notes ?? '', updated_at: leaseNoteRows[0].last_action_at, source: 'lease_actions' } });
+      return;
+    }
+    res.status(200).json({ success: true, data: { notes: '', updated_at: null, source: null } });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`[${SERVICE_NAME}] GET /api/v1/units/:id/notes error:`, message);
+    res.status(500).json({ success: false, error: message });
+  } finally {
+    if (sql) await sql.end();
+  }
+});
+
+// ── PUT /api/v1/units/:id/notes ───────────────────────────────────────────────
+// Upserts a note for a unit into unit_notes. Also mirrors to the active
+// lease_actions record (if one exists) so the Lease Drawer stays in sync.
+app.put("/api/v1/units/:id/notes", async (req: Request, res: Response) => {
+  let sql: postgres.Sql | null = null;
+  try {
+    const unitId = req.params.id.toLowerCase().trim();
+    const body = req.body as { notes?: string; updated_by?: string };
+    if (body.notes === undefined) {
+      res.status(400).json({ success: false, error: 'notes field required' });
+      return;
+    }
+    const notes = body.notes;
+    const updatedBy = body.updated_by ?? null;
+    sql = getDb();
+    // 1. Upsert into unit_notes
+    await sql`
+      INSERT INTO unit_notes (unit_id, notes, updated_at, updated_by)
+      VALUES (${unitId}, ${notes}, NOW(), ${updatedBy})
+      ON CONFLICT (unit_id) DO UPDATE SET
+        notes      = EXCLUDED.notes,
+        updated_at = NOW(),
+        updated_by = EXCLUDED.updated_by
+    `;
+    // 2. Mirror to lease_actions if an active lease exists
+    const leaseRows = await sql<{ id: string }[]>`
+      SELECT id FROM gold_lease_expirations
+      WHERE unit_id = ${unitId}
+      ORDER BY lease_end_date DESC NULLS LAST
+      LIMIT 1
+    `;
+    if (leaseRows.length > 0) {
+      const leaseId = leaseRows[0].id;
+      await sql`
+        INSERT INTO lease_actions (lease_id, contacted, flagged, notes, last_action_at, updated_at)
+        VALUES (${leaseId}, false, false, ${notes}, NOW(), NOW())
+        ON CONFLICT (lease_id) DO UPDATE SET
+          notes      = EXCLUDED.notes,
+          last_action_at = NOW(),
+          updated_at = NOW()
+      `;
+    }
+    res.status(200).json({ success: true, data: { unit_id: unitId, notes, updated_at: new Date().toISOString() } });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`[${SERVICE_NAME}] PUT /api/v1/units/:id/notes error:`, message);
+    res.status(500).json({ success: false, error: message });
+  } finally {
+    if (sql) await sql.end();
+  }
+});
+
 // ── GET /api/v1/leases/:id/actions ───────────────────────────────────────────
 // Returns the action state for a lease. If no record exists, returns defaults.
 app.get("/api/v1/leases/:id/actions", async (req: Request, res: Response) => {
@@ -3552,6 +3648,18 @@ app.listen(PORT, "0.0.0.0", async () => {
     // Adds tenant_status TEXT to gold_delinquency_records and gold_aged_receivables.
     // 'past' records are carry-over balances from prior lease terms and must not
     // inflate current-tenant risk scores or appear in Collections Risk.
+    // ── unit_notes table (idempotent) ─────────────────────────────────────
+    // Stores per-unit notes keyed by unit_id. For occupied units, notes are
+    // also mirrored to/from lease_actions so they appear in the Lease Drawer.
+    await boot`
+      CREATE TABLE IF NOT EXISTS unit_notes (
+        unit_id    TEXT PRIMARY KEY,
+        notes      TEXT NOT NULL DEFAULT '',
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_by TEXT
+      )
+    `;
+    console.log(`[${SERVICE_NAME}] unit_notes table ensured`);
     await boot`
       ALTER TABLE gold_delinquency_records
         ADD COLUMN IF NOT EXISTS tenant_status TEXT NOT NULL DEFAULT 'current'
