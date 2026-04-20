@@ -1946,6 +1946,7 @@ app.get("/api/v1/insights/collections-risk", async (req: Request, res: Response)
           bucket_90_plus::numeric   AS bucket_90_plus,
           dominant_bucket
         FROM gold_aged_receivables
+        WHERE tenant_status = 'current'
         ORDER BY tenant_id, risk_score DESC, created_at DESC
       ),
       d_deduped AS (
@@ -1954,6 +1955,7 @@ app.get("/api/v1/insights/collections-risk", async (req: Request, res: Response)
           days_overdue,
           risk_level AS delinquency_level
         FROM gold_delinquency_records
+        WHERE tenant_status = 'current'
         ORDER BY tenant_id, days_overdue DESC NULLS LAST, created_at DESC
       ),
       le_deduped AS (
@@ -2039,11 +2041,13 @@ app.get("/api/v1/insights/collections-risk", async (req: Request, res: Response)
           risk_score::numeric     AS risk_score,
           bucket_90_plus::numeric AS bucket_90_plus
         FROM gold_aged_receivables
+        WHERE tenant_status = 'current'
         ORDER BY tenant_id, risk_score DESC, created_at DESC
       ),
       d_deduped AS (
         SELECT DISTINCT ON (tenant_id) tenant_id, days_overdue
         FROM gold_delinquency_records
+        WHERE tenant_status = 'current'
         ORDER BY tenant_id, days_overdue DESC NULLS LAST, created_at DESC
       ),
       le_deduped AS (
@@ -3544,6 +3548,19 @@ app.listen(PORT, "0.0.0.0", async () => {
       SET    exclude_from_occupancy = TRUE
       WHERE  unit_id IN ('202', '313')
     `;
+    // ── tenant_status column migrations (idempotent) ─────────────────────
+    // Adds tenant_status TEXT to gold_delinquency_records and gold_aged_receivables.
+    // 'past' records are carry-over balances from prior lease terms and must not
+    // inflate current-tenant risk scores or appear in Collections Risk.
+    await boot`
+      ALTER TABLE gold_delinquency_records
+        ADD COLUMN IF NOT EXISTS tenant_status TEXT NOT NULL DEFAULT 'current'
+    `;
+    await boot`
+      ALTER TABLE gold_aged_receivables
+        ADD COLUMN IF NOT EXISTS tenant_status TEXT NOT NULL DEFAULT 'current'
+    `;
+    console.log(`[${SERVICE_NAME}] tenant_status migrations applied to gold_delinquency_records + gold_aged_receivables`);
     console.log(`[${SERVICE_NAME}] gold_units unit_group + exclude_from_occupancy migrations applied`);
     const [cnt] = await boot<{ n: string }[]>`SELECT COUNT(*)::text AS n FROM gold_units`;
     if (parseInt(cnt.n, 10) === 0) {
