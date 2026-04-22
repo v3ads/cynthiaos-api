@@ -1,5 +1,6 @@
 import express, { Request, Response, NextFunction } from "express";
 import postgres from "postgres";
+import jasmineRouter from "./routes/jasmine";
 
 const app = express();
 const PORT = parseInt(process.env.PORT ?? "3003", 10);
@@ -3618,6 +3619,9 @@ app.get("/api/v1/maintenance", async (req: Request, res: Response) => {
     if (sql) await sql.end();
   }
 });
+
+// ── Jasmine AI Agent Routes ─────────────────────────────────────────────────
+app.use('/api', jasmineRouter);
 
 // ── Error handler ─────────────────────────────────────────────────────────────
 app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
