@@ -1013,6 +1013,345 @@ router.get("/jasmine/work-orders", async (req: Request, res: Response) => {
   }
 });
 
+// ============================================================================
+// 14. Aged Receivables (/jasmine/aged-receivables)
+// ============================================================================
+router.get("/jasmine/aged-receivables", async (_req: Request, res: Response) => {
+  try {
+    if (responseCache.has('aged-receivables')) {
+      return res.json(responseCache.get('aged-receivables'));
+    }
+
+    const sql = getDb();
+    const results = await sql`
+      SELECT raw_data->'results' as data, report_date
+      FROM bronze_appfolio_reports
+      WHERE report_type = 'aged_receivables_detail'
+      ORDER BY report_date DESC
+      LIMIT 1
+    `;
+
+    if (!results || results.length === 0) {
+      return res.json({ receivables: [], last_pipeline_run: null });
+    }
+
+    const rawData = results[0].data || [];
+    const reportDate = results[0].report_date;
+
+    const receivables = rawData.map((row: any) => ({
+      unit: row.UnitName || row.Unit,
+      tenant_name: row.PayerName || row.OccupancyName,
+      tenant_status: row.TenantStatus,
+      amount_0_to_30: parseFloat(row['0To30'] || '0'),
+      amount_30_to_60: parseFloat(row['30To60'] || '0'),
+      amount_60_to_90: parseFloat(row['60To90'] || '0'),
+      amount_90_plus: parseFloat(row['90Plus'] || '0'),
+      total_amount: parseFloat(row.TotalAmount || '0'),
+      gl_account: row.GlAccountName
+    })).filter((r: any) => r.total_amount > 0);
+
+    const response = {
+      receivables,
+      total_outstanding: receivables.reduce((sum: number, r: any) => sum + r.total_amount, 0),
+      last_pipeline_run: reportDate
+    };
+
+    return res.json(response);
+  } catch (error) {
+    console.error("[Jasmine] Error fetching aged receivables:", error);
+    return res.status(500).json({ error: "Failed to fetch aged receivables" });
+  }
+});
+
+// ============================================================================
+// 15. Applicant Pipeline (/jasmine/applicants)
+// ============================================================================
+router.get("/jasmine/applicants", async (_req: Request, res: Response) => {
+  try {
+    if (responseCache.has('applicants')) {
+      return res.json(responseCache.get('applicants'));
+    }
+
+    const sql = getDb();
+    const results = await sql`
+      SELECT raw_data->'results' as data, report_date
+      FROM bronze_appfolio_reports
+      WHERE report_type = 'rental_applications'
+      ORDER BY report_date DESC
+      LIMIT 1
+    `;
+
+    if (!results || results.length === 0) {
+      return res.json({ applicants: [], last_pipeline_run: null });
+    }
+
+    const rawData = results[0].data || [];
+    const reportDate = results[0].report_date;
+
+    const applicants = rawData.map((row: any) => ({
+      name: row.Applicants,
+      email: row.Email,
+      phone: row.PhoneNumber,
+      unit_applied_for: row.UnitName || row.UnitTitle,
+      status: row.Status || row.ApplicationStatus,
+      received_date: row.Received,
+      move_in_date: row.MoveInDate || row.DesiredMoveIn,
+      assigned_to: row.AssignedUser
+    }));
+
+    const response = {
+      applicants,
+      total_count: applicants.length,
+      last_pipeline_run: reportDate
+    };
+
+    return res.json(response);
+  } catch (error) {
+    console.error("[Jasmine] Error fetching applicant pipeline:", error);
+    return res.status(500).json({ error: "Failed to fetch applicant pipeline" });
+  }
+});
+
+// ============================================================================
+// 16. Inspection Report (Unit Turns) (/jasmine/inspections)
+// ============================================================================
+router.get("/jasmine/inspections", async (_req: Request, res: Response) => {
+  try {
+    if (responseCache.has('inspections')) {
+      return res.json(responseCache.get('inspections'));
+    }
+
+    const sql = getDb();
+    const results = await sql`
+      SELECT raw_data->'results' as data, report_date
+      FROM bronze_appfolio_reports
+      WHERE report_type = 'unit_turn_detail'
+      ORDER BY report_date DESC
+      LIMIT 1
+    `;
+
+    if (!results || results.length === 0) {
+      return res.json({ unit_turns: [], last_pipeline_run: null });
+    }
+
+    const rawData = results[0].data || [];
+    const reportDate = results[0].report_date;
+
+    const unit_turns = rawData.map((row: any) => ({
+      unit: row.Unit,
+      move_out_date: row.MoveOutDate,
+      expected_move_in: row.ExpectedMoveInDate,
+      turn_end_date: row.TurnEndDate,
+      target_days: row.TargetDaysToComplete,
+      actual_days: row.TotalDaysToComplete,
+      notes: row.Notes
+    }));
+
+    const response = {
+      unit_turns,
+      total_count: unit_turns.length,
+      last_pipeline_run: reportDate
+    };
+
+    return res.json(response);
+  } catch (error) {
+    console.error("[Jasmine] Error fetching inspections/unit turns:", error);
+    return res.status(500).json({ error: "Failed to fetch inspections" });
+  }
+});
+
+// ============================================================================
+// 17. Insurance Expiration (/jasmine/insurance)
+// ============================================================================
+router.get("/jasmine/insurance", async (_req: Request, res: Response) => {
+  // Stub endpoint since we don't have the insurance_expiration report in DB yet
+  return res.json({ 
+    insurance_policies: [], 
+    message: "Insurance tracking data not currently available in AppFolio sync",
+    last_pipeline_run: new Date().toISOString()
+  });
+});
+
+// ============================================================================
+// 18. General Ledger (/jasmine/general-ledger)
+// ============================================================================
+router.get("/jasmine/general-ledger", async (req: Request, res: Response) => {
+  try {
+    const accountFilter = req.query.account as string;
+    const cacheKey = accountFilter ? `general-ledger:\${accountFilter.toLowerCase()}` : 'general-ledger:all';
+
+    if (responseCache.has(cacheKey)) {
+      return res.json(responseCache.get(cacheKey));
+    }
+
+    // Fall back to base cache and filter in memory if base exists
+    if (accountFilter && responseCache.has('general-ledger:all')) {
+      const baseData = responseCache.get('general-ledger:all') as any;
+      const filteredEntries = baseData.entries.filter((e: any) => 
+        e.gl_account_name && e.gl_account_name.toLowerCase().includes(accountFilter.toLowerCase())
+      );
+      return res.json({
+        entries: filteredEntries,
+        total_count: filteredEntries.length,
+        last_pipeline_run: baseData.last_pipeline_run
+      });
+    }
+
+    const sql = getDb();
+    const results = await sql`
+      SELECT raw_data->'results' as data, report_date
+      FROM bronze_appfolio_reports
+      WHERE report_type = 'general_ledger'
+      ORDER BY report_date DESC
+      LIMIT 1
+    `;
+
+    if (!results || results.length === 0) {
+      return res.json({ entries: [], last_pipeline_run: null });
+    }
+
+    const rawData = results[0].data || [];
+    const reportDate = results[0].report_date;
+
+    let entries = rawData.map((row: any) => ({
+      date: row.PostDate,
+      type: row.Type,
+      unit: row.Unit,
+      debit: row.Debit ? parseFloat(row.Debit.replace(/,/g, '')) : 0,
+      credit: row.Credit ? parseFloat(row.Credit.replace(/,/g, '')) : 0,
+      description: row.Description,
+      gl_account_name: row.GlAccountName,
+      party_name: row.PartyName
+    }));
+
+    if (accountFilter) {
+      entries = entries.filter((e: any) => 
+        e.gl_account_name && e.gl_account_name.toLowerCase().includes(accountFilter.toLowerCase())
+      );
+    }
+
+    const response = {
+      entries,
+      total_count: entries.length,
+      last_pipeline_run: reportDate
+    };
+
+    return res.json(response);
+  } catch (error) {
+    console.error("[Jasmine] Error fetching general ledger:", error);
+    return res.status(500).json({ error: "Failed to fetch general ledger" });
+  }
+});
+
+// ============================================================================
+// 19. Vendor Directory (/jasmine/vendors)
+// ============================================================================
+router.get("/jasmine/vendors", async (req: Request, res: Response) => {
+  try {
+    const tradeFilter = req.query.trade as string;
+    
+    if (!tradeFilter && responseCache.has('vendors')) {
+      return res.json(responseCache.get('vendors'));
+    }
+
+    const sql = getDb();
+    const results = await sql`
+      SELECT raw_data->'results' as data, report_date
+      FROM bronze_appfolio_reports
+      WHERE report_type = 'vendor_directory'
+      ORDER BY report_date DESC
+      LIMIT 1
+    `;
+
+    if (!results || results.length === 0) {
+      return res.json({ vendors: [], last_pipeline_run: null });
+    }
+
+    const rawData = results[0].data || [];
+    const reportDate = results[0].report_date;
+
+    let vendors = rawData.map((row: any) => ({
+      company_name: row.CompanyName,
+      contact_name: row.Name || `\${row.FirstName || ''} \${row.LastName || ''}`.trim(),
+      type: row.VendorType,
+      trades: row.VendorTrades,
+      email: row.Email,
+      phone: row.PhoneNumbers,
+      payment_type: row.PaymentType,
+      do_not_use: row.DoNotUseForWorkOrder === 'Yes'
+    })).filter((v: any) => v.company_name || v.contact_name);
+
+    if (tradeFilter) {
+      vendors = vendors.filter((v: any) => 
+        (v.trades && v.trades.toLowerCase().includes(tradeFilter.toLowerCase())) ||
+        (v.type && v.type.toLowerCase().includes(tradeFilter.toLowerCase()))
+      );
+    }
+
+    const response = {
+      vendors,
+      total_count: vendors.length,
+      last_pipeline_run: reportDate
+    };
+
+    return res.json(response);
+  } catch (error) {
+    console.error("[Jasmine] Error fetching vendors:", error);
+    return res.status(500).json({ error: "Failed to fetch vendors" });
+  }
+});
+
+// ============================================================================
+// 20. Prospect Activity (/jasmine/prospects)
+// ============================================================================
+router.get("/jasmine/prospects", async (_req: Request, res: Response) => {
+  try {
+    if (responseCache.has('prospects')) {
+      return res.json(responseCache.get('prospects'));
+    }
+
+    const sql = getDb();
+    const results = await sql`
+      SELECT raw_data->'results' as data, report_date
+      FROM bronze_appfolio_reports
+      WHERE report_type = 'guest_cards'
+      ORDER BY report_date DESC
+      LIMIT 1
+    `;
+
+    if (!results || results.length === 0) {
+      return res.json({ prospects: [], last_pipeline_run: null });
+    }
+
+    const rawData = results[0].data || [];
+    const reportDate = results[0].report_date;
+
+    const prospects = rawData.map((row: any) => ({
+      name: row.Name,
+      email: row.EmailAddress,
+      phone: row.PhoneNumber,
+      source: row.Source,
+      status: row.Status,
+      unit_interest: row.Unit,
+      received_date: row.Received,
+      last_activity: row.LastActivityDate,
+      assigned_to: row.AssignedUser
+    }));
+
+    const response = {
+      prospects,
+      total_count: prospects.length,
+      last_pipeline_run: reportDate
+    };
+
+    return res.json(response);
+  } catch (error) {
+    console.error("[Jasmine] Error fetching prospects:", error);
+    return res.status(500).json({ error: "Failed to fetch prospects" });
+  }
+});
+
+
 // ── Cache loaders (pre-warm all static endpoints) ───────────────────────────
 // Each loader runs the same SQL as its corresponding endpoint and stores the
 // result in responseCache. warmCache() iterates all loaders at startup and
@@ -1326,6 +1665,188 @@ cacheLoaders.set('work-orders:all', async () => {
     `;
   } finally { await sql.end(); }
 });
+
+cacheLoaders.set('aged-receivables', async () => {
+  const sql = getDb();
+  try {
+    const results = await sql`
+      SELECT raw_data->'results' as data, report_date
+      FROM bronze_appfolio_reports
+      WHERE report_type = 'aged_receivables_detail'
+      ORDER BY report_date DESC
+      LIMIT 1
+    `;
+    if (!results || results.length === 0) return { receivables: [], last_pipeline_run: null };
+    const rawData = results[0].data || [];
+    const receivables = rawData.map((row: any) => ({
+      unit: row.UnitName || row.Unit,
+      tenant_name: row.PayerName || row.OccupancyName,
+      tenant_status: row.TenantStatus,
+      amount_0_to_30: parseFloat(row['0To30'] || '0'),
+      amount_30_to_60: parseFloat(row['30To60'] || '0'),
+      amount_60_to_90: parseFloat(row['60To90'] || '0'),
+      amount_90_plus: parseFloat(row['90Plus'] || '0'),
+      total_amount: parseFloat(row.TotalAmount || '0'),
+      gl_account: row.GlAccountName
+    })).filter((r: any) => r.total_amount > 0);
+    return {
+      receivables,
+      total_outstanding: receivables.reduce((sum: number, r: any) => sum + r.total_amount, 0),
+      last_pipeline_run: results[0].report_date
+    };
+  } finally { await sql.end(); }
+});
+
+cacheLoaders.set('applicants', async () => {
+  const sql = getDb();
+  try {
+    const results = await sql`
+      SELECT raw_data->'results' as data, report_date
+      FROM bronze_appfolio_reports
+      WHERE report_type = 'rental_applications'
+      ORDER BY report_date DESC
+      LIMIT 1
+    `;
+    if (!results || results.length === 0) return { applicants: [], last_pipeline_run: null };
+    const rawData = results[0].data || [];
+    const applicants = rawData.map((row: any) => ({
+      name: row.Applicants,
+      email: row.Email,
+      phone: row.PhoneNumber,
+      unit_applied_for: row.UnitName || row.UnitTitle,
+      status: row.Status || row.ApplicationStatus,
+      received_date: row.Received,
+      move_in_date: row.MoveInDate || row.DesiredMoveIn,
+      assigned_to: row.AssignedUser
+    }));
+    return {
+      applicants,
+      total_count: applicants.length,
+      last_pipeline_run: results[0].report_date
+    };
+  } finally { await sql.end(); }
+});
+
+cacheLoaders.set('inspections', async () => {
+  const sql = getDb();
+  try {
+    const results = await sql`
+      SELECT raw_data->'results' as data, report_date
+      FROM bronze_appfolio_reports
+      WHERE report_type = 'unit_turn_detail'
+      ORDER BY report_date DESC
+      LIMIT 1
+    `;
+    if (!results || results.length === 0) return { unit_turns: [], last_pipeline_run: null };
+    const rawData = results[0].data || [];
+    const unit_turns = rawData.map((row: any) => ({
+      unit: row.Unit,
+      move_out_date: row.MoveOutDate,
+      expected_move_in: row.ExpectedMoveInDate,
+      turn_end_date: row.TurnEndDate,
+      target_days: row.TargetDaysToComplete,
+      actual_days: row.TotalDaysToComplete,
+      notes: row.Notes
+    }));
+    return {
+      unit_turns,
+      total_count: unit_turns.length,
+      last_pipeline_run: results[0].report_date
+    };
+  } finally { await sql.end(); }
+});
+
+cacheLoaders.set('general-ledger:all', async () => {
+  const sql = getDb();
+  try {
+    const results = await sql`
+      SELECT raw_data->'results' as data, report_date
+      FROM bronze_appfolio_reports
+      WHERE report_type = 'general_ledger'
+      ORDER BY report_date DESC
+      LIMIT 1
+    `;
+    if (!results || results.length === 0) return { entries: [], last_pipeline_run: null };
+    const rawData = results[0].data || [];
+    const entries = rawData.map((row: any) => ({
+      date: row.PostDate,
+      type: row.Type,
+      unit: row.Unit,
+      debit: row.Debit ? parseFloat(row.Debit.replace(/,/g, '')) : 0,
+      credit: row.Credit ? parseFloat(row.Credit.replace(/,/g, '')) : 0,
+      description: row.Description,
+      gl_account_name: row.GlAccountName,
+      party_name: row.PartyName
+    }));
+    return {
+      entries,
+      total_count: entries.length,
+      last_pipeline_run: results[0].report_date
+    };
+  } finally { await sql.end(); }
+});
+
+cacheLoaders.set('vendors', async () => {
+  const sql = getDb();
+  try {
+    const results = await sql`
+      SELECT raw_data->'results' as data, report_date
+      FROM bronze_appfolio_reports
+      WHERE report_type = 'vendor_directory'
+      ORDER BY report_date DESC
+      LIMIT 1
+    `;
+    if (!results || results.length === 0) return { vendors: [], last_pipeline_run: null };
+    const rawData = results[0].data || [];
+    const vendors = rawData.map((row: any) => ({
+      company_name: row.CompanyName,
+      contact_name: row.Name || `\${row.FirstName || ''} \${row.LastName || ''}`.trim(),
+      type: row.VendorType,
+      trades: row.VendorTrades,
+      email: row.Email,
+      phone: row.PhoneNumbers,
+      payment_type: row.PaymentType,
+      do_not_use: row.DoNotUseForWorkOrder === 'Yes'
+    })).filter((v: any) => v.company_name || v.contact_name);
+    return {
+      vendors,
+      total_count: vendors.length,
+      last_pipeline_run: results[0].report_date
+    };
+  } finally { await sql.end(); }
+});
+
+cacheLoaders.set('prospects', async () => {
+  const sql = getDb();
+  try {
+    const results = await sql`
+      SELECT raw_data->'results' as data, report_date
+      FROM bronze_appfolio_reports
+      WHERE report_type = 'guest_cards'
+      ORDER BY report_date DESC
+      LIMIT 1
+    `;
+    if (!results || results.length === 0) return { prospects: [], last_pipeline_run: null };
+    const rawData = results[0].data || [];
+    const prospects = rawData.map((row: any) => ({
+      name: row.Name,
+      email: row.EmailAddress,
+      phone: row.PhoneNumber,
+      source: row.Source,
+      status: row.Status,
+      unit_interest: row.Unit,
+      received_date: row.Received,
+      last_activity: row.LastActivityDate,
+      assigned_to: row.AssignedUser
+    }));
+    return {
+      prospects,
+      total_count: prospects.length,
+      last_pipeline_run: results[0].report_date
+    };
+  } finally { await sql.end(); }
+});
+
 
 export default router;
 
