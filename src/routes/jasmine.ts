@@ -1,11 +1,13 @@
 // ── Jasmine AI Agent — Read-Only Gold Layer Endpoints ─────────────────────────
-// Exposes 11 GET endpoints that the Jasmine AI leasing agent uses to query
+// Exposes 12 GET endpoints that the Jasmine AI leasing agent uses to query
 // live portfolio data from the Gold layer.
 //
-// Business rule: the following units are excluded from vacancy, revenue, and
-// market analysis queries because they are family-held or employee-occupied:
-//   115, 116, 202, 313, 318  → family units
-//   411, 707, 905, 906       → employee units
+// Business rule: units listed in jasmine_unit_overrides with
+//   exclude_from_vacancy = true  are excluded from vacancy queries
+//   exclude_from_revenue = true  are excluded from revenue/market queries
+//
+// The excluded unit list is loaded from the database at module startup and
+// refreshed every 60 minutes so changes take effect without a redeploy.
 //
 // All endpoints:
 //   - Use parameterized queries via the `postgres` tagged-template driver
@@ -18,9 +20,6 @@ import postgres from "postgres";
 
 const router = Router();
 
-// ── Excluded unit IDs (family + employee units) ───────────────────────────────
-const EXCLUDED_UNITS = ['115', '116', '202', '313', '318', '411', '707', '905', '906'];
-
 // ── Database client factory (mirrors pattern in src/index.ts) ─────────────────
 function getDb(): postgres.Sql {
   const databaseUrl = process.env.DATABASE_URL;
@@ -28,9 +27,39 @@ function getDb(): postgres.Sql {
   return postgres(databaseUrl, { ssl: "require", max: 5, idle_timeout: 30 });
 }
 
-// ── Helper: normalize unit_id from AppFolio raw Unit string ──────────────────
-// Mirrors the LOWER(REGEXP_REPLACE(TRIM(...), '\s*-\s*', '-', 'g')) pattern
-// used throughout the API SQL.
+// ── Dynamic exclusion cache ───────────────────────────────────────────────────
+// Loaded from jasmine_unit_overrides at startup; refreshed every 60 minutes.
+// Falls back to the hardcoded list if the DB query fails (safety net).
+const FALLBACK_EXCLUDED_UNITS = ['115', '116', '202', '313', '318', '411', '707', '905', '906'];
+
+let excludedUnitIds: string[] = [...FALLBACK_EXCLUDED_UNITS];
+
+async function loadExcludedUnits(): Promise<void> {
+  let sql: postgres.Sql | null = null;
+  try {
+    sql = getDb();
+    const rows = await sql<{ unit_id: string }[]>`
+      SELECT unit_id FROM jasmine_unit_overrides WHERE exclude_from_vacancy = true
+    `;
+    if (rows.length > 0) {
+      excludedUnitIds = rows.map(r => r.unit_id);
+      console.log(`[jasmine] Loaded ${excludedUnitIds.length} excluded unit IDs from jasmine_unit_overrides`);
+    } else {
+      console.warn('[jasmine] jasmine_unit_overrides returned 0 rows — keeping previous cache');
+    }
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error('[jasmine] Failed to load excluded units from DB — using cached/fallback list:', message);
+  } finally {
+    if (sql) await sql.end();
+  }
+}
+
+// Initial load at module startup
+loadExcludedUnits();
+
+// Refresh every 60 minutes
+setInterval(loadExcludedUnits, 60 * 60 * 1000);
 
 // ── ENDPOINT 1 — GET /jasmine/portfolio-summary ───────────────────────────────
 // Returns a single summary object with occupancy counts, vacancy rate,
@@ -39,9 +68,8 @@ router.get("/jasmine/portfolio-summary", async (_req: Request, res: Response) =>
   let sql: postgres.Sql | null = null;
   try {
     sql = getDb();
+    const excluded = excludedUnitIds;
 
-    // Occupancy counts come from the latest unit_vacancy Bronze report,
-    // which is the same source used by the existing /api/v1/occupancy endpoint.
     const [summary] = await sql<{
       occupied: string;
       vacant: string;
@@ -81,20 +109,19 @@ router.get("/jasmine/portfolio-summary", async (_req: Request, res: Response) =>
           AND b.report_date = latest_rr.dt
           AND elem->>'Unit' IS NOT NULL
           AND LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g'))
-              NOT IN (${sql.array(EXCLUDED_UNITS)})
+              NOT IN (${sql.array(excluded)})
       )
       SELECT
         COUNT(*) FILTER (WHERE uv.unit_status ILIKE '%occupied%' OR (uv.unit_status NOT ILIKE '%vacant%' AND uv.unit_status NOT ILIKE '%notice%')) AS occupied,
         COUNT(*) FILTER (WHERE uv.unit_status ILIKE '%vacant%'
-          AND uv.unit_id NOT IN (${sql.array(EXCLUDED_UNITS)}))                 AS vacant,
-        COUNT(*) FILTER (WHERE uv.unit_status ILIKE '%notice%')                 AS on_notice,
-        SUM(rr.monthly_rent)::text                                               AS total_monthly_rent,
-        ROUND(AVG(rr.monthly_rent), 2)::text                                     AS avg_rent
+          AND uv.unit_id NOT IN (${sql.array(excluded)}))                   AS vacant,
+        COUNT(*) FILTER (WHERE uv.unit_status ILIKE '%notice%')             AS on_notice,
+        SUM(rr.monthly_rent)::text                                           AS total_monthly_rent,
+        ROUND(AVG(rr.monthly_rent), 2)::text                                 AS avg_rent
       FROM uv
       LEFT JOIN rr ON rr.unit_id = uv.unit_id
     `;
 
-    // Last successful pipeline run
     const [pipeline] = await sql<{ last_run: string | null }[]>`
       SELECT MAX(updated_at)::text AS last_run
       FROM pipeline_metadata
@@ -103,9 +130,7 @@ router.get("/jasmine/portfolio-summary", async (_req: Request, res: Response) =>
 
     const TOTAL_UNITS = 182;
     const vacant = parseInt(summary.vacant ?? '0', 10);
-    const vacancyRatePct = parseFloat(
-      ((vacant / TOTAL_UNITS) * 100).toFixed(1)
-    );
+    const vacancyRatePct = parseFloat(((vacant / TOTAL_UNITS) * 100).toFixed(1));
 
     res.json({
       total_units: TOTAL_UNITS,
@@ -113,9 +138,7 @@ router.get("/jasmine/portfolio-summary", async (_req: Request, res: Response) =>
       vacant,
       on_notice: parseInt(summary.on_notice ?? '0', 10),
       vacancy_rate_pct: vacancyRatePct,
-      total_monthly_rent: summary.total_monthly_rent
-        ? parseFloat(summary.total_monthly_rent)
-        : null,
+      total_monthly_rent: summary.total_monthly_rent ? parseFloat(summary.total_monthly_rent) : null,
       avg_rent: summary.avg_rent ? parseFloat(summary.avg_rent) : null,
       last_pipeline_run: pipeline?.last_run ?? null,
     });
@@ -128,14 +151,13 @@ router.get("/jasmine/portfolio-summary", async (_req: Request, res: Response) =>
 });
 
 // ── ENDPOINT 2 — GET /jasmine/units ──────────────────────────────────────────
-// Returns an array of units with optional status and building filters.
-// Applies the business rule exclusion when status is 'vacant' or 'all'.
 router.get("/jasmine/units", async (req: Request, res: Response) => {
   let sql: postgres.Sql | null = null;
   try {
     sql = getDb();
     const status   = String(req.query.status   ?? 'all').toLowerCase();
     const building = req.query.building ? String(req.query.building) : null;
+    const excluded = excludedUnitIds;
 
     const validStatuses = ['vacant', 'occupied', 'notice', 'all'];
     if (!validStatuses.includes(status)) {
@@ -204,8 +226,8 @@ router.get("/jasmine/units", async (req: Request, res: Response) => {
       LEFT JOIN rr ON rr.unit_id = uv.unit_id
       WHERE (
         ${status === 'all'}
-        OR (${status === 'vacant'}  AND uv.unit_status ILIKE '%vacant%')
-        OR (${status === 'notice'}  AND uv.unit_status ILIKE '%notice%')
+        OR (${status === 'vacant'}   AND uv.unit_status ILIKE '%vacant%')
+        OR (${status === 'notice'}   AND uv.unit_status ILIKE '%notice%')
         OR (${status === 'occupied'} AND uv.unit_status ILIKE '%occupied%')
       )
       AND (
@@ -214,7 +236,7 @@ router.get("/jasmine/units", async (req: Request, res: Response) => {
       )
       AND (
         ${status !== 'vacant' && status !== 'all'}
-        OR uv.unit_id NOT IN (${sql.array(EXCLUDED_UNITS)})
+        OR uv.unit_id NOT IN (${sql.array(excluded)})
       )
       ORDER BY uv.unit_id
     `;
@@ -226,7 +248,7 @@ router.get("/jasmine/units", async (req: Request, res: Response) => {
       building:     r.building,
       status:       r.status,
       days_vacant:  r.days_vacant !== null ? parseInt(r.days_vacant, 10) : null,
-      market_rent:  r.market_rent !== null ? parseFloat(r.market_rent) : null,
+      market_rent:  r.market_rent  !== null ? parseFloat(r.market_rent)  : null,
       monthly_rent: r.monthly_rent !== null ? parseFloat(r.monthly_rent) : null,
       tenant_name:  r.tenant_name,
     })));
@@ -239,8 +261,6 @@ router.get("/jasmine/units", async (req: Request, res: Response) => {
 });
 
 // ── ENDPOINT 3 — GET /jasmine/units/:unit_id ─────────────────────────────────
-// Returns a single unit record joining gold_units, gold_tenants,
-// gold_lease_expirations, and unit_notes.
 router.get("/jasmine/units/:unit_id", async (req: Request, res: Response) => {
   let sql: postgres.Sql | null = null;
   try {
@@ -283,12 +303,9 @@ router.get("/jasmine/units/:unit_id", async (req: Request, res: Response) => {
         un.contacted           AS contact_status,
         un.flagged
       FROM gold_units gu
-      LEFT JOIN gold_tenants gt
-        ON gt.unit_id = gu.unit_id
-      LEFT JOIN gold_lease_expirations le
-        ON le.unit_id = gu.unit_id
-      LEFT JOIN unit_notes un
-        ON un.unit_id = gu.unit_id
+      LEFT JOIN gold_tenants gt ON gt.unit_id = gu.unit_id
+      LEFT JOIN gold_lease_expirations le ON le.unit_id = gu.unit_id
+      LEFT JOIN unit_notes un ON un.unit_id = gu.unit_id
       WHERE gu.unit_id = ${unitId}
       LIMIT 1
     `;
@@ -308,8 +325,6 @@ router.get("/jasmine/units/:unit_id", async (req: Request, res: Response) => {
 });
 
 // ── ENDPOINT 4 — GET /jasmine/leases ─────────────────────────────────────────
-// Returns leases expiring within window_days (default 90).
-// Joins tenant_directory Bronze for phone/email.
 router.get("/jasmine/leases", async (req: Request, res: Response) => {
   let sql: postgres.Sql | null = null;
   try {
@@ -380,7 +395,6 @@ router.get("/jasmine/leases", async (req: Request, res: Response) => {
 });
 
 // ── ENDPOINT 5 — GET /jasmine/notices ────────────────────────────────────────
-// Returns tenants with a notice-to-vacate (lease_status = 'notice').
 router.get("/jasmine/notices", async (_req: Request, res: Response) => {
   let sql: postgres.Sql | null = null;
   try {
@@ -426,13 +440,13 @@ router.get("/jasmine/notices", async (_req: Request, res: Response) => {
     `;
 
     res.json(rows.map(r => ({
-      unit_id:       r.unit_id,
-      tenant_name:   r.tenant_name,
-      unit_type:     r.unit_type,
+      unit_id:        r.unit_id,
+      tenant_name:    r.tenant_name,
+      unit_type:      r.unit_type,
       lease_end_date: r.lease_end_date,
-      monthly_rent:  r.monthly_rent !== null ? parseFloat(r.monthly_rent) : null,
-      phone:         r.phone,
-      email:         r.email,
+      monthly_rent:   r.monthly_rent !== null ? parseFloat(r.monthly_rent) : null,
+      phone:          r.phone,
+      email:          r.email,
     })));
   } catch (err: unknown) {
     const error = err instanceof Error ? err.message : String(err);
@@ -443,7 +457,6 @@ router.get("/jasmine/notices", async (_req: Request, res: Response) => {
 });
 
 // ── ENDPOINT 6 — GET /jasmine/delinquency ────────────────────────────────────
-// Returns delinquency records filtered by risk level (default: all).
 router.get("/jasmine/delinquency", async (req: Request, res: Response) => {
   let sql: postgres.Sql | null = null;
   try {
@@ -462,15 +475,13 @@ router.get("/jasmine/delinquency", async (req: Request, res: Response) => {
       amount_owed: string | null;
       days_overdue: number | null;
       risk_level: string | null;
-      last_payment_date: string | null;
     }[]>`
       SELECT
         d.unit_id,
         gt.full_name          AS tenant_name,
         d.balance_due::text   AS amount_owed,
         d.days_overdue,
-        d.risk_level,
-        NULL::text            AS last_payment_date
+        d.risk_level
       FROM gold_delinquency_records d
       LEFT JOIN gold_tenants gt ON gt.unit_id = d.unit_id
       WHERE d.tenant_status = 'current'
@@ -482,12 +493,11 @@ router.get("/jasmine/delinquency", async (req: Request, res: Response) => {
     `;
 
     res.json(rows.map(r => ({
-      unit_id:          r.unit_id,
-      tenant_name:      r.tenant_name,
-      amount_owed:      r.amount_owed !== null ? parseFloat(r.amount_owed) : null,
-      days_overdue:     r.days_overdue,
-      risk_level:       r.risk_level,
-      last_payment_date: r.last_payment_date,
+      unit_id:      r.unit_id,
+      tenant_name:  r.tenant_name,
+      amount_owed:  r.amount_owed !== null ? parseFloat(r.amount_owed) : null,
+      days_overdue: r.days_overdue,
+      risk_level:   r.risk_level,
     })));
   } catch (err: unknown) {
     const error = err instanceof Error ? err.message : String(err);
@@ -498,16 +508,12 @@ router.get("/jasmine/delinquency", async (req: Request, res: Response) => {
 });
 
 // ── ENDPOINT 7 — GET /jasmine/below-market ───────────────────────────────────
-// Returns units where monthly_rent is below market_rent by at least threshold_pct.
-// Applies the business rule exclusion.
 router.get("/jasmine/below-market", async (req: Request, res: Response) => {
   let sql: postgres.Sql | null = null;
   try {
     sql = getDb();
-    const thresholdPct = Math.max(
-      parseFloat(String(req.query.threshold_pct ?? '10')),
-      0
-    );
+    const thresholdPct = Math.max(parseFloat(String(req.query.threshold_pct ?? '10')), 0);
+    const excluded = excludedUnitIds;
 
     const rows = await sql<{
       unit_id: string;
@@ -535,7 +541,7 @@ router.get("/jasmine/below-market", async (req: Request, res: Response) => {
           AND b.report_date = latest_rr.dt
           AND elem->>'Unit' IS NOT NULL
           AND LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g'))
-              NOT IN (${sql.array(EXCLUDED_UNITS)})
+              NOT IN (${sql.array(excluded)})
         ORDER BY LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g'))
       )
       SELECT
@@ -556,12 +562,12 @@ router.get("/jasmine/below-market", async (req: Request, res: Response) => {
     `;
 
     res.json(rows.map(r => ({
-      unit_id:      r.unit_id,
-      unit_type:    r.unit_type,
-      tenant_name:  r.tenant_name,
-      monthly_rent: r.monthly_rent !== null ? parseFloat(r.monthly_rent) : null,
-      market_rent:  r.market_rent  !== null ? parseFloat(r.market_rent)  : null,
-      difference:   r.difference   !== null ? parseFloat(r.difference)   : null,
+      unit_id:       r.unit_id,
+      unit_type:     r.unit_type,
+      tenant_name:   r.tenant_name,
+      monthly_rent:  r.monthly_rent  !== null ? parseFloat(r.monthly_rent)  : null,
+      market_rent:   r.market_rent   !== null ? parseFloat(r.market_rent)   : null,
+      difference:    r.difference    !== null ? parseFloat(r.difference)    : null,
       percent_below: r.percent_below !== null ? parseFloat(r.percent_below) : null,
     })));
   } catch (err: unknown) {
@@ -573,16 +579,12 @@ router.get("/jasmine/below-market", async (req: Request, res: Response) => {
 });
 
 // ── ENDPOINT 8 — GET /jasmine/long-vacancies ─────────────────────────────────
-// Returns vacant units where days_vacant >= min_days (default 90).
-// Applies the business rule exclusion.
 router.get("/jasmine/long-vacancies", async (req: Request, res: Response) => {
   let sql: postgres.Sql | null = null;
   try {
     sql = getDb();
-    const minDays = Math.max(
-      parseInt(String(req.query.min_days ?? '90'), 10),
-      0
-    );
+    const minDays = Math.max(parseInt(String(req.query.min_days ?? '90'), 10), 0);
+    const excluded = excludedUnitIds;
 
     const rows = await sql<{
       unit_id: string;
@@ -607,7 +609,7 @@ router.get("/jasmine/long-vacancies", async (req: Request, res: Response) => {
           AND b.report_date = latest_uv.dt
           AND elem->>'Unit' IS NOT NULL
           AND LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g'))
-              NOT IN (${sql.array(EXCLUDED_UNITS)})
+              NOT IN (${sql.array(excluded)})
         ORDER BY LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g'))
       )
       SELECT unit_id, unit_type, days_vacant, market_rent::text
@@ -634,7 +636,6 @@ router.get("/jasmine/long-vacancies", async (req: Request, res: Response) => {
 });
 
 // ── ENDPOINT 9 — GET /jasmine/tenants ────────────────────────────────────────
-// Searches gold_tenants by tenant_name or unit_id (search param required).
 router.get("/jasmine/tenants", async (req: Request, res: Response) => {
   let sql: postgres.Sql | null = null;
   try {
@@ -708,9 +709,6 @@ router.get("/jasmine/tenants", async (req: Request, res: Response) => {
 });
 
 // ── ENDPOINT 10 — GET /jasmine/move-schedule ─────────────────────────────────
-// Returns upcoming move-ins and/or move-outs within window_days (default 30).
-// Uses gold_unit_turnover for historical move events, and gold_tenants for
-// upcoming move-outs derived from lease_end_date.
 router.get("/jasmine/move-schedule", async (req: Request, res: Response) => {
   let sql: postgres.Sql | null = null;
   try {
@@ -765,12 +763,8 @@ router.get("/jasmine/move-schedule", async (req: Request, res: Response) => {
         OR
         (${type === null || type === 'out'} AND gut.move_out_date BETWEEN NOW() AND NOW() + (${windowDays} || ' days')::interval)
       )
-      AND NOT (
-        ${type === 'in'}  AND gut.move_in_date  IS NULL
-      )
-      AND NOT (
-        ${type === 'out'} AND gut.move_out_date IS NULL
-      )
+      AND NOT (${type === 'in'}  AND gut.move_in_date  IS NULL)
+      AND NOT (${type === 'out'} AND gut.move_out_date IS NULL)
       ORDER BY
         CASE
           WHEN ${type === 'out'} THEN gut.move_out_date
@@ -795,11 +789,6 @@ router.get("/jasmine/move-schedule", async (req: Request, res: Response) => {
 });
 
 // ── ENDPOINT 11 — GET /jasmine/tasks ─────────────────────────────────────────
-// Returns open/pending tasks from the CynthiaOS tasks table.
-// Fields: task_id, unit_id, task_type, description, priority, assigned_to, created_at
-// TODO: The tasks table uses entity_id for the unit reference and payload_json for
-//       description/assigned_to — these are mapped below. If the schema evolves,
-//       update the field mappings accordingly.
 router.get("/jasmine/tasks", async (_req: Request, res: Response) => {
   let sql: postgres.Sql | null = null;
   try {
@@ -836,6 +825,52 @@ router.get("/jasmine/tasks", async (_req: Request, res: Response) => {
       assigned_to: r.actor_id,
       created_at:  r.created_at,
     })));
+  } catch (err: unknown) {
+    const error = err instanceof Error ? err.message : String(err);
+    res.status(500).json({ error });
+  } finally {
+    if (sql) await sql.end();
+  }
+});
+
+// ── ENDPOINT 12 — GET /jasmine/unit-overrides ────────────────────────────────
+// Returns all rows from jasmine_unit_overrides ordered by override_type then
+// unit_id. Used by the frontend to display the current override list to Cindy
+// or Ayman. Also triggers a cache refresh so the in-memory excludedUnitIds
+// array is always consistent with what this endpoint returns.
+router.get("/jasmine/unit-overrides", async (_req: Request, res: Response) => {
+  let sql: postgres.Sql | null = null;
+  try {
+    sql = getDb();
+
+    const rows = await sql<{
+      unit_id: string;
+      override_type: string;
+      reason: string | null;
+      exclude_from_vacancy: boolean;
+      exclude_from_revenue: boolean;
+      created_at: string;
+    }[]>`
+      SELECT
+        unit_id,
+        override_type,
+        reason,
+        exclude_from_vacancy,
+        exclude_from_revenue,
+        created_at::text
+      FROM jasmine_unit_overrides
+      ORDER BY override_type ASC, unit_id ASC
+    `;
+
+    // Keep the in-memory cache consistent with the DB on every read
+    const freshExcluded = rows
+      .filter(r => r.exclude_from_vacancy)
+      .map(r => r.unit_id);
+    if (freshExcluded.length > 0) {
+      excludedUnitIds = freshExcluded;
+    }
+
+    res.json(rows);
   } catch (err: unknown) {
     const error = err instanceof Error ? err.message : String(err);
     res.status(500).json({ error });
