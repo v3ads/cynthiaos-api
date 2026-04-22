@@ -58,8 +58,52 @@ async function loadExcludedUnits(): Promise<void> {
 // Initial load at module startup
 loadExcludedUnits();
 
-// Refresh every 60 minutes
-setInterval(loadExcludedUnits, 60 * 60 * 1000);
+// Refresh daily at 8:00 AM Eastern Time (UTC-5 in EST, UTC-4 in EDT).
+// We schedule a setTimeout that fires at the next 8 AM ET wall-clock time,
+// then re-schedules itself 24 hours later so it stays aligned regardless of
+// DST transitions.
+function scheduleNextRefresh(): void {
+  // Determine the next 8:00 AM in the America/New_York timezone.
+  const now = new Date();
+
+  // Build a candidate "today at 08:00 ET" by formatting the current date in
+  // the ET timezone and constructing an 08:00 timestamp in that zone.
+  const etFormatter = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/New_York',
+    year: 'numeric', month: '2-digit', day: '2-digit',
+  });
+  const parts = etFormatter.formatToParts(now);
+  const etYear  = parts.find(p => p.type === 'year')!.value;
+  const etMonth = parts.find(p => p.type === 'month')!.value;
+  const etDay   = parts.find(p => p.type === 'day')!.value;
+
+  // ISO string for 08:00 ET today — interpreted in the ET timezone via the
+  // Intl API to get the correct UTC epoch.
+  const todayAt8AmEt = new Date(
+    `${etYear}-${etMonth}-${etDay}T08:00:00`
+  );
+  // The string above is parsed as local time; convert to ET by computing the
+  // UTC offset for that moment in New York.
+  const utcOffsetMs = todayAt8AmEt.getTime()
+    - new Date(todayAt8AmEt.toLocaleString('en-US', { timeZone: 'America/New_York' })).getTime();
+  const next8AmEtUtc = new Date(todayAt8AmEt.getTime() - utcOffsetMs);
+
+  // If 8 AM ET has already passed today, target tomorrow.
+  if (next8AmEtUtc <= now) {
+    next8AmEtUtc.setUTCDate(next8AmEtUtc.getUTCDate() + 1);
+  }
+
+  const msUntilNext = next8AmEtUtc.getTime() - now.getTime();
+  const hoursUntil  = (msUntilNext / 3_600_000).toFixed(2);
+  console.log(`[jasmine] Next cache refresh scheduled in ${hoursUntil}h at ${next8AmEtUtc.toISOString()} (8:00 AM ET)`);
+
+  setTimeout(async () => {
+    await loadExcludedUnits();
+    scheduleNextRefresh(); // re-schedule for the following day
+  }, msUntilNext);
+}
+
+scheduleNextRefresh();
 
 // ── ENDPOINT 1 — GET /jasmine/portfolio-summary ───────────────────────────────
 // Returns a single summary object with occupancy counts, vacancy rate,
