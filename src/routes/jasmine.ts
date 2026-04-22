@@ -144,7 +144,7 @@ router.get("/jasmine/portfolio-summary", async (_req: Request, res: Response) =>
       ),
       rr AS (
         SELECT
-          LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g')) AS unit_id,
+          LOWER(REGEXP_REPLACE(elem->>'Unit', '[^a-zA-Z0-9]', '', 'g')) AS unit_id,
           NULLIF(REPLACE(elem->>'Rent', ',', ''), '')::numeric AS monthly_rent
         FROM bronze_appfolio_reports b,
              jsonb_array_elements(b.raw_data->'results') AS elem,
@@ -152,7 +152,8 @@ router.get("/jasmine/portfolio-summary", async (_req: Request, res: Response) =>
         WHERE b.report_type = 'rent_roll'
           AND b.report_date = latest_rr.dt
           AND elem->>'Unit' IS NOT NULL
-          AND LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g'))
+          AND elem->>'Status' ILIKE '%current%'
+          AND LOWER(REGEXP_REPLACE(elem->>'Unit', '[^a-zA-Z0-9]', '', 'g'))
               NOT IN (${sql.array(excluded)})
       )
       SELECT
