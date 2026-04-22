@@ -209,6 +209,11 @@ router.get("/jasmine/units", async (req: Request, res: Response) => {
       return;
     }
 
+    // For status=all we drive off gold_units (182 rows) so every unit is
+    // represented even if it has no entry in the unit_vacancy Bronze report.
+    // For status-filtered queries we still drive off the vacancy report.
+    // Exclusion uses a subquery against jasmine_unit_overrides so it works
+    // reliably regardless of the postgres driver's array interpolation.
     const rows = await sql<{
       unit_id: string;
       unit_type: string | null;
@@ -254,35 +259,35 @@ router.get("/jasmine/units", async (req: Request, res: Response) => {
           AND b.report_date = latest_rr.dt
           AND elem->>'Unit' IS NOT NULL
         ORDER BY LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g'))
+      ),
+      excluded AS (
+        SELECT unit_id FROM jasmine_unit_overrides WHERE exclude_from_vacancy = true
       )
       SELECT
-        uv.unit_id,
+        gu.unit_id,
         uv.unit_type,
         gu.unit_group,
         uv.building,
-        uv.unit_status                    AS status,
+        COALESCE(uv.unit_status, gu.unit_status)  AS status,
         uv.days_vacant,
         uv.market_rent::text,
         rr.monthly_rent::text,
         rr.tenant_name
-      FROM uv
-      LEFT JOIN gold_units gu ON gu.unit_id = uv.unit_id
-      LEFT JOIN rr ON rr.unit_id = uv.unit_id
+      FROM gold_units gu
+      LEFT JOIN uv  ON uv.unit_id  = gu.unit_id
+      LEFT JOIN rr  ON rr.unit_id  = gu.unit_id
       WHERE (
         ${status === 'all'}
-        OR (${status === 'vacant'}   AND uv.unit_status ILIKE '%vacant%')
-        OR (${status === 'notice'}   AND uv.unit_status ILIKE '%notice%')
-        OR (${status === 'occupied'} AND uv.unit_status ILIKE '%occupied%')
+        OR (${status === 'vacant'}   AND COALESCE(uv.unit_status, gu.unit_status) ILIKE '%vacant%')
+        OR (${status === 'notice'}   AND COALESCE(uv.unit_status, gu.unit_status) ILIKE '%notice%')
+        OR (${status === 'occupied'} AND COALESCE(uv.unit_status, gu.unit_status) ILIKE '%occupied%')
       )
       AND (
         ${!building}
         OR uv.building ILIKE ${'%' + (building ?? '') + '%'}
       )
-      AND (
-        ${status !== 'vacant' && status !== 'all'}
-        OR uv.unit_id NOT IN (${sql.array(excluded)})
-      )
-      ORDER BY uv.unit_id
+      AND gu.unit_id NOT IN (SELECT unit_id FROM excluded)
+      ORDER BY gu.unit_id
     `;
 
     res.json(rows.map(r => ({
@@ -416,7 +421,8 @@ router.get("/jasmine/leases", async (req: Request, res: Response) => {
       FROM gold_lease_expirations le
       LEFT JOIN gold_tenants gt ON gt.unit_id = le.unit_id
       LEFT JOIN rent_lookup  rl ON rl.unit_id = le.unit_id
-      WHERE le.days_until_expiration <= ${windowDays}
+      WHERE le.days_until_expiration >= 0
+        AND le.days_until_expiration <= ${windowDays}
       ORDER BY le.days_until_expiration ASC
     `;
 
@@ -557,7 +563,6 @@ router.get("/jasmine/below-market", async (req: Request, res: Response) => {
   try {
     sql = getDb();
     const thresholdPct = Math.max(parseFloat(String(req.query.threshold_pct ?? '10')), 0);
-    const excluded = excludedUnitIds;
 
     const rows = await sql<{
       unit_id: string;
@@ -570,6 +575,9 @@ router.get("/jasmine/below-market", async (req: Request, res: Response) => {
     }[]>`
       WITH latest_rr AS (
         SELECT MAX(report_date) AS dt FROM bronze_appfolio_reports WHERE report_type = 'rent_roll'
+      ),
+      excl AS (
+        SELECT unit_id FROM jasmine_unit_overrides WHERE exclude_from_revenue = true
       ),
       rr AS (
         SELECT DISTINCT ON (LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g')))
@@ -585,7 +593,7 @@ router.get("/jasmine/below-market", async (req: Request, res: Response) => {
           AND b.report_date = latest_rr.dt
           AND elem->>'Unit' IS NOT NULL
           AND LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g'))
-              NOT IN (${sql.array(excluded)})
+              NOT IN (SELECT unit_id FROM excl)
         ORDER BY LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g'))
       )
       SELECT
@@ -628,7 +636,6 @@ router.get("/jasmine/long-vacancies", async (req: Request, res: Response) => {
   try {
     sql = getDb();
     const minDays = Math.max(parseInt(String(req.query.min_days ?? '90'), 10), 0);
-    const excluded = excludedUnitIds;
 
     const rows = await sql<{
       unit_id: string;
@@ -653,7 +660,7 @@ router.get("/jasmine/long-vacancies", async (req: Request, res: Response) => {
           AND b.report_date = latest_uv.dt
           AND elem->>'Unit' IS NOT NULL
           AND LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g'))
-              NOT IN (${sql.array(excluded)})
+              NOT IN (SELECT unit_id FROM jasmine_unit_overrides WHERE exclude_from_vacancy = true)
         ORDER BY LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g'))
       )
       SELECT unit_id, unit_type, days_vacant, market_rent::text
