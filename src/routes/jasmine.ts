@@ -916,4 +916,62 @@ router.get("/jasmine/unit-overrides", async (_req: Request, res: Response) => {
   }
 });
 
+// ── 13. Work Orders ─────────────────────────────────────────────────────────
+// GET /jasmine/work-orders
+// Query params: status=open|all (default: open)
+// Returns maintenance requests from the AppFolio work_order Bronze report.
+// open = Assigned / New / Pending (excludes Completed, Canceled, Closed)
+router.get("/jasmine/work-orders", async (req: Request, res: Response) => {
+  let sql: postgres.Sql | null = null;
+  try {
+    sql = getDb();
+    const statusFilter = (req.query.status as string | undefined) ?? 'open';
+
+    const rows = await sql`
+      SELECT
+        elem->>'WorkOrderId'               AS work_order_id,
+        elem->>'WorkOrderNumber'            AS work_order_number,
+        elem->>'UnitName'                   AS unit,
+        elem->>'Status'                     AS status,
+        elem->>'Priority'                   AS priority,
+        elem->>'WorkOrderType'              AS work_order_type,
+        elem->>'WorkOrderIssue'             AS issue,
+        COALESCE(
+          NULLIF(elem->>'JobDescription', ''),
+          NULLIF(elem->>'ServiceRequestDescription', '')
+        )                                   AS description,
+        elem->>'PrimaryTenant'              AS tenant,
+        elem->>'AssignedUser'               AS assigned_to,
+        elem->>'Vendor'                     AS vendor,
+        elem->>'CreatedAt'                  AS created_at,
+        elem->>'ScheduledStart'             AS scheduled_start,
+        elem->>'WorkDoneOn'                 AS work_done_on
+      FROM bronze_appfolio_reports,
+      LATERAL jsonb_array_elements(raw_data->'results') AS elem
+      WHERE report_type = 'work_order'
+        AND report_date = (
+          SELECT MAX(report_date)
+          FROM bronze_appfolio_reports
+          WHERE report_type = 'work_order'
+        )
+        AND (
+          ${statusFilter === 'all'}
+          OR (
+            elem->>'Status' NOT ILIKE '%complete%'
+            AND elem->>'Status' NOT ILIKE '%cancel%'
+            AND elem->>'Status' NOT ILIKE '%closed%'
+          )
+        )
+      ORDER BY elem->>'CreatedAt' DESC
+    `;
+    res.json(rows);
+  } catch (err: unknown) {
+    const error = err instanceof Error ? err.message : String(err);
+    res.status(500).json({ error });
+  } finally {
+    if (sql) await sql.end();
+  }
+});
+
 export default router;
+
