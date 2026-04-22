@@ -210,6 +210,8 @@ app.get("/api/v1/leases/expirations", async (req: Request, res: Response) => {
         WHERE b.report_type = 'tenant_directory' AND b.report_date = latest_td.dt
           AND elem->>'Status' ILIKE '%current%'
           AND elem->>'Unit' IS NOT NULL
+        ORDER BY LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g')),
+                 (elem->>'PrimaryTenant' = 'Yes') DESC
       )
       SELECT le.id, le.bronze_report_id, le.tenant_id, le.unit_id,
              le.lease_start_date::text AS lease_start_date,
@@ -273,6 +275,8 @@ app.get("/api/v1/leases/expiring-soon", async (req: Request, res: Response) => {
         WHERE b.report_type = 'tenant_directory' AND b.report_date = latest_td.dt
           AND elem->>'Status' ILIKE '%current%'
           AND elem->>'Unit' IS NOT NULL
+        ORDER BY LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g')),
+                 (elem->>'PrimaryTenant' = 'Yes') DESC
       )
       SELECT le.id, le.bronze_report_id, le.tenant_id, le.unit_id,
              le.lease_start_date::text AS lease_start_date,
@@ -343,6 +347,8 @@ app.get("/api/v1/leases/upcoming-renewals", async (req: Request, res: Response) 
         WHERE b.report_type = 'tenant_directory' AND b.report_date = latest_td.dt
           AND elem->>'Status' ILIKE '%current%'
           AND elem->>'Unit' IS NOT NULL
+        ORDER BY LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g')),
+                 (elem->>'PrimaryTenant' = 'Yes') DESC
       )
       SELECT le.id, le.bronze_report_id, le.tenant_id, le.unit_id,
              le.lease_start_date::text AS lease_start_date,
@@ -417,6 +423,8 @@ app.get("/api/v1/leases/:id", async (req: Request, res: Response) => {
         WHERE b.report_type = 'tenant_directory' AND b.report_date = latest_td.dt
           AND elem->>'Status' ILIKE '%current%'
           AND elem->>'Unit' IS NOT NULL
+        ORDER BY LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g')),
+                 (elem->>'PrimaryTenant' = 'Yes') DESC
       )
       SELECT le.id, le.bronze_report_id, le.tenant_id, le.unit_id,
              le.lease_start_date::text AS lease_start_date,
