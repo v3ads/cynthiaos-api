@@ -551,13 +551,18 @@ router.get("/jasmine/delinquency", async (req: Request, res: Response) => {
     }[]>`
       SELECT
         d.unit_id,
-        gt.full_name                   AS tenant_name,
+        (
+          SELECT gt.full_name
+          FROM gold_tenants gt
+          WHERE gt.unit_id = d.unit_id
+          ORDER BY (gt.tenant_status ILIKE '%primary%') DESC, gt.full_name ASC
+          LIMIT 1
+        )                              AS tenant_name,
         d.balance_due::text            AS amount_owed,
         d.total_outstanding::text      AS total_outstanding,
         d.days_overdue,
         d.risk_level
       FROM gold_delinquency_records d
-      LEFT JOIN gold_tenants gt ON gt.unit_id = d.unit_id
       WHERE d.tenant_status = 'current'
         AND (
           ${risk === 'all'}
