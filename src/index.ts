@@ -60,6 +60,7 @@ interface GoldLeaseExpiration {
   tenant_name: string | null;    // display name from tenant_directory Bronze
   unit: string | null;           // display unit number (e.g. '918')
   property: string | null;       // property name from tenant_directory Bronze
+  unit_group: string | null;     // family/group label from gold_units
   created_at: Date;
 }
 
@@ -160,6 +161,7 @@ function mapRow(r: GoldLeaseExpiration) {
     // contact fields sourced from gold_tenants; null when no tenant record exists
     contact_email: r.contact_email ?? null,
     contact_phone: r.contact_phone ?? null,
+    unit_group: r.unit_group ?? null,
     created_at: r.created_at,
   };
 }
@@ -206,7 +208,7 @@ app.get("/api/v1/leases/expirations", async (req: Request, res: Response) => {
              jsonb_array_elements(b.raw_data->'results') AS elem,
              latest_td
         WHERE b.report_type = 'tenant_directory' AND b.report_date = latest_td.dt
-          AND elem->>'Status' NOT ILIKE '%vacant%'
+          AND elem->>'Status' ILIKE '%current%'
           AND elem->>'Unit' IS NOT NULL
       )
       SELECT le.id, le.bronze_report_id, le.tenant_id, le.unit_id,
@@ -219,10 +221,12 @@ app.get("/api/v1/leases/expirations", async (req: Request, res: Response) => {
              tl.tenant_name,
              tl.unit_display           AS unit,
              tl.property,
+             gu.unit_group,
              le.created_at
       FROM gold_lease_expirations le
       LEFT JOIN rent_lookup   rl ON rl.unit_id = le.unit_id
       LEFT JOIN tenant_lookup tl ON tl.unit_id = le.unit_id
+      LEFT JOIN gold_units    gu ON gu.unit_id = le.unit_id
       ORDER BY le.lease_end_date ASC NULLS LAST
       LIMIT ${limit} OFFSET ${offset}
     `;
@@ -267,7 +271,7 @@ app.get("/api/v1/leases/expiring-soon", async (req: Request, res: Response) => {
              jsonb_array_elements(b.raw_data->'results') AS elem,
              latest_td
         WHERE b.report_type = 'tenant_directory' AND b.report_date = latest_td.dt
-          AND elem->>'Status' NOT ILIKE '%vacant%'
+          AND elem->>'Status' ILIKE '%current%'
           AND elem->>'Unit' IS NOT NULL
       )
       SELECT le.id, le.bronze_report_id, le.tenant_id, le.unit_id,
@@ -277,10 +281,12 @@ app.get("/api/v1/leases/expiring-soon", async (req: Request, res: Response) => {
              rl.monthly_rent::text     AS monthly_rent,
              tl.contact_email,
              tl.contact_phone,
+             gu.unit_group,
              le.created_at
       FROM gold_lease_expirations le
       LEFT JOIN rent_lookup   rl ON rl.unit_id = le.unit_id
       LEFT JOIN tenant_lookup tl ON tl.unit_id = le.unit_id
+      LEFT JOIN gold_units    gu ON gu.unit_id = le.unit_id
       WHERE le.lease_end_date IS NOT NULL
         AND le.lease_end_date >= CURRENT_DATE
         AND (le.lease_end_date - CURRENT_DATE) <= ${days}
@@ -335,7 +341,7 @@ app.get("/api/v1/leases/upcoming-renewals", async (req: Request, res: Response) 
              jsonb_array_elements(b.raw_data->'results') AS elem,
              latest_td
         WHERE b.report_type = 'tenant_directory' AND b.report_date = latest_td.dt
-          AND elem->>'Status' NOT ILIKE '%vacant%'
+          AND elem->>'Status' ILIKE '%current%'
           AND elem->>'Unit' IS NOT NULL
       )
       SELECT le.id, le.bronze_report_id, le.tenant_id, le.unit_id,
@@ -345,10 +351,12 @@ app.get("/api/v1/leases/upcoming-renewals", async (req: Request, res: Response) 
              rl.monthly_rent::text     AS monthly_rent,
              tl.contact_email,
              tl.contact_phone,
+             gu.unit_group,
              le.created_at
       FROM gold_lease_expirations le
       LEFT JOIN rent_lookup   rl ON rl.unit_id = le.unit_id
       LEFT JOIN tenant_lookup tl ON tl.unit_id = le.unit_id
+      LEFT JOIN gold_units    gu ON gu.unit_id = le.unit_id
       WHERE le.lease_end_date IS NOT NULL
         AND (le.lease_end_date - CURRENT_DATE) > ${fromDays}
         AND (le.lease_end_date - CURRENT_DATE) <= ${toDays}
@@ -407,7 +415,7 @@ app.get("/api/v1/leases/:id", async (req: Request, res: Response) => {
              jsonb_array_elements(b.raw_data->'results') AS elem,
              latest_td
         WHERE b.report_type = 'tenant_directory' AND b.report_date = latest_td.dt
-          AND elem->>'Status' NOT ILIKE '%vacant%'
+          AND elem->>'Status' ILIKE '%current%'
           AND elem->>'Unit' IS NOT NULL
       )
       SELECT le.id, le.bronze_report_id, le.tenant_id, le.unit_id,
@@ -417,10 +425,12 @@ app.get("/api/v1/leases/:id", async (req: Request, res: Response) => {
              rl.monthly_rent::text     AS monthly_rent,
              tl.contact_email,
              tl.contact_phone,
+             gu.unit_group,
              le.created_at
       FROM gold_lease_expirations le
       LEFT JOIN rent_lookup   rl ON rl.unit_id = le.unit_id
       LEFT JOIN tenant_lookup tl ON tl.unit_id = le.unit_id
+      LEFT JOIN gold_units    gu ON gu.unit_id = le.unit_id
       WHERE le.id = ${id}
       LIMIT 1
     `;
@@ -2962,7 +2972,7 @@ app.get("/api/v1/renewals", async (req: Request, res: Response) => {
              jsonb_array_elements(b.raw_data->'results') AS elem,
              latest_td
         WHERE b.report_type = 'tenant_directory' AND b.report_date = latest_td.dt
-          AND elem->>'Status' NOT ILIKE '%vacant%'
+          AND elem->>'Status' ILIKE '%current%'
           AND elem->>'Unit' IS NOT NULL
         ORDER BY LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g')),
                  (elem->>'PrimaryTenant' = 'Yes') DESC
