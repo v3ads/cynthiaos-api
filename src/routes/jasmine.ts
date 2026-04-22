@@ -545,13 +545,15 @@ router.get("/jasmine/delinquency", async (req: Request, res: Response) => {
       unit_id: string;
       tenant_name: string | null;
       amount_owed: string | null;
+      total_outstanding: string | null;
       days_overdue: number | null;
       risk_level: string | null;
     }[]>`
       SELECT
         d.unit_id,
-        gt.full_name          AS tenant_name,
-        d.balance_due::text   AS amount_owed,
+        gt.full_name                   AS tenant_name,
+        d.balance_due::text            AS amount_owed,
+        d.total_outstanding::text      AS total_outstanding,
         d.days_overdue,
         d.risk_level
       FROM gold_delinquency_records d
@@ -561,16 +563,28 @@ router.get("/jasmine/delinquency", async (req: Request, res: Response) => {
           ${risk === 'all'}
           OR LOWER(d.risk_level) = ${risk}
         )
-      ORDER BY d.days_overdue DESC NULLS LAST
+      ORDER BY d.days_overdue DESC NULLS LAST, d.balance_due DESC NULLS LAST
     `;
 
-    res.json(rows.map(r => ({
-      unit_id:      r.unit_id,
-      tenant_name:  r.tenant_name,
-      amount_owed:  r.amount_owed !== null ? parseFloat(r.amount_owed) : null,
-      days_overdue: r.days_overdue,
-      risk_level:   r.risk_level,
-    })));
+    const delinquencyRows = rows.map(r => ({
+      unit_id:           r.unit_id,
+      tenant_name:       r.tenant_name,
+      amount_owed:       r.amount_owed !== null ? parseFloat(r.amount_owed) : null,
+      total_outstanding: r.total_outstanding !== null ? parseFloat(r.total_outstanding) : null,
+      days_overdue:      r.days_overdue,
+      risk_level:        r.risk_level,
+    }));
+
+    res.json({
+      delinquency: delinquencyRows,
+      summary: {
+        total_overdue:      delinquencyRows.reduce((s, r) => s + (r.amount_owed ?? 0), 0),
+        total_outstanding:  delinquencyRows.reduce((s, r) => s + (r.total_outstanding ?? 0), 0),
+        high_risk_count:    delinquencyRows.filter(r => r.risk_level === 'high').length,
+        medium_risk_count:  delinquencyRows.filter(r => r.risk_level === 'medium').length,
+        low_risk_count:     delinquencyRows.filter(r => r.risk_level === 'low').length,
+      }
+    });
   } catch (err: unknown) {
     const error = err instanceof Error ? err.message : String(err);
     res.status(500).json({ error });
