@@ -555,7 +555,7 @@ router.get("/jasmine/delinquency", async (req: Request, res: Response) => {
           SELECT gt.full_name
           FROM gold_tenants gt
           WHERE gt.unit_id = d.unit_id
-          ORDER BY (gt.tenant_status ILIKE '%primary%') DESC, gt.full_name ASC
+          ORDER BY (gt.lease_status ILIKE '%primary%') DESC, gt.full_name ASC
           LIMIT 1
         )                              AS tenant_name,
         d.balance_due::text            AS amount_owed,
