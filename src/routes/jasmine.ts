@@ -99,11 +99,47 @@ function scheduleNextRefresh(): void {
 
   setTimeout(async () => {
     await loadExcludedUnits();
-    scheduleNextRefresh(); // re-schedule for the following day
+    await warmCache();       // refresh all endpoint caches
+    scheduleNextRefresh();   // re-schedule for the following day
   }, msUntilNext);
 }
 
 scheduleNextRefresh();
+
+// ── Response cache ───────────────────────────────────────────────────────────────────────────────
+// A module-scoped Map keyed by endpoint variant (e.g. 'portfolio-summary',
+// 'units:all', 'leases:90'). Pre-warmed at startup and refreshed daily at
+// 8 AM ET alongside the excludedUnitIds refresh. Endpoints with query params
+// cache their most common default variant; unique-per-request endpoints
+// (unit detail, tenant search) always hit the DB live.
+
+type CacheLoader = () => Promise<unknown>;
+const responseCache = new Map<string, unknown>();
+const cacheLoaders  = new Map<string, CacheLoader>();
+
+async function warmCache(): Promise<void> {
+  console.log('[jasmine] Warming response cache...');
+  for (const [key, loader] of cacheLoaders.entries()) {
+    try {
+      const data = await loader();
+      responseCache.set(key, data);
+      console.log(`[jasmine] Cached: ${key}`);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`[jasmine] Cache warm failed for ${key}:`, msg);
+    }
+  }
+  console.log('[jasmine] Response cache warm complete.');
+}
+
+function getCached<T = unknown>(key: string): T | null {
+  const hit = responseCache.get(key);
+  return hit !== undefined ? (hit as T) : null;
+}
+
+// Kick off initial warm after a short delay so the module finishes loading
+// before the first DB round-trips. Also called inside scheduleNextRefresh.
+setTimeout(() => warmCache(), 2_000);
 
 // ── ENDPOINT 1 — GET /jasmine/portfolio-summary ───────────────────────────────
 // Returns a single summary object with occupancy counts, vacancy rate,
@@ -876,6 +912,8 @@ router.get("/jasmine/tasks", async (_req: Request, res: Response) => {
 // or Ayman. Also triggers a cache refresh so the in-memory excludedUnitIds
 // array is always consistent with what this endpoint returns.
 router.get("/jasmine/unit-overrides", async (_req: Request, res: Response) => {
+  const cached = getCached('unit-overrides');
+  if (cached) { res.json(cached); return; }
   let sql: postgres.Sql | null = null;
   try {
     sql = getDb();
@@ -922,10 +960,12 @@ router.get("/jasmine/unit-overrides", async (_req: Request, res: Response) => {
 // Returns maintenance requests from the AppFolio work_order Bronze report.
 // open = Assigned / New / Pending (excludes Completed, Canceled, Closed)
 router.get("/jasmine/work-orders", async (req: Request, res: Response) => {
+  const statusFilter = (req.query.status as string | undefined) ?? 'open';
+  const woCached = getCached<unknown[]>(statusFilter === 'all' ? 'work-orders:all' : 'work-orders:open');
+  if (woCached) { res.json(woCached); return; }
   let sql: postgres.Sql | null = null;
   try {
     sql = getDb();
-    const statusFilter = (req.query.status as string | undefined) ?? 'open';
 
     const rows = await sql`
       SELECT
@@ -971,6 +1011,320 @@ router.get("/jasmine/work-orders", async (req: Request, res: Response) => {
   } finally {
     if (sql) await sql.end();
   }
+});
+
+// ── Cache loaders (pre-warm all static endpoints) ───────────────────────────
+// Each loader runs the same SQL as its corresponding endpoint and stores the
+// result in responseCache. warmCache() iterates all loaders at startup and
+// at 8 AM ET daily.
+
+cacheLoaders.set('portfolio-summary', async () => {
+  const sql = getDb();
+  try {
+    const excluded = excludedUnitIds;
+    const [summary] = await sql<{ occupied: string; vacant: string; on_notice: string; total_monthly_rent: string | null; avg_rent: string | null; }[]>`
+      WITH latest_rr AS (
+        SELECT MAX(report_date) AS dt FROM bronze_appfolio_reports WHERE report_type = 'rent_roll'
+      ),
+      rr AS (
+        SELECT
+          LOWER(REGEXP_REPLACE(elem->>'Unit', '[^a-zA-Z0-9]', '', 'g')) AS unit_id,
+          NULLIF(REPLACE(elem->>'Rent', ',', ''), '')::numeric AS monthly_rent
+        FROM bronze_appfolio_reports b,
+             jsonb_array_elements(b.raw_data->'results') AS elem,
+             latest_rr
+        WHERE b.report_type = 'rent_roll'
+          AND b.report_date = latest_rr.dt
+          AND elem->>'Unit' IS NOT NULL
+          AND elem->>'Status' ILIKE '%current%'
+      )
+      SELECT
+        COUNT(*) FILTER (WHERE gu.unit_status = 'occupied'
+          AND gu.unit_id NOT IN (${sql.array(excluded)}))  AS occupied,
+        COUNT(*) FILTER (WHERE gu.unit_status = 'vacant'
+          AND gu.unit_id NOT IN (${sql.array(excluded)}))  AS vacant,
+        COUNT(*) FILTER (WHERE gu.unit_status = 'notice'
+          AND gu.unit_id NOT IN (${sql.array(excluded)}))  AS on_notice,
+        SUM(rr.monthly_rent)::text                          AS total_monthly_rent,
+        ROUND(AVG(rr.monthly_rent), 2)::text                AS avg_rent
+      FROM gold_units gu
+      LEFT JOIN rr ON rr.unit_id = gu.unit_id
+      WHERE gu.unit_id NOT IN (${sql.array(excluded)})
+    `;
+    const [pipeline] = await sql<{ last_run: string | null }[]>`
+      SELECT MAX(created_at)::text AS last_run FROM bronze_appfolio_reports
+    `;
+    const total = (parseInt(summary.occupied) || 0) + (parseInt(summary.vacant) || 0) + (parseInt(summary.on_notice) || 0);
+    return {
+      total_units: total,
+      occupied: parseInt(summary.occupied) || 0,
+      vacant: parseInt(summary.vacant) || 0,
+      on_notice: parseInt(summary.on_notice) || 0,
+      vacancy_rate_pct: total > 0 ? parseFloat(((parseInt(summary.vacant) / total) * 100).toFixed(1)) : 0,
+      total_monthly_rent: summary.total_monthly_rent ? parseFloat(summary.total_monthly_rent) : null,
+      avg_rent: summary.avg_rent ? parseFloat(summary.avg_rent) : null,
+      last_pipeline_run: pipeline.last_run ?? null,
+    };
+  } finally { await sql.end(); }
+});
+
+cacheLoaders.set('units:all', async () => {
+  const sql = getDb();
+  try {
+    const excluded = excludedUnitIds;
+    return await sql`
+      SELECT
+        gu.unit_id,
+        gu.unit_status AS status,
+        gu.unit_group,
+        tl.tenant_name,
+        tl.email,
+        tl.phone,
+        le.lease_end_date::text,
+        le.days_until_expiration,
+        le.monthly_rent,
+        le.market_rent,
+        uv.days_vacant
+      FROM gold_units gu
+      LEFT JOIN gold_lease_expirations le ON le.unit_id = gu.unit_id
+      LEFT JOIN (
+        SELECT DISTINCT ON (unit_id)
+          unit_id,
+          tenant_name,
+          email,
+          phone
+        FROM gold_tenants
+        ORDER BY unit_id, (tenant_status ILIKE '%primary%') DESC
+      ) tl ON tl.unit_id = gu.unit_id
+      LEFT JOIN (
+        SELECT
+          LOWER(REGEXP_REPLACE(elem->>'Unit', '[^a-zA-Z0-9]', '', 'g')) AS unit_id,
+          (elem->>'DaysVacant')::int AS days_vacant
+        FROM bronze_appfolio_reports,
+             LATERAL jsonb_array_elements(raw_data->'results') AS elem
+        WHERE report_type = 'unit_vacancy'
+          AND report_date = (SELECT MAX(report_date) FROM bronze_appfolio_reports WHERE report_type = 'unit_vacancy')
+      ) uv ON uv.unit_id = gu.unit_id
+      WHERE gu.unit_id NOT IN (${sql.array(excluded)})
+      ORDER BY gu.unit_id
+    `;
+  } finally { await sql.end(); }
+});
+
+cacheLoaders.set('units:vacant', async () => {
+  const all = (await cacheLoaders.get('units:all')!()) as Array<{ status: string | null }>;
+  return all.filter(u => u.status?.toLowerCase().includes('vacant'));
+});
+
+cacheLoaders.set('units:occupied', async () => {
+  const all = (await cacheLoaders.get('units:all')!()) as Array<{ status: string | null }>;
+  return all.filter(u => u.status?.toLowerCase().includes('occupied'));
+});
+
+cacheLoaders.set('units:notice', async () => {
+  const all = (await cacheLoaders.get('units:all')!()) as Array<{ status: string | null }>;
+  return all.filter(u => u.status?.toLowerCase().includes('notice'));
+});
+
+cacheLoaders.set('leases:90', async () => {
+  const sql = getDb();
+  try {
+    return await sql`
+      SELECT
+        unit_id, tenant_name, email, phone,
+        lease_end_date::text, days_until_expiration, monthly_rent, market_rent
+      FROM gold_lease_expirations
+      WHERE days_until_expiration >= 0
+        AND days_until_expiration <= 90
+      ORDER BY days_until_expiration ASC
+    `;
+  } finally { await sql.end(); }
+});
+
+cacheLoaders.set('notices', async () => {
+  const sql = getDb();
+  try {
+    return await sql`
+      SELECT unit_id, tenant_name, email, phone, lease_end_date::text, days_until_expiration
+      FROM gold_lease_expirations
+      WHERE tenant_status ILIKE '%notice%'
+      ORDER BY lease_end_date ASC
+    `;
+  } finally { await sql.end(); }
+});
+
+cacheLoaders.set('delinquency:all', async () => {
+  const sql = getDb();
+  try {
+    return await sql`
+      SELECT
+        unit_id, tenant_name, email, phone,
+        balance::text, days_overdue, risk_level
+      FROM gold_collections_risk
+      ORDER BY balance DESC
+    `;
+  } finally { await sql.end(); }
+});
+
+cacheLoaders.set('below-market:5', async () => {
+  const sql = getDb();
+  try {
+    const excluded = excludedUnitIds;
+    return await sql`
+      SELECT
+        le.unit_id,
+        le.tenant_name,
+        le.monthly_rent,
+        le.market_rent,
+        ROUND(((le.market_rent - le.monthly_rent) / NULLIF(le.market_rent, 0)) * 100, 1)::float AS percent_below
+      FROM gold_lease_expirations le
+      WHERE le.market_rent IS NOT NULL
+        AND le.monthly_rent IS NOT NULL
+        AND le.market_rent > le.monthly_rent
+        AND le.unit_id NOT IN (SELECT unit_id FROM jasmine_unit_overrides WHERE exclude_from_revenue = true)
+        AND ROUND(((le.market_rent - le.monthly_rent) / NULLIF(le.market_rent, 0)) * 100, 1) >= 5
+      ORDER BY percent_below DESC
+    `;
+  } finally { await sql.end(); }
+});
+
+cacheLoaders.set('long-vacancies:30', async () => {
+  const sql = getDb();
+  try {
+    return await sql`
+      SELECT
+        LOWER(REGEXP_REPLACE(elem->>'Unit', '[^a-zA-Z0-9]', '', 'g')) AS unit_id,
+        elem->>'Unit'         AS unit_display,
+        (elem->>'DaysVacant')::int AS days_vacant,
+        elem->>'VacancyStatus' AS vacancy_status,
+        elem->>'MarketRent'    AS market_rent
+      FROM bronze_appfolio_reports,
+           LATERAL jsonb_array_elements(raw_data->'results') AS elem
+      WHERE report_type = 'unit_vacancy'
+        AND report_date = (SELECT MAX(report_date) FROM bronze_appfolio_reports WHERE report_type = 'unit_vacancy')
+        AND (elem->>'DaysVacant')::int >= 30
+        AND LOWER(REGEXP_REPLACE(elem->>'Unit', '[^a-zA-Z0-9]', '', 'g'))
+            NOT IN (SELECT unit_id FROM jasmine_unit_overrides WHERE exclude_from_vacancy = true)
+      ORDER BY (elem->>'DaysVacant')::int DESC
+    `;
+  } finally { await sql.end(); }
+});
+
+cacheLoaders.set('move-schedule:30', async () => {
+  const sql = getDb();
+  try {
+    return await sql`
+      SELECT
+        LOWER(REGEXP_REPLACE(elem->>'Unit', '[^a-zA-Z0-9]', '', 'g')) AS unit_id,
+        elem->>'Unit'        AS unit_display,
+        elem->>'TenantName'  AS tenant_name,
+        elem->>'MoveInDate'  AS move_in_date,
+        elem->>'MoveOutDate' AS move_out_date
+      FROM bronze_appfolio_reports,
+           LATERAL jsonb_array_elements(raw_data->'results') AS elem
+      WHERE report_type = 'move_in_out'
+        AND report_date = (SELECT MAX(report_date) FROM bronze_appfolio_reports WHERE report_type = 'move_in_out')
+        AND (
+          (elem->>'MoveInDate')::date BETWEEN CURRENT_DATE AND CURRENT_DATE + INTERVAL '30 days'
+          OR
+          (elem->>'MoveOutDate')::date BETWEEN CURRENT_DATE AND CURRENT_DATE + INTERVAL '30 days'
+        )
+      ORDER BY LEAST(
+        (elem->>'MoveInDate')::date,
+        (elem->>'MoveOutDate')::date
+      ) ASC
+    `;
+  } finally { await sql.end(); }
+});
+
+cacheLoaders.set('tasks', async () => {
+  const sql = getDb();
+  try {
+    return await sql`
+      SELECT id, title, description, status, priority, due_date::text, created_at::text
+      FROM tasks
+      WHERE status NOT IN ('completed', 'closed', 'cancelled')
+      ORDER BY
+        CASE priority WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END,
+        due_date ASC NULLS LAST
+    `;
+  } finally { await sql.end(); }
+});
+
+cacheLoaders.set('unit-overrides', async () => {
+  const sql = getDb();
+  try {
+    return await sql`
+      SELECT unit_id, override_type, reason, exclude_from_vacancy, exclude_from_revenue, created_at::text
+      FROM jasmine_unit_overrides
+      ORDER BY override_type ASC, unit_id ASC
+    `;
+  } finally { await sql.end(); }
+});
+
+cacheLoaders.set('work-orders:open', async () => {
+  const sql = getDb();
+  try {
+    return await sql`
+      SELECT
+        elem->>'WorkOrderId'     AS work_order_id,
+        elem->>'WorkOrderNumber' AS work_order_number,
+        elem->>'UnitName'        AS unit,
+        elem->>'Status'          AS status,
+        elem->>'Priority'        AS priority,
+        elem->>'WorkOrderType'   AS work_order_type,
+        elem->>'WorkOrderIssue'  AS issue,
+        COALESCE(
+          NULLIF(elem->>'JobDescription', ''),
+          NULLIF(elem->>'ServiceRequestDescription', '')
+        )                        AS description,
+        elem->>'PrimaryTenant'   AS tenant,
+        elem->>'AssignedUser'    AS assigned_to,
+        elem->>'Vendor'          AS vendor,
+        elem->>'CreatedAt'       AS created_at,
+        elem->>'ScheduledStart'  AS scheduled_start,
+        elem->>'WorkDoneOn'      AS work_done_on
+      FROM bronze_appfolio_reports,
+      LATERAL jsonb_array_elements(raw_data->'results') AS elem
+      WHERE report_type = 'work_order'
+        AND report_date = (SELECT MAX(report_date) FROM bronze_appfolio_reports WHERE report_type = 'work_order')
+        AND elem->>'Status' NOT ILIKE '%complete%'
+        AND elem->>'Status' NOT ILIKE '%cancel%'
+        AND elem->>'Status' NOT ILIKE '%closed%'
+      ORDER BY elem->>'CreatedAt' DESC
+    `;
+  } finally { await sql.end(); }
+});
+
+cacheLoaders.set('work-orders:all', async () => {
+  const sql = getDb();
+  try {
+    return await sql`
+      SELECT
+        elem->>'WorkOrderId'     AS work_order_id,
+        elem->>'WorkOrderNumber' AS work_order_number,
+        elem->>'UnitName'        AS unit,
+        elem->>'Status'          AS status,
+        elem->>'Priority'        AS priority,
+        elem->>'WorkOrderType'   AS work_order_type,
+        elem->>'WorkOrderIssue'  AS issue,
+        COALESCE(
+          NULLIF(elem->>'JobDescription', ''),
+          NULLIF(elem->>'ServiceRequestDescription', '')
+        )                        AS description,
+        elem->>'PrimaryTenant'   AS tenant,
+        elem->>'AssignedUser'    AS assigned_to,
+        elem->>'Vendor'          AS vendor,
+        elem->>'CreatedAt'       AS created_at,
+        elem->>'ScheduledStart'  AS scheduled_start,
+        elem->>'WorkDoneOn'      AS work_done_on
+      FROM bronze_appfolio_reports,
+      LATERAL jsonb_array_elements(raw_data->'results') AS elem
+      WHERE report_type = 'work_order'
+        AND report_date = (SELECT MAX(report_date) FROM bronze_appfolio_reports WHERE report_type = 'work_order')
+      ORDER BY elem->>'CreatedAt' DESC
+    `;
+  } finally { await sql.end(); }
 });
 
 export default router;
