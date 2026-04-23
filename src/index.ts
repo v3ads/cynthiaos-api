@@ -2043,6 +2043,7 @@ interface CollectionsRiskRow {
   tenant_id:             string;
   full_name:             string | null;
   unit_id:               string | null;
+  tenant_status:         string | null;
   total_balance:         string | null;
   risk_score:            string | null;
   bucket_90_plus:        string | null;
@@ -2074,9 +2075,11 @@ app.get("/api/v1/insights/collections-risk", async (req: Request, res: Response)
 
     const baseQuery = sql<CollectionsRiskRow[]>`
       WITH
+      -- Current tenants: sourced from AR (primary) + delinquency + lease expirations
       ar_deduped AS (
         SELECT DISTINCT ON (tenant_id)
           tenant_id, unit_id,
+          tenant_status,
           total_balance::numeric    AS total_balance,
           risk_score::numeric       AS risk_score,
           bucket_90_plus::numeric   AS bucket_90_plus,
@@ -2085,13 +2088,25 @@ app.get("/api/v1/insights/collections-risk", async (req: Request, res: Response)
         WHERE tenant_status = 'current'
         ORDER BY tenant_id, risk_score DESC, created_at DESC
       ),
-      d_deduped AS (
+      d_current AS (
         SELECT DISTINCT ON (tenant_id)
           tenant_id,
           days_overdue,
           risk_level AS delinquency_level
         FROM gold_delinquency_records
         WHERE tenant_status = 'current'
+        ORDER BY tenant_id, days_overdue DESC NULLS LAST, created_at DESC
+      ),
+      -- Past tenants: sourced exclusively from delinquency (no AR rows for vacated units)
+      d_past AS (
+        SELECT DISTINCT ON (tenant_id)
+          tenant_id, unit_id,
+          balance_due::numeric      AS total_balance,
+          balance_due::numeric      AS bucket_90_plus,
+          days_overdue,
+          risk_level                AS delinquency_level
+        FROM gold_delinquency_records
+        WHERE tenant_status = 'past'
         ORDER BY tenant_id, days_overdue DESC NULLS LAST, created_at DESC
       ),
       le_deduped AS (
@@ -2108,23 +2123,21 @@ app.get("/api/v1/insights/collections-risk", async (req: Request, res: Response)
         FROM gold_tenants
         ORDER BY tenant_id, updated_at DESC
       ),
-      joined AS (
+      -- Current tenant rows
+      current_joined AS (
         SELECT
           ar.tenant_id,
           COALESCE(t.full_name, ar.tenant_id)  AS full_name,
           ar.unit_id,
+          'current'::text                       AS tenant_status,
           ar.total_balance,
           ar.risk_score,
           ar.bucket_90_plus,
           ar.dominant_bucket,
-          d.days_overdue,
-          d.delinquency_level,
+          dc.days_overdue,
+          dc.delinquency_level,
           le.lease_end_date,
           le.days_until_expiration,
-          -- Collections risk score (0-100)
-          -- 90+ bucket: up to 40 pts (bucket_90_plus / total_balance * 40)
-          -- days_overdue: up to 35 pts (days_overdue / 90 * 35, capped)
-          -- lease ending soon: up to 25 pts (inverse of days_until_expiration)
           LEAST(100, ROUND(
             COALESCE(
               CASE WHEN ar.total_balance > 0
@@ -2133,7 +2146,7 @@ app.get("/api/v1/insights/collections-risk", async (req: Request, res: Response)
               END, 0
             ) +
             COALESCE(
-              LEAST(35, (d.days_overdue::numeric / 90.0) * 35), 0
+              LEAST(35, (dc.days_overdue::numeric / 90.0) * 35), 0
             ) +
             COALESCE(
               CASE
@@ -2146,9 +2159,44 @@ app.get("/api/v1/insights/collections-risk", async (req: Request, res: Response)
             )
           )) AS collections_risk_score
         FROM ar_deduped ar
-        LEFT JOIN d_deduped  d  ON ar.tenant_id = d.tenant_id
+        LEFT JOIN d_current  dc ON ar.tenant_id = dc.tenant_id
         LEFT JOIN le_deduped le ON ar.tenant_id = le.tenant_id
         LEFT JOIN t_deduped  t  ON ar.tenant_id = t.tenant_id
+      ),
+      -- Past tenant rows (vacated units with outstanding balance)
+      past_joined AS (
+        SELECT
+          dp.tenant_id,
+          COALESCE(t.full_name, dp.tenant_id)  AS full_name,
+          dp.unit_id,
+          'past'::text                          AS tenant_status,
+          dp.total_balance,
+          dp.total_balance                      AS risk_score,
+          dp.bucket_90_plus,
+          '90_plus'::text                       AS dominant_bucket,
+          dp.days_overdue,
+          dp.delinquency_level,
+          NULL::text                            AS lease_end_date,
+          NULL::integer                         AS days_until_expiration,
+          -- Past tenants score purely on balance size (no lease risk component)
+          LEAST(100, ROUND(
+            COALESCE(
+              CASE WHEN dp.total_balance > 0
+                THEN LEAST(40, (dp.bucket_90_plus / dp.total_balance) * 40)
+                ELSE 0
+              END, 0
+            ) +
+            COALESCE(
+              LEAST(35, (dp.days_overdue::numeric / 90.0) * 35), 0
+            )
+          )) AS collections_risk_score
+        FROM d_past dp
+        LEFT JOIN t_deduped t ON dp.tenant_id = t.tenant_id
+      ),
+      all_joined AS (
+        SELECT * FROM current_joined
+        UNION ALL
+        SELECT * FROM past_joined
       ),
       classified AS (
         SELECT *,
@@ -2158,69 +2206,36 @@ app.get("/api/v1/insights/collections-risk", async (req: Request, res: Response)
             WHEN collections_risk_score >= 40 THEN 'Monitor'
             ELSE 'Low Risk'
           END AS collections_classification
-        FROM joined
+        FROM all_joined
       )
       SELECT *
       FROM classified
       WHERE
         ${classFilter ? sql`collections_classification = ${classFilter}` : sql`TRUE`}
-      ORDER BY collections_risk_score DESC, tenant_id ASC
+      ORDER BY tenant_status ASC, collections_risk_score DESC, tenant_id ASC
       LIMIT ${limit} OFFSET ${offset}
     `;
 
     const countQuery = sql<{ count: string }[]>`
       WITH
       ar_deduped AS (
-        SELECT DISTINCT ON (tenant_id)
-          tenant_id,
-          total_balance::numeric  AS total_balance,
-          risk_score::numeric     AS risk_score,
-          bucket_90_plus::numeric AS bucket_90_plus
+        SELECT DISTINCT ON (tenant_id) tenant_id
         FROM gold_aged_receivables
         WHERE tenant_status = 'current'
         ORDER BY tenant_id, risk_score DESC, created_at DESC
       ),
-      d_deduped AS (
-        SELECT DISTINCT ON (tenant_id) tenant_id, days_overdue
+      d_past AS (
+        SELECT DISTINCT ON (tenant_id) tenant_id
         FROM gold_delinquency_records
-        WHERE tenant_status = 'current'
+        WHERE tenant_status = 'past'
         ORDER BY tenant_id, days_overdue DESC NULLS LAST, created_at DESC
       ),
-      le_deduped AS (
-        SELECT DISTINCT ON (tenant_id) tenant_id, days_until_expiration
-        FROM gold_lease_expirations
-        ORDER BY tenant_id, lease_end_date ASC, created_at DESC
-      ),
-      joined AS (
-        SELECT
-          LEAST(100, ROUND(
-            COALESCE(CASE WHEN ar.total_balance > 0
-              THEN (ar.bucket_90_plus / ar.total_balance) * 40 ELSE 0 END, 0) +
-            COALESCE(LEAST(35, (d.days_overdue::numeric / 90.0) * 35), 0) +
-            COALESCE(CASE
-              WHEN le.days_until_expiration IS NULL THEN 0
-              WHEN le.days_until_expiration <= 30   THEN 25
-              WHEN le.days_until_expiration <= 60   THEN 18
-              WHEN le.days_until_expiration <= 90   THEN 10
-              ELSE 0
-            END, 0)
-          )) AS collections_risk_score
-        FROM ar_deduped ar
-        LEFT JOIN d_deduped  d  ON ar.tenant_id = d.tenant_id
-        LEFT JOIN le_deduped le ON ar.tenant_id = le.tenant_id
-      ),
-      classified AS (
-        SELECT CASE
-          WHEN collections_risk_score >= 80 THEN 'Immediate Action'
-          WHEN collections_risk_score >= 60 THEN 'High Priority'
-          WHEN collections_risk_score >= 40 THEN 'Monitor'
-          ELSE 'Low Risk'
-        END AS collections_classification
-        FROM joined
+      all_tenants AS (
+        SELECT tenant_id FROM ar_deduped
+        UNION
+        SELECT tenant_id FROM d_past
       )
-      SELECT COUNT(*)::text AS count
-      FROM classified
-      WHERE ${classFilter ? sql`collections_classification = ${classFilter}` : sql`TRUE`}
+      SELECT COUNT(*)::text AS count FROM all_tenants
     `;
 
     const [rows, countRows] = await Promise.all([baseQuery, countQuery]);
@@ -2236,6 +2251,7 @@ app.get("/api/v1/insights/collections-risk", async (req: Request, res: Response)
         tenant_id:              r.tenant_id,
         full_name:              r.full_name,
         unit_id:                r.unit_id,
+        tenant_status:          r.tenant_status ?? 'current',
         total_balance:          r.total_balance !== null ? parseFloat(String(r.total_balance)) : null,
         risk_score:             r.risk_score    !== null ? parseFloat(String(r.risk_score))    : null,
         bucket_90_plus:         r.bucket_90_plus !== null ? parseFloat(String(r.bucket_90_plus)) : null,
