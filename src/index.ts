@@ -210,7 +210,7 @@ app.get("/api/v1/leases/expirations", async (req: Request, res: Response) => {
              jsonb_array_elements(b.raw_data->'results') AS elem,
              latest_td
         WHERE b.report_type = 'tenant_directory' AND b.report_date = latest_td.dt
-          AND elem->>'Status' ILIKE '%current%'
+          AND (elem->>'Status' ILIKE '%current%' OR elem->>'Status' ILIKE '%notice%')
           AND elem->>'Unit' IS NOT NULL
         ORDER BY LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g')),
                  (elem->>'PrimaryTenant' = 'Yes') DESC
@@ -275,7 +275,7 @@ app.get("/api/v1/leases/expiring-soon", async (req: Request, res: Response) => {
              jsonb_array_elements(b.raw_data->'results') AS elem,
              latest_td
         WHERE b.report_type = 'tenant_directory' AND b.report_date = latest_td.dt
-          AND elem->>'Status' ILIKE '%current%'
+          AND (elem->>'Status' ILIKE '%current%' OR elem->>'Status' ILIKE '%notice%')
           AND elem->>'Unit' IS NOT NULL
         ORDER BY LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g')),
                  (elem->>'PrimaryTenant' = 'Yes') DESC
@@ -347,7 +347,7 @@ app.get("/api/v1/leases/upcoming-renewals", async (req: Request, res: Response) 
              jsonb_array_elements(b.raw_data->'results') AS elem,
              latest_td
         WHERE b.report_type = 'tenant_directory' AND b.report_date = latest_td.dt
-          AND elem->>'Status' ILIKE '%current%'
+          AND (elem->>'Status' ILIKE '%current%' OR elem->>'Status' ILIKE '%notice%')
           AND elem->>'Unit' IS NOT NULL
         ORDER BY LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g')),
                  (elem->>'PrimaryTenant' = 'Yes') DESC
@@ -423,7 +423,7 @@ app.get("/api/v1/leases/:id", async (req: Request, res: Response) => {
              jsonb_array_elements(b.raw_data->'results') AS elem,
              latest_td
         WHERE b.report_type = 'tenant_directory' AND b.report_date = latest_td.dt
-          AND elem->>'Status' ILIKE '%current%'
+          AND (elem->>'Status' ILIKE '%current%' OR elem->>'Status' ILIKE '%notice%')
           AND elem->>'Unit' IS NOT NULL
         ORDER BY LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g')),
                  (elem->>'PrimaryTenant' = 'Yes') DESC
@@ -3019,7 +3019,7 @@ app.get("/api/v1/renewals", async (req: Request, res: Response) => {
              jsonb_array_elements(b.raw_data->'results') AS elem,
              latest_td
         WHERE b.report_type = 'tenant_directory' AND b.report_date = latest_td.dt
-          AND elem->>'Status' ILIKE '%current%'
+          AND (elem->>'Status' ILIKE '%current%' OR elem->>'Status' ILIKE '%notice%')
           AND elem->>'Unit' IS NOT NULL
         ORDER BY LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g')),
                  (elem->>'PrimaryTenant' = 'Yes') DESC
