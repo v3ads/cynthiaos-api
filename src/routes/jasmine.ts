@@ -937,7 +937,6 @@ router.get("/jasmine/tasks", async (_req: Request, res: Response) => {
       tenant_name: string | null;
       lease_end_date: string | null;
       days_until_expiration: number | null;
-      monthly_rent: string | null;
       phone: string | null;
       email: string | null;
     }[]>`
@@ -946,7 +945,6 @@ router.get("/jasmine/tasks", async (_req: Request, res: Response) => {
         gt.full_name           AS tenant_name,
         le.lease_end_date::text,
         le.days_until_expiration,
-        le.monthly_rent::text,
         gt.phone,
         gt.email
       FROM gold_lease_expirations le
@@ -983,7 +981,6 @@ router.get("/jasmine/tasks", async (_req: Request, res: Response) => {
         tenant_name:    r.tenant_name,
         lease_end_date: r.lease_end_date,
         days_until_expiration: r.days_until_expiration,
-        monthly_rent:   r.monthly_rent !== null ? parseFloat(r.monthly_rent) : null,
         phone:          r.phone,
         email:          r.email,
         created_at:     new Date().toISOString(),
@@ -1800,7 +1797,6 @@ cacheLoaders.set('tasks', async () => {
       tenant_name: string | null;
       lease_end_date: string | null;
       days_until_expiration: number | null;
-      monthly_rent: string | null;
       phone: string | null;
       email: string | null;
     }[]>`
@@ -1809,7 +1805,6 @@ cacheLoaders.set('tasks', async () => {
         gt.full_name           AS tenant_name,
         le.lease_end_date::text,
         le.days_until_expiration,
-        le.monthly_rent::text,
         gt.phone,
         gt.email
       FROM gold_lease_expirations le
@@ -1845,7 +1840,6 @@ cacheLoaders.set('tasks', async () => {
         tenant_name:    r.tenant_name,
         lease_end_date: r.lease_end_date,
         days_until_expiration: r.days_until_expiration,
-        monthly_rent:   r.monthly_rent !== null ? parseFloat(r.monthly_rent) : null,
         phone:          r.phone,
         email:          r.email,
         created_at:     new Date().toISOString(),
