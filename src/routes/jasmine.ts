@@ -145,6 +145,8 @@ setTimeout(() => warmCache(), 2_000);
 // Returns a single summary object with occupancy counts, vacancy rate,
 // rent totals, and the timestamp of the last successful pipeline run.
 router.get("/jasmine/portfolio-summary", async (_req: Request, res: Response) => {
+  const cached = getCached('portfolio-summary');
+  if (cached) { res.json(cached); return; }
   let sql: postgres.Sql | null = null;
   try {
     sql = getDb();
@@ -198,7 +200,7 @@ router.get("/jasmine/portfolio-summary", async (_req: Request, res: Response) =>
     const vacant = parseInt(summary.vacant ?? '0', 10);
     const vacancyRatePct = parseFloat(((vacant / TOTAL_UNITS) * 100).toFixed(1));
 
-    res.json({
+    const portfolioResult = {
       total_units: TOTAL_UNITS,
       occupied: parseInt(summary.occupied ?? '0', 10),
       vacant,
@@ -207,7 +209,9 @@ router.get("/jasmine/portfolio-summary", async (_req: Request, res: Response) =>
       total_monthly_rent: summary.total_monthly_rent ? parseFloat(summary.total_monthly_rent) : null,
       avg_rent: summary.avg_rent ? parseFloat(summary.avg_rent) : null,
       last_pipeline_run: pipeline?.last_run ?? null,
-    });
+    };
+    responseCache.set('portfolio-summary', portfolioResult);
+    res.json(portfolioResult);
   } catch (err: unknown) {
     const error = err instanceof Error ? err.message : String(err);
     res.status(500).json({ error });
@@ -218,11 +222,16 @@ router.get("/jasmine/portfolio-summary", async (_req: Request, res: Response) =>
 
 // ── ENDPOINT 2 — GET /jasmine/units ──────────────────────────────────────────
 router.get("/jasmine/units", async (req: Request, res: Response) => {
+  const status   = String(req.query.status   ?? 'all').toLowerCase();
+  const building = req.query.building ? String(req.query.building) : null;
+  // Serve from cache for default variants (no building filter)
+  if (!building && ['all', 'vacant', 'occupied', 'notice'].includes(status)) {
+    const cached = getCached(`units:${status}`);
+    if (cached) { res.json(cached); return; }
+  }
   let sql: postgres.Sql | null = null;
   try {
     sql = getDb();
-    const status   = String(req.query.status   ?? 'all').toLowerCase();
-    const building = req.query.building ? String(req.query.building) : null;
     const excluded = excludedUnitIds;
 
     const validStatuses = ['vacant', 'occupied', 'notice', 'all'];
@@ -312,7 +321,7 @@ router.get("/jasmine/units", async (req: Request, res: Response) => {
       ORDER BY gu.unit_id
     `;
 
-    res.json(rows.map(r => ({
+    const unitsResult = rows.map(r => ({
       unit_id:      r.unit_id,
       unit_type:    r.unit_type,
       unit_group:   r.unit_group,
@@ -322,7 +331,11 @@ router.get("/jasmine/units", async (req: Request, res: Response) => {
       market_rent:  r.market_rent  !== null ? parseFloat(r.market_rent)  : null,
       monthly_rent: r.monthly_rent !== null ? parseFloat(r.monthly_rent) : null,
       tenant_name:  r.tenant_name,
-    })));
+    }));
+    if (!building && ['all', 'vacant', 'occupied', 'notice'].includes(status)) {
+      responseCache.set(`units:${status}`, unitsResult);
+    }
+    res.json(unitsResult);
   } catch (err: unknown) {
     const error = err instanceof Error ? err.message : String(err);
     res.status(500).json({ error });
@@ -395,15 +408,20 @@ router.get("/jasmine/units/:unit_id", async (req: Request, res: Response) => {
   }
 });
 
-// ── ENDPOINT 4 — GET /jasmine/leases ─────────────────────────────────────────
+/// ── ENDPOINT 4 — GET /jasmine/leases ────────────────────────────────────────
 router.get("/jasmine/leases", async (req: Request, res: Response) => {
+  const windowDays = Math.min(
+    Math.max(parseInt(String(req.query.window_days ?? '90'), 10), 1),
+    730
+  );
+  // Cache only for default 90-day window
+  if (windowDays === 90) {
+    const cached = getCached('leases:90');
+    if (cached) { res.json(cached); return; }
+  }
   let sql: postgres.Sql | null = null;
   try {
     sql = getDb();
-    const windowDays = Math.min(
-      Math.max(parseInt(String(req.query.window_days ?? '90'), 10), 1),
-      730
-    );
 
     const rows = await sql<{
       unit_id: string;
@@ -448,7 +466,7 @@ router.get("/jasmine/leases", async (req: Request, res: Response) => {
       ORDER BY le.days_until_expiration ASC
     `;
 
-    res.json(rows.map(r => ({
+     const leasesResult = rows.map(r => ({
       unit_id:               r.unit_id,
       tenant_name:           r.tenant_name,
       unit_type:             r.unit_type,
@@ -457,7 +475,9 @@ router.get("/jasmine/leases", async (req: Request, res: Response) => {
       monthly_rent:          r.monthly_rent !== null ? parseFloat(r.monthly_rent) : null,
       phone:                 r.phone,
       email:                 r.email,
-    })));
+    }));
+    if (windowDays === 90) responseCache.set('leases:90', leasesResult);
+    res.json(leasesResult);
   } catch (err: unknown) {
     const error = err instanceof Error ? err.message : String(err);
     res.status(500).json({ error });
@@ -465,9 +485,10 @@ router.get("/jasmine/leases", async (req: Request, res: Response) => {
     if (sql) await sql.end();
   }
 });
-
 // ── ENDPOINT 5 — GET /jasmine/notices ────────────────────────────────────────
 router.get("/jasmine/notices", async (_req: Request, res: Response) => {
+  const cached = getCached('notices');
+  if (cached) { res.json(cached); return; }
   let sql: postgres.Sql | null = null;
   try {
     sql = getDb();
@@ -510,8 +531,7 @@ router.get("/jasmine/notices", async (_req: Request, res: Response) => {
       WHERE gt.lease_status ILIKE '%notice%'
       ORDER BY gt.lease_end_date ASC NULLS LAST
     `;
-
-    res.json(rows.map(r => ({
+    const noticesResult = rows.map(r => ({
       unit_id:        r.unit_id,
       tenant_name:    r.tenant_name,
       unit_type:      r.unit_type,
@@ -519,7 +539,9 @@ router.get("/jasmine/notices", async (_req: Request, res: Response) => {
       monthly_rent:   r.monthly_rent !== null ? parseFloat(r.monthly_rent) : null,
       phone:          r.phone,
       email:          r.email,
-    })));
+    }));
+    responseCache.set('notices', noticesResult);
+    res.json(noticesResult);
   } catch (err: unknown) {
     const error = err instanceof Error ? err.message : String(err);
     res.status(500).json({ error });
@@ -527,13 +549,17 @@ router.get("/jasmine/notices", async (_req: Request, res: Response) => {
     if (sql) await sql.end();
   }
 });
-
-// ── ENDPOINT 6 — GET /jasmine/delinquency ────────────────────────────────────
+// ── ENDPOINT 6 — GET /jasmine/delinquency ────────────────────────────────────────
 router.get("/jasmine/delinquency", async (req: Request, res: Response) => {
+  const risk = String(req.query.risk ?? 'all').toLowerCase();
+  // Cache only for risk=all (default)
+  if (risk === 'all') {
+    const cached = getCached('delinquency:all');
+    if (cached) { res.json(cached); return; }
+  }
   let sql: postgres.Sql | null = null;
   try {
     sql = getDb();
-    const risk = String(req.query.risk ?? 'all').toLowerCase();
 
     const validRisks = ['high', 'medium', 'low', 'all'];
     if (!validRisks.includes(risk)) {
@@ -579,8 +605,7 @@ router.get("/jasmine/delinquency", async (req: Request, res: Response) => {
       days_overdue:      r.days_overdue,
       risk_level:        r.risk_level,
     }));
-
-    res.json({
+    const delinquencyResult = {
       delinquency: delinquencyRows,
       summary: {
         total_overdue:      delinquencyRows.reduce((s, r) => s + (r.amount_owed ?? 0), 0),
@@ -589,7 +614,9 @@ router.get("/jasmine/delinquency", async (req: Request, res: Response) => {
         medium_risk_count:  delinquencyRows.filter(r => r.risk_level === 'medium').length,
         low_risk_count:     delinquencyRows.filter(r => r.risk_level === 'low').length,
       }
-    });
+    };
+    if (risk === 'all') responseCache.set('delinquency:all', delinquencyResult);
+    res.json(delinquencyResult);
   } catch (err: unknown) {
     const error = err instanceof Error ? err.message : String(err);
     res.status(500).json({ error });
@@ -597,14 +624,17 @@ router.get("/jasmine/delinquency", async (req: Request, res: Response) => {
     if (sql) await sql.end();
   }
 });
-
-// ── ENDPOINT 7 — GET /jasmine/below-market ───────────────────────────────────
+// ── ENDPOINT 7 — GET /jasmine/below-market ────────────────────────────────────────
 router.get("/jasmine/below-market", async (req: Request, res: Response) => {
+  const thresholdPct = Math.max(parseFloat(String(req.query.threshold_pct ?? '10')), 0);
+  // Cache only for default threshold of 10%
+  if (thresholdPct === 10) {
+    const cached = getCached('below-market:5');
+    if (cached) { res.json(cached); return; }
+  }
   let sql: postgres.Sql | null = null;
   try {
     sql = getDb();
-    const thresholdPct = Math.max(parseFloat(String(req.query.threshold_pct ?? '10')), 0);
-
     const rows = await sql<{
       unit_id: string;
       unit_type: string | null;
@@ -653,8 +683,7 @@ router.get("/jasmine/below-market", async (req: Request, res: Response) => {
             >= ${thresholdPct}
       ORDER BY ((rr.market_rent - rr.monthly_rent) / NULLIF(rr.market_rent, 0)) * 100 DESC
     `;
-
-    res.json(rows.map(r => ({
+    const belowMarketResult = rows.map(r => ({
       unit_id:       r.unit_id,
       unit_type:     r.unit_type,
       tenant_name:   r.tenant_name,
@@ -662,7 +691,9 @@ router.get("/jasmine/below-market", async (req: Request, res: Response) => {
       market_rent:   r.market_rent   !== null ? parseFloat(r.market_rent)   : null,
       difference:    r.difference    !== null ? parseFloat(r.difference)    : null,
       percent_below: r.percent_below !== null ? parseFloat(r.percent_below) : null,
-    })));
+    }));
+    if (thresholdPct === 10) responseCache.set('below-market:5', belowMarketResult);
+    res.json(belowMarketResult);
   } catch (err: unknown) {
     const error = err instanceof Error ? err.message : String(err);
     res.status(500).json({ error });
@@ -670,14 +701,17 @@ router.get("/jasmine/below-market", async (req: Request, res: Response) => {
     if (sql) await sql.end();
   }
 });
-
-// ── ENDPOINT 8 — GET /jasmine/long-vacancies ─────────────────────────────────
+// ── ENDPOINT 8 — GET /jasmine/long-vacancies ────────────────────────────────────────
 router.get("/jasmine/long-vacancies", async (req: Request, res: Response) => {
+  const minDays = Math.max(parseInt(String(req.query.min_days ?? '90'), 10), 0);
+  // Cache only for default min_days=90
+  if (minDays === 90) {
+    const cached = getCached('long-vacancies:30');
+    if (cached) { res.json(cached); return; }
+  }
   let sql: postgres.Sql | null = null;
   try {
     sql = getDb();
-    const minDays = Math.max(parseInt(String(req.query.min_days ?? '90'), 10), 0);
-
     const rows = await sql<{
       unit_id: string;
       unit_type: string | null;
@@ -712,13 +746,15 @@ router.get("/jasmine/long-vacancies", async (req: Request, res: Response) => {
       ORDER BY TRIM(days_vacant)::integer DESC
     `;
 
-    res.json(rows.map(r => ({
+    const longVacanciesResult = rows.map(r => ({
       unit_id:                r.unit_id,
       unit_type:              r.unit_type,
       days_vacant:            r.days_vacant !== null ? parseInt(r.days_vacant, 10) : null,
       market_rent:            r.market_rent !== null ? parseFloat(r.market_rent) : null,
       estimated_monthly_loss: r.market_rent !== null ? parseFloat(r.market_rent) : null,
-    })));
+    }));
+    if (minDays === 90) responseCache.set('long-vacancies:30', longVacanciesResult);
+    res.json(longVacanciesResult);
   } catch (err: unknown) {
     const error = err instanceof Error ? err.message : String(err);
     res.status(500).json({ error });
@@ -726,8 +762,7 @@ router.get("/jasmine/long-vacancies", async (req: Request, res: Response) => {
     if (sql) await sql.end();
   }
 });
-
-// ── ENDPOINT 9 — GET /jasmine/tenants ────────────────────────────────────────
+// ── ENDPOINT 9 — GET /jasmine/tenantss ────────────────────────────────────────
 router.get("/jasmine/tenants", async (req: Request, res: Response) => {
   let sql: postgres.Sql | null = null;
   try {
@@ -799,17 +834,21 @@ router.get("/jasmine/tenants", async (req: Request, res: Response) => {
     if (sql) await sql.end();
   }
 });
-
-// ── ENDPOINT 10 — GET /jasmine/move-schedule ─────────────────────────────────
+// ── ENDPOINT 10 — GET /jasmine/move-schedule ────────────────────────────────────────
 router.get("/jasmine/move-schedule", async (req: Request, res: Response) => {
+  const type       = req.query.type ? String(req.query.type).toLowerCase() : null;
+  const windowDays = Math.min(
+    Math.max(parseInt(String(req.query.window_days ?? '30'), 10), 1),
+    365
+  );
+  // Cache only for default window (30 days, no type filter)
+  if (!type && windowDays === 30) {
+    const cached = getCached('move-schedule:30');
+    if (cached) { res.json(cached); return; }
+  }
   let sql: postgres.Sql | null = null;
   try {
     sql = getDb();
-    const type       = req.query.type ? String(req.query.type).toLowerCase() : null;
-    const windowDays = Math.min(
-      Math.max(parseInt(String(req.query.window_days ?? '30'), 10), 1),
-      365
-    );
 
     if (type && !['in', 'out'].includes(type)) {
       res.status(400).json({ error: "type must be 'in', 'out', or omitted for both" });
@@ -864,14 +903,16 @@ router.get("/jasmine/move-schedule", async (req: Request, res: Response) => {
         END ASC NULLS LAST
     `;
 
-    res.json(rows.map(r => ({
+    const moveScheduleResult = rows.map(r => ({
       unit_id:       r.unit_id,
       tenant_name:   r.tenant_name,
       unit_type:     r.unit_type,
       move_in_date:  r.move_in_date,
       move_out_date: r.move_out_date,
       monthly_rent:  r.monthly_rent !== null ? parseFloat(r.monthly_rent) : null,
-    })));
+    }));
+    if (!type && windowDays === 30) responseCache.set('move-schedule:30', moveScheduleResult);
+    res.json(moveScheduleResult);
   } catch (err: unknown) {
     const error = err instanceof Error ? err.message : String(err);
     res.status(500).json({ error });
@@ -879,44 +920,85 @@ router.get("/jasmine/move-schedule", async (req: Request, res: Response) => {
     if (sql) await sql.end();
   }
 });
-
 // ── ENDPOINT 11 — GET /jasmine/tasks ─────────────────────────────────────────
+// Generates tasks server-side from gold_lease_expirations.
+// Leases expiring within 60 days = contact task (priority: medium)
+// Leases expiring within 30 days = urgent follow-up (priority: high)
+// Leases expiring within 14 days = critical renewal (priority: critical)
 router.get("/jasmine/tasks", async (_req: Request, res: Response) => {
+  // Serve from cache if available
+  const cached = getCached('tasks');
+  if (cached) { res.json(cached); return; }
   let sql: postgres.Sql | null = null;
   try {
     sql = getDb();
-
     const rows = await sql<{
-      id: string;
-      entity_id: string | null;
-      task_type: string | null;
-      payload_json: Record<string, unknown> | null;
-      priority: number | null;
-      actor_id: string | null;
-      created_at: string;
+      unit_id: string;
+      tenant_name: string | null;
+      lease_end_date: string | null;
+      days_until_expiration: number | null;
+      monthly_rent: string | null;
+      phone: string | null;
+      email: string | null;
     }[]>`
       SELECT
-        id,
-        entity_id,
-        task_type,
-        payload_json,
-        priority,
-        actor_id,
-        created_at::text
-      FROM tasks
-      WHERE status IN ('open', 'pending')
-      ORDER BY priority DESC NULLS LAST, created_at ASC
+        le.unit_id,
+        gt.full_name           AS tenant_name,
+        le.lease_end_date::text,
+        le.days_until_expiration,
+        le.monthly_rent::text,
+        gt.phone,
+        gt.email
+      FROM gold_lease_expirations le
+      LEFT JOIN gold_tenants gt ON gt.unit_id = le.unit_id
+      WHERE le.days_until_expiration >= 0
+        AND le.days_until_expiration <= 60
+      ORDER BY le.days_until_expiration ASC
     `;
 
-    res.json(rows.map(r => ({
-      task_id:     r.id,
-      unit_id:     r.entity_id,
-      task_type:   r.task_type,
-      description: r.payload_json?.description ?? null,
-      priority:    r.priority,
-      assigned_to: r.actor_id,
-      created_at:  r.created_at,
-    })));
+    const tasks = rows.map((r, idx) => {
+      const days = r.days_until_expiration ?? 999;
+      let priority: string;
+      let task_type: string;
+      let description: string;
+      if (days <= 14) {
+        priority    = 'critical';
+        task_type   = 'critical_renewal';
+        description = `CRITICAL: Lease for unit ${r.unit_id} (${r.tenant_name ?? 'unknown'}) expires in ${days} day${days === 1 ? '' : 's'} on ${r.lease_end_date}. Immediate action required.`;
+      } else if (days <= 30) {
+        priority    = 'high';
+        task_type   = 'urgent_followup';
+        description = `URGENT: Follow up with ${r.tenant_name ?? 'tenant'} in unit ${r.unit_id} — lease expires in ${days} days on ${r.lease_end_date}.`;
+      } else {
+        priority    = 'medium';
+        task_type   = 'contact_tenant';
+        description = `Contact ${r.tenant_name ?? 'tenant'} in unit ${r.unit_id} about lease renewal — expires in ${days} days on ${r.lease_end_date}.`;
+      }
+      return {
+        task_id:        `lease-${r.unit_id}-${r.lease_end_date}`,
+        unit_id:        r.unit_id,
+        task_type,
+        description,
+        priority,
+        tenant_name:    r.tenant_name,
+        lease_end_date: r.lease_end_date,
+        days_until_expiration: r.days_until_expiration,
+        monthly_rent:   r.monthly_rent !== null ? parseFloat(r.monthly_rent) : null,
+        phone:          r.phone,
+        email:          r.email,
+        created_at:     new Date().toISOString(),
+      };
+    });
+
+    const tasksResult = {
+      tasks,
+      total_count:    tasks.length,
+      critical_count: tasks.filter(t => t.priority === 'critical').length,
+      high_count:     tasks.filter(t => t.priority === 'high').length,
+      medium_count:   tasks.filter(t => t.priority === 'medium').length,
+    };
+    responseCache.set('tasks', tasksResult);
+    res.json(tasksResult);
   } catch (err: unknown) {
     const error = err instanceof Error ? err.message : String(err);
     res.status(500).json({ error });
@@ -1038,7 +1120,11 @@ router.get("/jasmine/work-orders", async (req: Request, res: Response) => {
 router.get("/jasmine/aged-receivables", async (req: Request, res: Response) => {
   try {
     const bucketFilter = req.query.bucket as string; // '30', '60', '90', '90_plus'
-
+    // Cache only for no bucket filter (all receivables)
+    if (!bucketFilter) {
+      const cached = getCached('aged-receivables:all');
+      if (cached) { return res.json(cached); }
+    }
     const sql = getDb();
     // Read from Gold table — gold_aged_receivables
     let results: any[];
@@ -1094,26 +1180,29 @@ router.get("/jasmine/aged-receivables", async (req: Request, res: Response) => {
     const reportDate = results[0].last_pipeline_run;
     const totalOutstanding = results.reduce((sum: number, r: any) => sum + parseFloat(r.total_amount || '0'), 0);
 
-    const response = {
+       const response = {
       receivables: results,
       total_outstanding: totalOutstanding,
       last_pipeline_run: reportDate
     };
-
+    if (!bucketFilter) responseCache.set('aged-receivables:all', response);
     return res.json(response);
   } catch (error) {
     console.error("[Jasmine] Error fetching aged receivables:", error);
     return res.status(500).json({ error: "Failed to fetch aged receivables" });
   }
 });
-
 // ============================================================================
 // 15. Applicant Pipeline (/jasmine/applicants)
 // ============================================================================
 router.get("/jasmine/applicants", async (req: Request, res: Response) => {
   try {
     const statusFilter = req.query.status as string; // e.g. 'Active', 'Converted', 'Denied'
-
+    // Cache only for no status filter (all applicants)
+    if (!statusFilter) {
+      const cached = getCached('applicants:all');
+      if (cached) { return res.json(cached); }
+    }
     const sql = getDb();
     // Read from Gold table — gold_rental_applications
     let results: any[];
@@ -1188,10 +1277,10 @@ router.get("/jasmine/applicants", async (req: Request, res: Response) => {
       total_count: applicants.length,
       last_pipeline_run: reportDate
     };
-
+    if (!statusFilter) responseCache.set('applicants:all', response);
     return res.json(response);
   } catch (error) {
-    console.error("[Jasmine] Error fetching applicant pipeline:", error);
+    console.error("[Jasmine] Error fetching applicant pipeline:", error);;
     return res.status(500).json({ error: "Failed to fetch applicant pipeline" });
   }
 });
@@ -1317,7 +1406,11 @@ router.get("/jasmine/general-ledger", async (req: Request, res: Response) => {
 router.get("/jasmine/vendors", async (req: Request, res: Response) => {
   try {
     const tradeFilter = req.query.trade as string;
-    
+    // Cache only for no trade filter (all vendors)
+    if (!tradeFilter) {
+      const cached = getCached('vendors');
+      if (cached) { return res.json(cached); }
+    }
     const sql = getDb();
     // Read from Gold table — gold_vendors
     let vendors: any[];
@@ -1367,26 +1460,29 @@ router.get("/jasmine/vendors", async (req: Request, res: Response) => {
       return res.json({ vendors: [], last_pipeline_run: null });
     }
 
-    const response = {
+       const response = {
       vendors,
       total_count: vendors.length,
       last_pipeline_run: reportDate
     };
-
+    if (!tradeFilter) responseCache.set('vendors', response);
     return res.json(response);
   } catch (error) {
     console.error("[Jasmine] Error fetching vendors:", error);
     return res.status(500).json({ error: "Failed to fetch vendors" });
   }
 });
-
 // ============================================================================
 // 20. Prospect Activity (/jasmine/prospects)
 // ============================================================================
 router.get("/jasmine/prospects", async (req: Request, res: Response) => {
   try {
     const statusFilter = req.query.status as string; // e.g. 'Active', 'Inactive', 'Converted'
-
+    // Cache only for no status filter (all prospects)
+    if (!statusFilter) {
+      const cached = getCached('prospects');
+      if (cached) { return res.json(cached); }
+    }
     const sql = getDb();
     // Read from Gold table — gold_prospects
     let results: any[];
@@ -1458,12 +1554,12 @@ router.get("/jasmine/prospects", async (req: Request, res: Response) => {
       assigned_to: row.assigned_to
     }));
 
-    const response = {
+     const response = {
       prospects,
       total_count: prospects.length,
       last_pipeline_run: reportDate
     };
-
+    if (!statusFilter) responseCache.set('prospects', response);
     return res.json(response);
   } catch (error) {
     console.error("[Jasmine] Error fetching prospects:", error);
@@ -1699,14 +1795,69 @@ cacheLoaders.set('move-schedule:30', async () => {
 cacheLoaders.set('tasks', async () => {
   const sql = getDb();
   try {
-    return await sql`
-      SELECT id, title, description, status, priority, due_date::text, created_at::text
-      FROM tasks
-      WHERE status NOT IN ('completed', 'closed', 'cancelled')
-      ORDER BY
-        CASE priority WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END,
-        due_date ASC NULLS LAST
+    const rows = await sql<{
+      unit_id: string;
+      tenant_name: string | null;
+      lease_end_date: string | null;
+      days_until_expiration: number | null;
+      monthly_rent: string | null;
+      phone: string | null;
+      email: string | null;
+    }[]>`
+      SELECT
+        le.unit_id,
+        gt.full_name           AS tenant_name,
+        le.lease_end_date::text,
+        le.days_until_expiration,
+        le.monthly_rent::text,
+        gt.phone,
+        gt.email
+      FROM gold_lease_expirations le
+      LEFT JOIN gold_tenants gt ON gt.unit_id = le.unit_id
+      WHERE le.days_until_expiration >= 0
+        AND le.days_until_expiration <= 60
+      ORDER BY le.days_until_expiration ASC
     `;
+    const tasks = rows.map(r => {
+      const days = r.days_until_expiration ?? 999;
+      let priority: string;
+      let task_type: string;
+      let description: string;
+      if (days <= 14) {
+        priority    = 'critical';
+        task_type   = 'critical_renewal';
+        description = `CRITICAL: Lease for unit ${r.unit_id} (${r.tenant_name ?? 'unknown'}) expires in ${days} day${days === 1 ? '' : 's'} on ${r.lease_end_date}. Immediate action required.`;
+      } else if (days <= 30) {
+        priority    = 'high';
+        task_type   = 'urgent_followup';
+        description = `URGENT: Follow up with ${r.tenant_name ?? 'tenant'} in unit ${r.unit_id} — lease expires in ${days} days on ${r.lease_end_date}.`;
+      } else {
+        priority    = 'medium';
+        task_type   = 'contact_tenant';
+        description = `Contact ${r.tenant_name ?? 'tenant'} in unit ${r.unit_id} about lease renewal — expires in ${days} days on ${r.lease_end_date}.`;
+      }
+      return {
+        task_id:        `lease-${r.unit_id}-${r.lease_end_date}`,
+        unit_id:        r.unit_id,
+        task_type,
+        description,
+        priority,
+        tenant_name:    r.tenant_name,
+        lease_end_date: r.lease_end_date,
+        days_until_expiration: r.days_until_expiration,
+        monthly_rent:   r.monthly_rent !== null ? parseFloat(r.monthly_rent) : null,
+        phone:          r.phone,
+        email:          r.email,
+        created_at:     new Date().toISOString(),
+      };
+    });
+    return {
+      tasks,
+      total_count:    tasks.length,
+      critical_count: tasks.filter(t => t.priority === 'critical').length,
+      high_count:     tasks.filter(t => t.priority === 'high').length,
+      medium_count:   tasks.filter(t => t.priority === 'medium').length,
+    };
   } finally { await sql.end(); }
 });
 
@@ -1786,13 +1937,183 @@ cacheLoaders.set('work-orders:all', async () => {
   } finally { await sql.end(); }
 });
 
+cacheLoaders.set('aged-receivables:all', async () => {
+  const sql = getDb();
+  try {
+    const results = await sql`
+      SELECT
+        unit_id         AS unit,
+        tenant_id       AS tenant_name,
+        tenant_status,
+        bucket_0_30     AS amount_0_to_30,
+        bucket_31_60    AS amount_30_to_60,
+        bucket_61_90    AS amount_60_to_90,
+        bucket_90_plus  AS amount_90_plus,
+        total_balance   AS total_amount,
+        dominant_bucket,
+        risk_score,
+        created_at      AS last_pipeline_run
+      FROM gold_aged_receivables
+      WHERE total_balance > 0
+      ORDER BY total_balance DESC
+    `;
+    const totalOutstanding = results.reduce((sum: number, r: any) => sum + parseFloat(r.total_amount || '0'), 0);
+    return {
+      receivables: results,
+      total_outstanding: totalOutstanding,
+      last_pipeline_run: results.length > 0 ? results[0].last_pipeline_run : null
+    };
+  } finally { await sql.end(); }
+});
+
+cacheLoaders.set('applicants:all', async () => {
+  const sql = getDb();
+  try {
+    const results = await sql`
+      SELECT
+        applicant_name  AS name,
+        email, phone,
+        unit_name       AS unit_applied_for,
+        status, application_status,
+        received_date,
+        desired_move_in AS move_in_date,
+        lease_start_date, lease_end_date,
+        monthly_rent, source,
+        assigned_user   AS assigned_to,
+        report_date
+      FROM gold_rental_applications
+      ORDER BY received_date DESC
+    `;
+    const applicants = results.map((row: any) => ({
+      name: row.name, email: row.email, phone: row.phone,
+      unit_applied_for: row.unit_applied_for, status: row.status,
+      application_status: row.application_status, received_date: row.received_date,
+      move_in_date: row.move_in_date, lease_start_date: row.lease_start_date,
+      lease_end_date: row.lease_end_date, monthly_rent: row.monthly_rent,
+      source: row.source, assigned_to: row.assigned_to
+    }));
+    return {
+      applicants,
+      total_count: applicants.length,
+      last_pipeline_run: results.length > 0 ? (results[0] as any).report_date : null
+    };
+  } finally { await sql.end(); }
+});
+
+cacheLoaders.set('vendors', async () => {
+  const sql = getDb();
+  try {
+    const vendors = await sql`
+      SELECT
+        company_name,
+        full_name       AS contact_name,
+        vendor_type     AS type,
+        vendor_trades   AS trades,
+        email,
+        phone_numbers   AS phone,
+        payment_type,
+        do_not_use,
+        report_date
+      FROM gold_vendors
+      WHERE company_name IS NOT NULL OR full_name IS NOT NULL
+      ORDER BY company_name ASC NULLS LAST
+    `;
+    return {
+      vendors,
+      total_count: vendors.length,
+      last_pipeline_run: vendors.length > 0 ? (vendors[0] as any).report_date : null
+    };
+  } finally { await sql.end(); }
+});
+
+cacheLoaders.set('prospects', async () => {
+  const sql = getDb();
+  try {
+    const results = await sql`
+      SELECT
+        prospect_name     AS name,
+        email, phone, source, status,
+        unit_name         AS unit_interest,
+        bed_bath_preference, max_rent, move_in_preference,
+        received_at       AS received_date,
+        last_activity_date AS last_activity,
+        last_activity_type, monthly_income,
+        assigned_user     AS assigned_to,
+        report_date
+      FROM gold_prospects
+      ORDER BY received_at DESC NULLS LAST
+    `;
+    const prospects = results.map((row: any) => ({
+      name: row.name, email: row.email, phone: row.phone,
+      source: row.source, status: row.status, unit_interest: row.unit_interest,
+      bed_bath_preference: row.bed_bath_preference, max_rent: row.max_rent,
+      move_in_preference: row.move_in_preference, received_date: row.received_date,
+      last_activity: row.last_activity, last_activity_type: row.last_activity_type,
+      monthly_income: row.monthly_income, assigned_to: row.assigned_to
+    }));
+    return {
+      prospects,
+      total_count: prospects.length,
+      last_pipeline_run: results.length > 0 ? (results[0] as any).report_date : null
+    };
+  } finally { await sql.end(); }
+});
+
+cacheLoaders.set('income-statement', async () => {
+  const sql = getDb();
+  try {
+    const results = await sql`
+      SELECT
+        report_date, total_income, rental_income, other_income,
+        total_expenses, operating_expenses, net_operating_income, profit_margin,
+        total_income_mtd, rental_income_mtd, other_income_mtd,
+        total_expenses_mtd, operating_expenses_mtd, net_operating_income_mtd
+      FROM gold_income_statements
+      ORDER BY report_date DESC
+      LIMIT 12
+    `;
+    if (!results || results.length === 0) return { income_statements: [], last_pipeline_run: null };
+    const latest = results[0] as any;
+    return {
+      latest: {
+        report_date:          latest.report_date,
+        total_income:         parseFloat(latest.total_income || '0'),
+        rental_income:        parseFloat(latest.rental_income || '0'),
+        other_income:         parseFloat(latest.other_income || '0'),
+        total_expenses:       parseFloat(latest.total_expenses || '0'),
+        operating_expenses:   parseFloat(latest.operating_expenses || '0'),
+        net_operating_income: parseFloat(latest.net_operating_income || '0'),
+        profit_margin:        parseFloat(latest.profit_margin || '0'),
+        mtd: {
+          total_income:         parseFloat(latest.total_income_mtd || '0'),
+          rental_income:        parseFloat(latest.rental_income_mtd || '0'),
+          other_income:         parseFloat(latest.other_income_mtd || '0'),
+          total_expenses:       parseFloat(latest.total_expenses_mtd || '0'),
+          operating_expenses:   parseFloat(latest.operating_expenses_mtd || '0'),
+          net_operating_income: parseFloat(latest.net_operating_income_mtd || '0'),
+        }
+      },
+      history: results.map((r: any) => ({
+        report_date:          r.report_date,
+        total_income:         parseFloat(r.total_income || '0'),
+        rental_income:        parseFloat(r.rental_income || '0'),
+        net_operating_income: parseFloat(r.net_operating_income || '0'),
+        profit_margin:        parseFloat(r.profit_margin || '0'),
+      })),
+      last_pipeline_run: latest.report_date
+    };
+  } finally { await sql.end(); }
+});
 
 // ============================================================================
 // 21. Income Statement (/jasmine/income-statement)
 // ============================================================================
 router.get("/jasmine/income-statement", async (req: Request, res: Response) => {
   try {
-     const sql = getDb();
+    // Always cacheable — no query params
+    const cached = getCached('income-statement');
+    if (cached) { return res.json(cached); }
+    const sql = getDb();
     // Read from Gold table — gold_income_statements (latest report + MTD figures)
     const results = await sql`
       SELECT
@@ -1846,9 +2167,9 @@ router.get("/jasmine/income-statement", async (req: Request, res: Response) => {
         net_operating_income: parseFloat(r.net_operating_income || '0'),
         profit_margin:        parseFloat(r.profit_margin || '0'),
       })),
-      last_pipeline_run: latest.report_date
+       last_pipeline_run: latest.report_date
     };
-
+    responseCache.set('income-statement', response);
     return res.json(response);
   } catch (error) {
     console.error("[Jasmine] Error fetching income statement:", error);
