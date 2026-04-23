@@ -1,6 +1,7 @@
 import express, { Request, Response, NextFunction } from "express";
 import postgres from "postgres";
 import jasmineRouter from "./routes/jasmine";
+import pagesRouter from "./routes/pages";
 
 const app = express();
 const PORT = parseInt(process.env.PORT ?? "3003", 10);
@@ -3622,6 +3623,7 @@ app.get("/api/v1/maintenance", async (req: Request, res: Response) => {
 
 // ── Jasmine AI Agent Routes ─────────────────────────────────────────────────
 app.use('/api', jasmineRouter);
+app.use('/api', pagesRouter);
 
 // ── Error handler ─────────────────────────────────────────────────────────────
 app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
