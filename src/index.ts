@@ -2198,6 +2198,15 @@ app.get("/api/v1/insights/collections-risk", async (req: Request, res: Response)
         UNION ALL
         SELECT * FROM past_joined
       ),
+      -- Deduplicate by unit_id: if a unit appears as both 'current' (stale AR)
+      -- and 'past' (fresh delinquency), keep only the 'past' row.
+      -- This handles the case where the AR report lags behind a tenant move-out.
+      deduped AS (
+        SELECT DISTINCT ON (unit_id)
+          *
+        FROM all_joined
+        ORDER BY unit_id, (CASE WHEN tenant_status = 'past' THEN 0 ELSE 1 END) ASC
+      ),
       classified AS (
         SELECT *,
           CASE
@@ -2206,7 +2215,7 @@ app.get("/api/v1/insights/collections-risk", async (req: Request, res: Response)
             WHEN collections_risk_score >= 40 THEN 'Monitor'
             ELSE 'Low Risk'
           END AS collections_classification
-        FROM all_joined
+        FROM deduped
       )
       SELECT *
       FROM classified
