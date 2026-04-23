@@ -177,11 +177,11 @@ router.get("/jasmine/portfolio-summary", async (_req: Request, res: Response) =>
           AND elem->>'Status' ILIKE '%current%'
       )
       SELECT
-        COUNT(*) FILTER (WHERE gu.unit_status = 'occupied'
+        COUNT(*) FILTER (WHERE gu.unit_status ILIKE '%occupied%'
           AND gu.unit_id NOT IN (${sql.array(excluded)}))                   AS occupied,
-        COUNT(*) FILTER (WHERE gu.unit_status = 'vacant'
+        COUNT(*) FILTER (WHERE gu.unit_status ILIKE '%vacant%'
           AND gu.unit_id NOT IN (${sql.array(excluded)}))                   AS vacant,
-        COUNT(*) FILTER (WHERE gu.unit_status = 'notice'
+        COUNT(*) FILTER (WHERE gu.unit_status ILIKE '%notice%'
           AND gu.unit_id NOT IN (${sql.array(excluded)}))                   AS on_notice,
         SUM(rr.monthly_rent)::text                                           AS total_monthly_rent,
         ROUND(AVG(rr.monthly_rent), 2)::text                                 AS avg_rent
@@ -1591,11 +1591,11 @@ cacheLoaders.set('portfolio-summary', async () => {
           AND elem->>'Status' ILIKE '%current%'
       )
       SELECT
-        COUNT(*) FILTER (WHERE gu.unit_status = 'occupied'
+        COUNT(*) FILTER (WHERE gu.unit_status ILIKE '%occupied%'
           AND gu.unit_id NOT IN (${sql.array(excluded)}))  AS occupied,
-        COUNT(*) FILTER (WHERE gu.unit_status = 'vacant'
+        COUNT(*) FILTER (WHERE gu.unit_status ILIKE '%vacant%'
           AND gu.unit_id NOT IN (${sql.array(excluded)}))  AS vacant,
-        COUNT(*) FILTER (WHERE gu.unit_status = 'notice'
+        COUNT(*) FILTER (WHERE gu.unit_status ILIKE '%notice%'
           AND gu.unit_id NOT IN (${sql.array(excluded)}))  AS on_notice,
         SUM(rr.monthly_rent)::text                          AS total_monthly_rent,
         ROUND(AVG(rr.monthly_rent), 2)::text                AS avg_rent
