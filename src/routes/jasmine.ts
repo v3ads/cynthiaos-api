@@ -159,7 +159,22 @@ router.get("/jasmine/portfolio-summary", async (_req: Request, res: Response) =>
       total_monthly_rent: string | null;
       avg_rent: string | null;
     }[]>`
-      WITH latest_rr AS (
+      WITH latest_uv AS (
+        SELECT MAX(report_date) AS dt FROM bronze_appfolio_reports WHERE report_type = 'unit_vacancy'
+      ),
+      uv AS (
+        SELECT DISTINCT ON (LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g')))
+          LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g')) AS unit_id,
+          NULLIF(TRIM(elem->>'UnitStatus'), '')                             AS unit_status
+        FROM bronze_appfolio_reports b,
+             jsonb_array_elements(b.raw_data->'results') AS elem,
+             latest_uv
+        WHERE b.report_type = 'unit_vacancy'
+          AND b.report_date = latest_uv.dt
+          AND elem->>'Unit' IS NOT NULL
+        ORDER BY LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g'))
+      ),
+      latest_rr AS (
         SELECT MAX(report_date) AS dt
         FROM bronze_appfolio_reports
         WHERE report_type = 'rent_roll'
@@ -177,16 +192,17 @@ router.get("/jasmine/portfolio-summary", async (_req: Request, res: Response) =>
           AND elem->>'Status' ILIKE '%current%'
       )
       SELECT
-        COUNT(*) FILTER (WHERE gu.unit_status ILIKE '%occupied%'
+        COUNT(*) FILTER (WHERE COALESCE(uv.unit_status, gu.unit_status) ILIKE '%occupied%'
           AND gu.unit_id NOT IN (${sql.array(excluded)}))                   AS occupied,
-        COUNT(*) FILTER (WHERE gu.unit_status ILIKE '%vacant%'
+        COUNT(*) FILTER (WHERE COALESCE(uv.unit_status, gu.unit_status) ILIKE '%vacant%'
           AND gu.unit_id NOT IN (${sql.array(excluded)}))                   AS vacant,
-        COUNT(*) FILTER (WHERE gu.unit_status ILIKE '%notice%'
+        COUNT(*) FILTER (WHERE COALESCE(uv.unit_status, gu.unit_status) ILIKE '%notice%'
           AND gu.unit_id NOT IN (${sql.array(excluded)}))                   AS on_notice,
         SUM(rr.monthly_rent)::text                                           AS total_monthly_rent,
         ROUND(AVG(rr.monthly_rent), 2)::text                                 AS avg_rent
       FROM gold_units gu
-      LEFT JOIN rr ON rr.unit_id = gu.unit_id
+      LEFT JOIN uv  ON uv.unit_id  = gu.unit_id
+      LEFT JOIN rr  ON rr.unit_id  = gu.unit_id
         AND gu.unit_id NOT IN (${sql.array(excluded)})
     `;
 
@@ -1575,7 +1591,22 @@ cacheLoaders.set('portfolio-summary', async () => {
   try {
     const excluded = excludedUnitIds;
     const [summary] = await sql<{ occupied: string; vacant: string; on_notice: string; total_monthly_rent: string | null; avg_rent: string | null; }[]>`
-      WITH latest_rr AS (
+      WITH latest_uv AS (
+        SELECT MAX(report_date) AS dt FROM bronze_appfolio_reports WHERE report_type = 'unit_vacancy'
+      ),
+      uv AS (
+        SELECT DISTINCT ON (LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g')))
+          LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g')) AS unit_id,
+          NULLIF(TRIM(elem->>'UnitStatus'), '')                             AS unit_status
+        FROM bronze_appfolio_reports b,
+             jsonb_array_elements(b.raw_data->'results') AS elem,
+             latest_uv
+        WHERE b.report_type = 'unit_vacancy'
+          AND b.report_date = latest_uv.dt
+          AND elem->>'Unit' IS NOT NULL
+        ORDER BY LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g'))
+      ),
+      latest_rr AS (
         SELECT MAX(report_date) AS dt FROM bronze_appfolio_reports WHERE report_type = 'rent_roll'
       ),
       rr AS (
@@ -1591,16 +1622,17 @@ cacheLoaders.set('portfolio-summary', async () => {
           AND elem->>'Status' ILIKE '%current%'
       )
       SELECT
-        COUNT(*) FILTER (WHERE gu.unit_status ILIKE '%occupied%'
+        COUNT(*) FILTER (WHERE COALESCE(uv.unit_status, gu.unit_status) ILIKE '%occupied%'
           AND gu.unit_id NOT IN (${sql.array(excluded)}))  AS occupied,
-        COUNT(*) FILTER (WHERE gu.unit_status ILIKE '%vacant%'
+        COUNT(*) FILTER (WHERE COALESCE(uv.unit_status, gu.unit_status) ILIKE '%vacant%'
           AND gu.unit_id NOT IN (${sql.array(excluded)}))  AS vacant,
-        COUNT(*) FILTER (WHERE gu.unit_status ILIKE '%notice%'
+        COUNT(*) FILTER (WHERE COALESCE(uv.unit_status, gu.unit_status) ILIKE '%notice%'
           AND gu.unit_id NOT IN (${sql.array(excluded)}))  AS on_notice,
         SUM(rr.monthly_rent)::text                          AS total_monthly_rent,
         ROUND(AVG(rr.monthly_rent), 2)::text                AS avg_rent
       FROM gold_units gu
-      LEFT JOIN rr ON rr.unit_id = gu.unit_id
+      LEFT JOIN uv  ON uv.unit_id  = gu.unit_id
+      LEFT JOIN rr  ON rr.unit_id  = gu.unit_id
       WHERE gu.unit_id NOT IN (${sql.array(excluded)})
     `;
     const [pipeline] = await sql<{ last_run: string | null }[]>`
