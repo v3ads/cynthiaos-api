@@ -2123,6 +2123,16 @@ app.get("/api/v1/insights/collections-risk", async (req: Request, res: Response)
         FROM gold_tenants
         ORDER BY tenant_id, updated_at DESC
       ),
+      -- Fallback name lookup by unit_id for past tenants whose tenant_id
+      -- has a unit suffix (e.g. 'schreuder_ramona_a_216') that doesn't match
+      -- the gold_tenants key (e.g. 'schreuder_ramona_a').
+      -- Pick the most recently updated tenant for each unit.
+      t_by_unit AS (
+        SELECT DISTINCT ON (unit_id)
+          unit_id, full_name
+        FROM gold_tenants
+        ORDER BY unit_id, updated_at DESC
+      ),
       -- Current tenant rows
       current_joined AS (
         SELECT
@@ -2167,9 +2177,9 @@ app.get("/api/v1/insights/collections-risk", async (req: Request, res: Response)
       past_joined AS (
         SELECT
           dp.tenant_id,
-          COALESCE(t.full_name, dp.tenant_id)  AS full_name,
+          COALESCE(t.full_name, tu.full_name, dp.tenant_id)  AS full_name,
           dp.unit_id,
-          'past'::text                          AS tenant_status,
+          'past'::text                                       AS tenant_status,
           dp.total_balance,
           dp.total_balance                      AS risk_score,
           dp.bucket_90_plus,
@@ -2191,7 +2201,8 @@ app.get("/api/v1/insights/collections-risk", async (req: Request, res: Response)
             )
           )) AS collections_risk_score
         FROM d_past dp
-        LEFT JOIN t_deduped t ON dp.tenant_id = t.tenant_id
+        LEFT JOIN t_deduped  t  ON dp.tenant_id = t.tenant_id
+        LEFT JOIN t_by_unit  tu ON dp.unit_id   = tu.unit_id
       ),
       all_joined AS (
         SELECT * FROM current_joined
