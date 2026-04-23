@@ -1038,11 +1038,6 @@ router.get("/jasmine/work-orders", async (req: Request, res: Response) => {
 router.get("/jasmine/aged-receivables", async (req: Request, res: Response) => {
   try {
     const bucketFilter = req.query.bucket as string; // '30', '60', '90', '90_plus'
-    const cacheKey = bucketFilter ? `aged-receivables:${bucketFilter}` : 'aged-receivables';
-
-    if (responseCache.has(cacheKey)) {
-      return res.json(responseCache.get(cacheKey));
-    }
 
     const sql = getDb();
     // Read from Gold table — gold_aged_receivables
@@ -1105,9 +1100,6 @@ router.get("/jasmine/aged-receivables", async (req: Request, res: Response) => {
       last_pipeline_run: reportDate
     };
 
-    if (!bucketFilter) {
-      responseCache.set('aged-receivables', response);
-    }
     return res.json(response);
   } catch (error) {
     console.error("[Jasmine] Error fetching aged receivables:", error);
@@ -1121,11 +1113,6 @@ router.get("/jasmine/aged-receivables", async (req: Request, res: Response) => {
 router.get("/jasmine/applicants", async (req: Request, res: Response) => {
   try {
     const statusFilter = req.query.status as string; // e.g. 'Active', 'Converted', 'Denied'
-    const cacheKey = statusFilter ? `applicants:${statusFilter.toLowerCase()}` : 'applicants';
-
-    if (responseCache.has(cacheKey)) {
-      return res.json(responseCache.get(cacheKey));
-    }
 
     const sql = getDb();
     // Read from Gold table — gold_rental_applications
@@ -1202,7 +1189,6 @@ router.get("/jasmine/applicants", async (req: Request, res: Response) => {
       last_pipeline_run: reportDate
     };
 
-    if (!statusFilter) responseCache.set('applicants', response);
     return res.json(response);
   } catch (error) {
     console.error("[Jasmine] Error fetching applicant pipeline:", error);
@@ -1215,10 +1201,6 @@ router.get("/jasmine/applicants", async (req: Request, res: Response) => {
 // ============================================================================
 router.get("/jasmine/inspections", async (_req: Request, res: Response) => {
   try {
-    if (responseCache.has('inspections')) {
-      return res.json(responseCache.get('inspections'));
-    }
-
     const sql = getDb();
     // Read from Gold table — gold_unit_turnover (already had Gold coverage)
     const results = await sql`
@@ -1256,7 +1238,6 @@ router.get("/jasmine/inspections", async (_req: Request, res: Response) => {
       last_pipeline_run: reportDate
     };
 
-    responseCache.set('inspections', response);
     return res.json(response);
   } catch (error) {
     console.error("[Jasmine] Error fetching inspections/unit turns:", error);
@@ -1285,25 +1266,6 @@ router.get("/jasmine/general-ledger", async (req: Request, res: Response) => {
     const startDate    = req.query.start_date as string; // YYYY-MM-DD
     const endDate      = req.query.end_date   as string; // YYYY-MM-DD
     const hasDateFilter = !!(startDate || endDate);
-
-    // Only cache the unfiltered full dataset — date/account filtered queries go direct to DB
-    const cacheKey = (!accountFilter && !hasDateFilter) ? 'general-ledger:all' : null;
-    if (cacheKey && responseCache.has(cacheKey)) {
-      return res.json(responseCache.get(cacheKey));
-    }
-
-    // If only account filter (no date), try serving from base cache to avoid full table scan
-    if (accountFilter && !hasDateFilter && responseCache.has('general-ledger:all')) {
-      const baseData = responseCache.get('general-ledger:all') as any;
-      const filteredEntries = baseData.entries.filter((e: any) => 
-        e.gl_account_name && e.gl_account_name.toLowerCase().includes(accountFilter.toLowerCase())
-      );
-      return res.json({
-        entries: filteredEntries,
-        total_count: filteredEntries.length,
-        last_pipeline_run: baseData.last_pipeline_run
-      });
-    }
 
     const sql = getDb();
     // Build dynamic WHERE clauses
@@ -1342,9 +1304,6 @@ router.get("/jasmine/general-ledger", async (req: Request, res: Response) => {
       ...(startDate || endDate ? { date_range: { start: startDate || null, end: endDate || null } } : {})
     };
 
-    if (cacheKey) {
-      responseCache.set(cacheKey, response);
-    }
     return res.json(response);
   } catch (error) {
     console.error("[Jasmine] Error fetching general ledger:", error);
@@ -1359,10 +1318,6 @@ router.get("/jasmine/vendors", async (req: Request, res: Response) => {
   try {
     const tradeFilter = req.query.trade as string;
     
-    if (!tradeFilter && responseCache.has('vendors')) {
-      return res.json(responseCache.get('vendors'));
-    }
-
     const sql = getDb();
     // Read from Gold table — gold_vendors
     let vendors: any[];
@@ -1418,9 +1373,6 @@ router.get("/jasmine/vendors", async (req: Request, res: Response) => {
       last_pipeline_run: reportDate
     };
 
-    if (!tradeFilter) {
-      responseCache.set('vendors', response);
-    }
     return res.json(response);
   } catch (error) {
     console.error("[Jasmine] Error fetching vendors:", error);
@@ -1434,11 +1386,6 @@ router.get("/jasmine/vendors", async (req: Request, res: Response) => {
 router.get("/jasmine/prospects", async (req: Request, res: Response) => {
   try {
     const statusFilter = req.query.status as string; // e.g. 'Active', 'Inactive', 'Converted'
-    const cacheKey = statusFilter ? `prospects:${statusFilter.toLowerCase()}` : 'prospects';
-
-    if (responseCache.has(cacheKey)) {
-      return res.json(responseCache.get(cacheKey));
-    }
 
     const sql = getDb();
     // Read from Gold table — gold_prospects
@@ -1517,7 +1464,6 @@ router.get("/jasmine/prospects", async (req: Request, res: Response) => {
       last_pipeline_run: reportDate
     };
 
-    if (!statusFilter) responseCache.set('prospects', response);
     return res.json(response);
   } catch (error) {
     console.error("[Jasmine] Error fetching prospects:", error);
@@ -1840,179 +1786,13 @@ cacheLoaders.set('work-orders:all', async () => {
   } finally { await sql.end(); }
 });
 
-cacheLoaders.set('aged-receivables', async () => {
-  const sql = getDb();
-  try {
-    const results = await sql`
-      SELECT
-        unit_id         AS unit,
-        tenant_id       AS tenant_name,
-        tenant_status,
-        bucket_0_30     AS amount_0_to_30,
-        bucket_31_60    AS amount_30_to_60,
-        bucket_61_90    AS amount_60_to_90,
-        bucket_90_plus  AS amount_90_plus,
-        total_balance   AS total_amount,
-        dominant_bucket,
-        risk_score,
-        created_at      AS last_pipeline_run
-      FROM gold_aged_receivables
-      WHERE total_balance > 0
-      ORDER BY total_balance DESC
-    `;
-    if (!results || results.length === 0) return { receivables: [], total_outstanding: 0, last_pipeline_run: null };
-    const totalOutstanding = results.reduce((sum: number, r: any) => sum + parseFloat(r.total_amount || '0'), 0);
-    return {
-      receivables: results,
-      total_outstanding: totalOutstanding,
-      last_pipeline_run: results[0].last_pipeline_run
-    };
-  } finally { await sql.end(); }
-});
-
-cacheLoaders.set('applicants', async () => {
-  const sql = getDb();
-  try {
-    const results = await sql`
-      SELECT
-        applicant_name  AS name,
-        email,
-        phone,
-        unit_id         AS unit_applied_for,
-        status,
-        received_date,
-        desired_move_in AS move_in_date,
-        assigned_user   AS assigned_to,
-        created_at      AS last_pipeline_run
-      FROM gold_rental_applications
-      ORDER BY received_date DESC NULLS LAST
-    `;
-    if (!results || results.length === 0) return { applicants: [], total_count: 0, last_pipeline_run: null };
-    return {
-      applicants: results,
-      total_count: results.length,
-      last_pipeline_run: results[0].last_pipeline_run
-    };
-  } finally { await sql.end(); }
-});
-
-cacheLoaders.set('inspections', async () => {
-  const sql = getDb();
-  try {
-    const results = await sql`
-      SELECT
-        unit_id                 AS unit,
-        move_out_date,
-        expected_move_in_date   AS expected_move_in,
-        turn_end_date,
-        target_days,
-        days_to_complete        AS actual_days,
-        event_type              AS turn_status,
-        created_at              AS last_pipeline_run
-      FROM gold_unit_turnover
-      ORDER BY move_out_date DESC NULLS LAST
-    `;
-    if (!results || results.length === 0) return { unit_turns: [], total_count: 0, last_pipeline_run: null };
-    return {
-      unit_turns: results,
-      total_count: results.length,
-      last_pipeline_run: results[0].last_pipeline_run
-    };
-  } finally { await sql.end(); }
-});
-
-cacheLoaders.set('general-ledger:all', async () => {
-  const sql = getDb();
-  try {
-    const results = await sql`
-      SELECT
-        post_date       AS date,
-        txn_type        AS type,
-        unit_id         AS unit,
-        debit,
-        credit,
-        description,
-        gl_account_name,
-        party_name,
-        created_at      AS last_pipeline_run
-      FROM gold_general_ledger
-      ORDER BY post_date DESC NULLS LAST
-      LIMIT 2500
-    `;
-    if (!results || results.length === 0) return { entries: [], total_count: 0, last_pipeline_run: null };
-    return {
-      entries: results,
-      total_count: results.length,
-      last_pipeline_run: results[0].last_pipeline_run
-    };
-  } finally { await sql.end(); }
-});
-
-cacheLoaders.set('vendors', async () => {
-  const sql = getDb();
-  try {
-    const results = await sql`
-      SELECT
-        company_name,
-        contact_name,
-        vendor_type,
-        vendor_trades   AS trades,
-        email,
-        phone_numbers   AS phone,
-        payment_type,
-        do_not_use,
-        created_at      AS last_pipeline_run
-      FROM gold_vendors
-      ORDER BY company_name ASC NULLS LAST
-    `;
-    if (!results || results.length === 0) return { vendors: [], total_count: 0, last_pipeline_run: null };
-    return {
-      vendors: results,
-      total_count: results.length,
-      last_pipeline_run: results[0].last_pipeline_run
-    };
-  } finally { await sql.end(); }
-});
-
-cacheLoaders.set('prospects', async () => {
-  const sql = getDb();
-  try {
-    const results = await sql`
-      SELECT
-        prospect_name       AS name,
-        email,
-        phone,
-        source,
-        status,
-        unit_id             AS unit_interest,
-        received_at         AS received_date,
-        last_activity_date  AS last_activity,
-        assigned_user       AS assigned_to,
-        created_at          AS last_pipeline_run
-      FROM gold_prospects
-      ORDER BY received_at DESC NULLS LAST
-    `;
-    if (!results || results.length === 0) return { prospects: [], total_count: 0, last_pipeline_run: null };
-    return {
-      prospects: results,
-      total_count: results.length,
-      last_pipeline_run: results[0].last_pipeline_run
-    };
-  } finally { await sql.end(); }
-});
-
 
 // ============================================================================
 // 21. Income Statement (/jasmine/income-statement)
 // ============================================================================
 router.get("/jasmine/income-statement", async (req: Request, res: Response) => {
   try {
-    const cacheKey = 'income-statement';
-    if (responseCache.has(cacheKey)) {
-      return res.json(responseCache.get(cacheKey));
-    }
-
-    const sql = getDb();
+     const sql = getDb();
     // Read from Gold table — gold_income_statements (latest report + MTD figures)
     const results = await sql`
       SELECT
@@ -2069,7 +1849,6 @@ router.get("/jasmine/income-statement", async (req: Request, res: Response) => {
       last_pipeline_run: latest.report_date
     };
 
-    responseCache.set(cacheKey, response);
     return res.json(response);
   } catch (error) {
     console.error("[Jasmine] Error fetching income statement:", error);
