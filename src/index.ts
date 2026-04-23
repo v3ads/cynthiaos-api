@@ -2092,7 +2092,8 @@ app.get("/api/v1/insights/collections-risk", async (req: Request, res: Response)
         SELECT DISTINCT ON (tenant_id)
           tenant_id,
           days_overdue,
-          risk_level AS delinquency_level
+          risk_level AS delinquency_level,
+          balance_due::numeric AS balance_due
         FROM gold_delinquency_records
         WHERE tenant_status = 'current'
         ORDER BY tenant_id, days_overdue DESC NULLS LAST, created_at DESC
@@ -2140,7 +2141,7 @@ app.get("/api/v1/insights/collections-risk", async (req: Request, res: Response)
           COALESCE(t.full_name, ar.tenant_id)  AS full_name,
           ar.unit_id,
           'current'::text                       AS tenant_status,
-          ar.total_balance,
+          GREATEST(ar.total_balance, COALESCE(dc.balance_due, 0)) AS total_balance,
           ar.risk_score,
           ar.bucket_90_plus,
           ar.dominant_bucket,
