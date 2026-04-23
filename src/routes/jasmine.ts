@@ -1844,29 +1844,28 @@ cacheLoaders.set('aged-receivables', async () => {
   const sql = getDb();
   try {
     const results = await sql`
-      SELECT raw_data->'results' as data, report_date
-      FROM bronze_appfolio_reports
-      WHERE report_type = 'aged_receivables_detail'
-      ORDER BY report_date DESC
-      LIMIT 1
+      SELECT
+        unit_id         AS unit,
+        tenant_id       AS tenant_name,
+        tenant_status,
+        bucket_0_30     AS amount_0_to_30,
+        bucket_31_60    AS amount_30_to_60,
+        bucket_61_90    AS amount_60_to_90,
+        bucket_90_plus  AS amount_90_plus,
+        total_balance   AS total_amount,
+        dominant_bucket,
+        risk_score,
+        created_at      AS last_pipeline_run
+      FROM gold_aged_receivables
+      WHERE total_balance > 0
+      ORDER BY total_balance DESC
     `;
-    if (!results || results.length === 0) return { receivables: [], last_pipeline_run: null };
-    const rawData = results[0].data || [];
-    const receivables = rawData.map((row: any) => ({
-      unit: row.UnitName || row.Unit,
-      tenant_name: row.PayerName || row.OccupancyName,
-      tenant_status: row.TenantStatus,
-      amount_0_to_30: parseFloat(row['0To30'] || '0'),
-      amount_30_to_60: parseFloat(row['30To60'] || '0'),
-      amount_60_to_90: parseFloat(row['60To90'] || '0'),
-      amount_90_plus: parseFloat(row['90Plus'] || '0'),
-      total_amount: parseFloat(row.TotalAmount || '0'),
-      gl_account: row.GlAccountName
-    })).filter((r: any) => r.total_amount > 0);
+    if (!results || results.length === 0) return { receivables: [], total_outstanding: 0, last_pipeline_run: null };
+    const totalOutstanding = results.reduce((sum: number, r: any) => sum + parseFloat(r.total_amount || '0'), 0);
     return {
-      receivables,
-      total_outstanding: receivables.reduce((sum: number, r: any) => sum + r.total_amount, 0),
-      last_pipeline_run: results[0].report_date
+      receivables: results,
+      total_outstanding: totalOutstanding,
+      last_pipeline_run: results[0].last_pipeline_run
     };
   } finally { await sql.end(); }
 });
@@ -1875,28 +1874,24 @@ cacheLoaders.set('applicants', async () => {
   const sql = getDb();
   try {
     const results = await sql`
-      SELECT raw_data->'results' as data, report_date
-      FROM bronze_appfolio_reports
-      WHERE report_type = 'rental_applications'
-      ORDER BY report_date DESC
-      LIMIT 1
+      SELECT
+        applicant_name  AS name,
+        email,
+        phone,
+        unit_id         AS unit_applied_for,
+        status,
+        received_date,
+        desired_move_in AS move_in_date,
+        assigned_user   AS assigned_to,
+        created_at      AS last_pipeline_run
+      FROM gold_rental_applications
+      ORDER BY received_date DESC NULLS LAST
     `;
-    if (!results || results.length === 0) return { applicants: [], last_pipeline_run: null };
-    const rawData = results[0].data || [];
-    const applicants = rawData.map((row: any) => ({
-      name: row.Applicants,
-      email: row.Email,
-      phone: row.PhoneNumber,
-      unit_applied_for: row.UnitName || row.UnitTitle,
-      status: row.Status || row.ApplicationStatus,
-      received_date: row.Received,
-      move_in_date: row.MoveInDate || row.DesiredMoveIn,
-      assigned_to: row.AssignedUser
-    }));
+    if (!results || results.length === 0) return { applicants: [], total_count: 0, last_pipeline_run: null };
     return {
-      applicants,
-      total_count: applicants.length,
-      last_pipeline_run: results[0].report_date
+      applicants: results,
+      total_count: results.length,
+      last_pipeline_run: results[0].last_pipeline_run
     };
   } finally { await sql.end(); }
 });
@@ -1905,27 +1900,23 @@ cacheLoaders.set('inspections', async () => {
   const sql = getDb();
   try {
     const results = await sql`
-      SELECT raw_data->'results' as data, report_date
-      FROM bronze_appfolio_reports
-      WHERE report_type = 'unit_turn_detail'
-      ORDER BY report_date DESC
-      LIMIT 1
+      SELECT
+        unit_id                 AS unit,
+        move_out_date,
+        expected_move_in_date   AS expected_move_in,
+        turn_end_date,
+        target_days,
+        days_to_complete        AS actual_days,
+        event_type              AS turn_status,
+        created_at              AS last_pipeline_run
+      FROM gold_unit_turnover
+      ORDER BY move_out_date DESC NULLS LAST
     `;
-    if (!results || results.length === 0) return { unit_turns: [], last_pipeline_run: null };
-    const rawData = results[0].data || [];
-    const unit_turns = rawData.map((row: any) => ({
-      unit: row.Unit,
-      move_out_date: row.MoveOutDate,
-      expected_move_in: row.ExpectedMoveInDate,
-      turn_end_date: row.TurnEndDate,
-      target_days: row.TargetDaysToComplete,
-      actual_days: row.TotalDaysToComplete,
-      notes: row.Notes
-    }));
+    if (!results || results.length === 0) return { unit_turns: [], total_count: 0, last_pipeline_run: null };
     return {
-      unit_turns,
-      total_count: unit_turns.length,
-      last_pipeline_run: results[0].report_date
+      unit_turns: results,
+      total_count: results.length,
+      last_pipeline_run: results[0].last_pipeline_run
     };
   } finally { await sql.end(); }
 });
@@ -1934,28 +1925,25 @@ cacheLoaders.set('general-ledger:all', async () => {
   const sql = getDb();
   try {
     const results = await sql`
-      SELECT raw_data->'results' as data, report_date
-      FROM bronze_appfolio_reports
-      WHERE report_type = 'general_ledger'
-      ORDER BY report_date DESC
-      LIMIT 1
+      SELECT
+        post_date       AS date,
+        txn_type        AS type,
+        unit_id         AS unit,
+        debit,
+        credit,
+        description,
+        gl_account_name,
+        party_name,
+        created_at      AS last_pipeline_run
+      FROM gold_general_ledger
+      ORDER BY post_date DESC NULLS LAST
+      LIMIT 2500
     `;
-    if (!results || results.length === 0) return { entries: [], last_pipeline_run: null };
-    const rawData = results[0].data || [];
-    const entries = rawData.map((row: any) => ({
-      date: row.PostDate,
-      type: row.Type,
-      unit: row.Unit,
-      debit: row.Debit ? parseFloat(row.Debit.replace(/,/g, '')) : 0,
-      credit: row.Credit ? parseFloat(row.Credit.replace(/,/g, '')) : 0,
-      description: row.Description,
-      gl_account_name: row.GlAccountName,
-      party_name: row.PartyName
-    }));
+    if (!results || results.length === 0) return { entries: [], total_count: 0, last_pipeline_run: null };
     return {
-      entries,
-      total_count: entries.length,
-      last_pipeline_run: results[0].report_date
+      entries: results,
+      total_count: results.length,
+      last_pipeline_run: results[0].last_pipeline_run
     };
   } finally { await sql.end(); }
 });
@@ -1964,28 +1952,24 @@ cacheLoaders.set('vendors', async () => {
   const sql = getDb();
   try {
     const results = await sql`
-      SELECT raw_data->'results' as data, report_date
-      FROM bronze_appfolio_reports
-      WHERE report_type = 'vendor_directory'
-      ORDER BY report_date DESC
-      LIMIT 1
+      SELECT
+        company_name,
+        contact_name,
+        vendor_type,
+        vendor_trades   AS trades,
+        email,
+        phone_numbers   AS phone,
+        payment_type,
+        do_not_use,
+        created_at      AS last_pipeline_run
+      FROM gold_vendors
+      ORDER BY company_name ASC NULLS LAST
     `;
-    if (!results || results.length === 0) return { vendors: [], last_pipeline_run: null };
-    const rawData = results[0].data || [];
-    const vendors = rawData.map((row: any) => ({
-      company_name: row.CompanyName,
-      contact_name: row.Name || `\${row.FirstName || ''} \${row.LastName || ''}`.trim(),
-      type: row.VendorType,
-      trades: row.VendorTrades,
-      email: row.Email,
-      phone: row.PhoneNumbers,
-      payment_type: row.PaymentType,
-      do_not_use: row.DoNotUseForWorkOrder === 'Yes'
-    })).filter((v: any) => v.company_name || v.contact_name);
+    if (!results || results.length === 0) return { vendors: [], total_count: 0, last_pipeline_run: null };
     return {
-      vendors,
-      total_count: vendors.length,
-      last_pipeline_run: results[0].report_date
+      vendors: results,
+      total_count: results.length,
+      last_pipeline_run: results[0].last_pipeline_run
     };
   } finally { await sql.end(); }
 });
@@ -1994,29 +1978,25 @@ cacheLoaders.set('prospects', async () => {
   const sql = getDb();
   try {
     const results = await sql`
-      SELECT raw_data->'results' as data, report_date
-      FROM bronze_appfolio_reports
-      WHERE report_type = 'guest_cards'
-      ORDER BY report_date DESC
-      LIMIT 1
+      SELECT
+        prospect_name       AS name,
+        email,
+        phone,
+        source,
+        status,
+        unit_id             AS unit_interest,
+        received_at         AS received_date,
+        last_activity_date  AS last_activity,
+        assigned_user       AS assigned_to,
+        created_at          AS last_pipeline_run
+      FROM gold_prospects
+      ORDER BY received_at DESC NULLS LAST
     `;
-    if (!results || results.length === 0) return { prospects: [], last_pipeline_run: null };
-    const rawData = results[0].data || [];
-    const prospects = rawData.map((row: any) => ({
-      name: row.Name,
-      email: row.EmailAddress,
-      phone: row.PhoneNumber,
-      source: row.Source,
-      status: row.Status,
-      unit_interest: row.Unit,
-      received_date: row.Received,
-      last_activity: row.LastActivityDate,
-      assigned_to: row.AssignedUser
-    }));
+    if (!results || results.length === 0) return { prospects: [], total_count: 0, last_pipeline_run: null };
     return {
-      prospects,
-      total_count: prospects.length,
-      last_pipeline_run: results[0].report_date
+      prospects: results,
+      total_count: results.length,
+      last_pipeline_run: results[0].last_pipeline_run
     };
   } finally { await sql.end(); }
 });
