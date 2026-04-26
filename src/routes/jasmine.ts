@@ -708,7 +708,9 @@ router.get("/jasmine/below-market", async (req: Request, res: Response) => {
       difference:    r.difference    !== null ? parseFloat(r.difference)    : null,
       percent_below: r.percent_below !== null ? parseFloat(r.percent_below) : null,
     }));
-    if (thresholdPct === 10) responseCache.set('below-market:5', belowMarketResult);
+    // NOTE: Do not write back to 'below-market:5' here — that key is owned by the warmCache
+    // loader which uses a broader 5% threshold for Jasmine AI context. Writing the 10%-filtered
+    // result here would corrupt the warmed data.
     res.json(belowMarketResult);
   } catch (err: unknown) {
     const error = err instanceof Error ? err.message : String(err);
@@ -769,7 +771,9 @@ router.get("/jasmine/long-vacancies", async (req: Request, res: Response) => {
       market_rent:            r.market_rent !== null ? parseFloat(r.market_rent) : null,
       estimated_monthly_loss: r.market_rent !== null ? parseFloat(r.market_rent) : null,
     }));
-    if (minDays === 90) responseCache.set('long-vacancies:30', longVacanciesResult);
+    // NOTE: Do not write back to 'long-vacancies:30' here — that key is owned by the warmCache
+    // loader which uses a broader 30-day minimum for Jasmine AI context. Writing the 90-day-filtered
+    // result here would corrupt the warmed data.
     res.json(longVacanciesResult);
   } catch (err: unknown) {
     const error = err instanceof Error ? err.message : String(err);
@@ -1131,6 +1135,7 @@ router.get("/jasmine/work-orders", async (req: Request, res: Response) => {
 // 14. Aged Receivables (/jasmine/aged-receivables)
 // ============================================================================
 router.get("/jasmine/aged-receivables", async (req: Request, res: Response) => {
+  let sql: postgres.Sql | null = null;
   try {
     const bucketFilter = req.query.bucket as string; // '30', '60', '90', '90_plus'
     // Cache only for no bucket filter (all receivables)
@@ -1138,7 +1143,7 @@ router.get("/jasmine/aged-receivables", async (req: Request, res: Response) => {
       const cached = getCached('aged-receivables:all');
       if (cached) { return res.json(cached); }
     }
-    const sql = getDb();
+    sql = getDb();
     // Read from Gold table — gold_aged_receivables
     let results: any[];
 
@@ -1203,12 +1208,15 @@ router.get("/jasmine/aged-receivables", async (req: Request, res: Response) => {
   } catch (error) {
     console.error("[Jasmine] Error fetching aged receivables:", error);
     return res.status(500).json({ error: "Failed to fetch aged receivables" });
+  } finally {
+    if (sql) await sql.end();
   }
 });
 // ============================================================================
 // 15. Applicant Pipeline (/jasmine/applicants)
 // ============================================================================
 router.get("/jasmine/applicants", async (req: Request, res: Response) => {
+  let sql: postgres.Sql | null = null;
   try {
     const statusFilter = req.query.status as string; // e.g. 'Active', 'Converted', 'Denied'
     // Cache only for no status filter (all applicants)
@@ -1216,7 +1224,7 @@ router.get("/jasmine/applicants", async (req: Request, res: Response) => {
       const cached = getCached('applicants:all');
       if (cached) { return res.json(cached); }
     }
-    const sql = getDb();
+    sql = getDb();
     // Read from Gold table — gold_rental_applications
     let results: any[];
 
@@ -1293,8 +1301,10 @@ router.get("/jasmine/applicants", async (req: Request, res: Response) => {
     if (!statusFilter) responseCache.set('applicants:all', response);
     return res.json(response);
   } catch (error) {
-    console.error("[Jasmine] Error fetching applicant pipeline:", error);;
+    console.error("[Jasmine] Error fetching applicant pipeline:", error);
     return res.status(500).json({ error: "Failed to fetch applicant pipeline" });
+  } finally {
+    if (sql) await sql.end();
   }
 });
 
@@ -1302,8 +1312,9 @@ router.get("/jasmine/applicants", async (req: Request, res: Response) => {
 // 16. Inspection Report (Unit Turns) (/jasmine/inspections)
 // ============================================================================
 router.get("/jasmine/inspections", async (_req: Request, res: Response) => {
+  let sql: postgres.Sql | null = null;
   try {
-    const sql = getDb();
+    sql = getDb();
     // Read from Gold table — gold_unit_turnover (already had Gold coverage)
     const results = await sql`
       SELECT
@@ -1344,6 +1355,8 @@ router.get("/jasmine/inspections", async (_req: Request, res: Response) => {
   } catch (error) {
     console.error("[Jasmine] Error fetching inspections/unit turns:", error);
     return res.status(500).json({ error: "Failed to fetch inspections" });
+  } finally {
+    if (sql) await sql.end();
   }
 });
 
