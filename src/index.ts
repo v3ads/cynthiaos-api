@@ -1513,7 +1513,8 @@ app.get("/api/v1/insights/at-risk-revenue", async (req: Request, res: Response) 
           tenant_id, unit_id,
           total_balance::numeric   AS total_balance,
           risk_score::numeric      AS risk_score,
-          dominant_bucket
+          dominant_bucket,
+          bucket_90_plus::numeric  AS bucket_90_plus
         FROM gold_aged_receivables
         ORDER BY tenant_id, risk_score DESC
       ),
@@ -1550,7 +1551,7 @@ app.get("/api/v1/insights/at-risk-revenue", async (req: Request, res: Response) 
           le.lease_end_date,
           le.days_until_expiration,
           CASE
-            WHEN d.days_overdue >= 90
+            WHEN d.days_overdue >= 90 AND ar.bucket_90_plus > 0
             THEN 'HIGH'
             WHEN ar.risk_score >= 5000
                  AND le.days_until_expiration IS NOT NULL
@@ -1579,7 +1580,9 @@ app.get("/api/v1/insights/at-risk-revenue", async (req: Request, res: Response) 
       WITH
       ar_deduped AS (
         SELECT DISTINCT ON (tenant_id)
-          tenant_id, risk_score::numeric AS risk_score
+          tenant_id,
+          risk_score::numeric      AS risk_score,
+          bucket_90_plus::numeric  AS bucket_90_plus
         FROM gold_aged_receivables
         ORDER BY tenant_id, risk_score DESC
       ),
@@ -1602,7 +1605,7 @@ app.get("/api/v1/insights/at-risk-revenue", async (req: Request, res: Response) 
           le.days_until_expiration,
           d.days_overdue,
           CASE
-            WHEN d.days_overdue >= 90
+            WHEN d.days_overdue >= 90 AND ar.bucket_90_plus > 0
             THEN 'HIGH'
             WHEN ar.risk_score >= 5000
                  AND le.days_until_expiration IS NOT NULL
