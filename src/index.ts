@@ -574,6 +574,33 @@ app.put("/api/v1/units/:id/notes", async (req: Request, res: Response) => {
   }
 });
 
+// ── GET /api/v1/leases/actions/bulk ─────────────────────────────────────────
+// Returns all lease_actions records in a single call.
+// Response: { success: true, data: Record<lease_id, LeaseActionRecord> }
+app.get("/api/v1/leases/actions/bulk", async (req: Request, res: Response) => {
+  let sql: postgres.Sql | null = null;
+  try {
+    sql = getDb();
+    const rows = await sql<LeaseActionRow[]>`
+      SELECT id, lease_id, contacted, flagged, notes, last_action_at, created_at, updated_at
+      FROM lease_actions
+      ORDER BY updated_at DESC
+    `;
+    // Return as a map keyed by lease_id for O(1) frontend lookups
+    const data: Record<string, ReturnType<typeof mapActionRow>> = {};
+    for (const row of rows) {
+      data[row.lease_id] = mapActionRow(row);
+    }
+    res.status(200).json({ success: true, data });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`[${SERVICE_NAME}] GET /api/v1/leases/actions/bulk error:`, message);
+    res.status(500).json({ success: false, error: message });
+  } finally {
+    if (sql) await sql.end();
+  }
+});
+
 // ── GET /api/v1/leases/:id/actions ───────────────────────────────────────────
 // Returns the action state for a lease. If no record exists, returns defaults.
 app.get("/api/v1/leases/:id/actions", async (req: Request, res: Response) => {
