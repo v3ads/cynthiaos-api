@@ -407,6 +407,13 @@ router.get("/jasmine/units/:unit_id", async (req: Request, res: Response) => {
       LEFT JOIN gold_lease_expirations le ON le.unit_id = gu.unit_id
       LEFT JOIN unit_notes un ON un.unit_id = gu.unit_id
       WHERE gu.unit_id = ${unitId}
+      ORDER BY
+        CASE gt.lease_status
+          WHEN 'active'  THEN 0
+          WHEN 'current' THEN 1
+          ELSE 2
+        END ASC,
+        gt.lease_start_date DESC NULLS LAST
       LIMIT 1
     `;
 
