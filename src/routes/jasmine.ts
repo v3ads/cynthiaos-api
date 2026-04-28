@@ -376,6 +376,7 @@ router.get("/jasmine/units/:unit_id", async (req: Request, res: Response) => {
       exclude_from_occupancy: boolean | null;
       tenant_name: string | null;
       tenant_status: string | null;
+      is_primary: boolean | null;
       phone: string | null;
       email: string | null;
       lease_start_date: string | null;
@@ -394,6 +395,7 @@ router.get("/jasmine/units/:unit_id", async (req: Request, res: Response) => {
         gu.exclude_from_occupancy,
         gt.full_name           AS tenant_name,
         gt.lease_status        AS tenant_status,
+        gt.is_primary,
         gt.phone,
         gt.email,
         gt.lease_start_date::text,
@@ -413,6 +415,7 @@ router.get("/jasmine/units/:unit_id", async (req: Request, res: Response) => {
           WHEN 'current' THEN 1
           ELSE 2
         END ASC,
+        gt.is_primary DESC NULLS LAST,
         gt.lease_start_date DESC NULLS LAST
       LIMIT 1
     `;
@@ -593,6 +596,7 @@ router.get("/jasmine/delinquency", async (req: Request, res: Response) => {
     const rows = await sql<{
       unit_id: string;
       tenant_name: string | null;
+      is_primary: boolean | null;
       amount_owed: string | null;
       total_outstanding: string | null;
       days_overdue: number | null;
@@ -604,9 +608,18 @@ router.get("/jasmine/delinquency", async (req: Request, res: Response) => {
           SELECT gt.full_name
           FROM gold_tenants gt
           WHERE gt.unit_id = d.unit_id
-          ORDER BY (gt.lease_status ILIKE '%primary%') DESC, gt.full_name ASC
+            AND gt.lease_status IN ('active', 'current')
+          ORDER BY gt.is_primary DESC NULLS LAST, gt.full_name ASC
           LIMIT 1
         )                              AS tenant_name,
+        (
+          SELECT gt.is_primary
+          FROM gold_tenants gt
+          WHERE gt.unit_id = d.unit_id
+            AND gt.lease_status IN ('active', 'current')
+          ORDER BY gt.is_primary DESC NULLS LAST, gt.full_name ASC
+          LIMIT 1
+        )                              AS is_primary,
         d.balance_due::text            AS amount_owed,
         d.total_outstanding::text      AS total_outstanding,
         d.days_overdue,
@@ -623,6 +636,7 @@ router.get("/jasmine/delinquency", async (req: Request, res: Response) => {
     const delinquencyRows = rows.map(r => ({
       unit_id:           r.unit_id,
       tenant_name:       r.tenant_name,
+      is_primary:        r.is_primary ?? false,
       amount_owed:       r.amount_owed !== null ? parseFloat(r.amount_owed) : null,
       total_outstanding: r.total_outstanding !== null ? parseFloat(r.total_outstanding) : null,
       days_overdue:      r.days_overdue,
@@ -807,6 +821,7 @@ router.get("/jasmine/tenants", async (req: Request, res: Response) => {
       unit_id: string;
       tenant_name: string | null;
       tenant_status: string | null;
+      is_primary: boolean | null;
       phone: string | null;
       email: string | null;
       monthly_rent: string | null;
@@ -832,6 +847,7 @@ router.get("/jasmine/tenants", async (req: Request, res: Response) => {
         gt.unit_id,
         gt.full_name           AS tenant_name,
         gt.lease_status        AS tenant_status,
+        gt.is_primary,
         gt.phone,
         gt.email,
         rl.monthly_rent::text,
@@ -848,6 +864,7 @@ router.get("/jasmine/tenants", async (req: Request, res: Response) => {
       unit_id:          r.unit_id,
       tenant_name:      r.tenant_name,
       tenant_status:    r.tenant_status,
+      is_primary:       r.is_primary ?? false,
       phone:            r.phone,
       email:            r.email,
       monthly_rent:     r.monthly_rent !== null ? parseFloat(r.monthly_rent) : null,
