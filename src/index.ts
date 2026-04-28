@@ -3688,6 +3688,47 @@ app.get("/api/v1/maintenance", async (req: Request, res: Response) => {
   }
 });
 
+// ── POST /api/v1/pipeline/sync — On-demand pipeline trigger ─────────────────
+// Fires the full AppFolio → Bronze → Silver → Gold pipeline immediately.
+// Delegates to the ingestion worker's /pipeline/run endpoint, which runs
+// fetchAndIngestAllReports() + gold drain asynchronously.
+// Returns immediately with a job ID.
+const INGESTION_WORKER_URL_SYNC = process.env.INGESTION_URL ||
+  'https://cynthiaos-ingestion-worker-production-8068.up.railway.app';
+
+app.post('/api/v1/pipeline/sync', async (_req: Request, res: Response) => {
+  const startedAt = new Date().toISOString();
+  const jobId = `sync_${Date.now()}`;
+
+  try {
+    // Delegate to the ingestion worker which has fetchReports.js bundled
+    const ingestionRes = await fetch(`${INGESTION_WORKER_URL_SYNC}/pipeline/run`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+    });
+    const body = await ingestionRes.json() as { success?: boolean; error?: string };
+    if (!ingestionRes.ok || !body.success) {
+      res.status(ingestionRes.status).json({
+        success: false,
+        error: body.error ?? 'Ingestion worker rejected the request',
+      });
+      return;
+    }
+    res.json({
+      success: true,
+      job_id: jobId,
+      started_at: startedAt,
+      message: 'Pipeline sync started. Data will be updated in approximately 5–10 minutes.',
+    });
+  } catch (err) {
+    console.error(`[pipeline/sync] Failed to reach ingestion worker:`, (err as Error).message);
+    res.status(502).json({
+      success: false,
+      error: 'Could not reach the ingestion worker. Please try again.',
+    });
+  }
+});
+
 // ── Jasmine AI Agent Routes ─────────────────────────────────────────────────
 app.use('/api', jasmineRouter);
 app.use('/api', pagesRouter);
