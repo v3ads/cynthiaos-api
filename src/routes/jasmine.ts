@@ -907,6 +907,8 @@ router.get("/jasmine/move-schedule", async (req: Request, res: Response) => {
       move_out_date: string | null;
       monthly_rent: string | null;
     }[]>`
+      -- gold_unit_turnover.move_in_date is NULL (AppFolio move_in_out report not ingested).
+      -- Use gold_tenants.lease_start_date for move-ins and lease_end_date for move-outs instead.
       WITH latest_rr AS (
         SELECT MAX(report_date) AS dt FROM bronze_appfolio_reports WHERE report_type = 'rent_roll'
       ),
@@ -922,29 +924,38 @@ router.get("/jasmine/move-schedule", async (req: Request, res: Response) => {
           AND b.report_date = latest_rr.dt
           AND elem->>'Unit' IS NOT NULL
         ORDER BY LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g'))
+      ),
+      move_ins AS (
+        SELECT gt.unit_id, gt.full_name AS tenant_name,
+               gt.lease_start_date::text AS move_in_date, NULL::text AS move_out_date
+        FROM gold_tenants gt
+        WHERE gt.is_primary = true
+          AND gt.lease_status IN ('future', 'active')
+          AND gt.lease_start_date BETWEEN CURRENT_DATE AND CURRENT_DATE + (${windowDays} || ' days')::interval
+      ),
+      move_outs AS (
+        SELECT gt.unit_id, gt.full_name AS tenant_name,
+               NULL::text AS move_in_date, gt.lease_end_date::text AS move_out_date
+        FROM gold_tenants gt
+        WHERE gt.is_primary = true
+          AND gt.lease_status IN ('active', 'current')
+          AND gt.lease_end_date BETWEEN CURRENT_DATE AND CURRENT_DATE + (${windowDays} || ' days')::interval
+      ),
+      combined AS (
+        SELECT * FROM move_ins  WHERE ${type === null || type === 'in'}
+        UNION ALL
+        SELECT * FROM move_outs WHERE ${type === null || type === 'out'}
       )
       SELECT
-        gut.unit_id,
-        gt.full_name           AS tenant_name,
+        c.unit_id,
+        c.tenant_name,
         rl.unit_type,
-        gut.move_in_date::text,
-        gut.move_out_date::text,
+        c.move_in_date,
+        c.move_out_date,
         rl.monthly_rent::text
-      FROM gold_unit_turnover gut
-      LEFT JOIN gold_tenants gt ON gt.unit_id = gut.unit_id
-      LEFT JOIN rent_lookup  rl ON rl.unit_id = gut.unit_id
-      WHERE (
-        (${type === null || type === 'in'}  AND gut.move_in_date  BETWEEN NOW() AND NOW() + (${windowDays} || ' days')::interval)
-        OR
-        (${type === null || type === 'out'} AND gut.move_out_date BETWEEN NOW() AND NOW() + (${windowDays} || ' days')::interval)
-      )
-      AND NOT (${type === 'in'}  AND gut.move_in_date  IS NULL)
-      AND NOT (${type === 'out'} AND gut.move_out_date IS NULL)
-      ORDER BY
-        CASE
-          WHEN ${type === 'out'} THEN gut.move_out_date
-          ELSE COALESCE(gut.move_in_date, gut.move_out_date)
-        END ASC NULLS LAST
+      FROM combined c
+      LEFT JOIN rent_lookup rl ON rl.unit_id = c.unit_id
+      ORDER BY COALESCE(c.move_in_date, c.move_out_date) ASC NULLS LAST
     `;
 
     const moveScheduleResult = rows.map(r => ({
