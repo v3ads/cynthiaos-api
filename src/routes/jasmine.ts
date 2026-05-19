@@ -883,10 +883,14 @@ router.get("/jasmine/move-schedule", async (req: Request, res: Response) => {
   const type       = req.query.type ? String(req.query.type).toLowerCase() : null;
   const windowDays = Math.min(
     Math.max(parseInt(String(req.query.window_days ?? '30'), 10), 1),
-    365
+    730
   );
-  // Cache only for default window (30 days, no type filter)
-  if (!type && windowDays === 30) {
+  // Support explicit date range for historical queries
+  const startDate = req.query.start_date ? String(req.query.start_date) : null;
+  const endDate   = req.query.end_date   ? String(req.query.end_date)   : null;
+  const useRange  = !!(startDate && endDate);
+  // Cache only for default window (30 days, no type filter, no date range)
+  if (!type && windowDays === 30 && !useRange) {
     const cached = getCached('move-schedule:30');
     if (cached) { res.json(cached); return; }
   }
@@ -931,15 +935,21 @@ router.get("/jasmine/move-schedule", async (req: Request, res: Response) => {
         FROM gold_tenants gt
         WHERE gt.is_primary = true
           AND gt.lease_status IN ('future', 'active')
-          AND gt.lease_start_date BETWEEN CURRENT_DATE AND CURRENT_DATE + (${windowDays} || ' days')::interval
+          AND gt.lease_start_date BETWEEN
+            CASE WHEN ${useRange} THEN ${startDate ?? '1900-01-01'}::date ELSE CURRENT_DATE END
+            AND
+            CASE WHEN ${useRange} THEN ${endDate ?? '2100-01-01'}::date ELSE CURRENT_DATE + (${windowDays} || ' days')::interval END
       ),
       move_outs AS (
         SELECT gt.unit_id, gt.full_name AS tenant_name,
                NULL::text AS move_in_date, gt.lease_end_date::text AS move_out_date
         FROM gold_tenants gt
         WHERE gt.is_primary = true
-          AND gt.lease_status IN ('active', 'current')
-          AND gt.lease_end_date BETWEEN CURRENT_DATE AND CURRENT_DATE + (${windowDays} || ' days')::interval
+          AND gt.lease_status IN ('active', 'current', 'past')
+          AND gt.lease_end_date BETWEEN
+            CASE WHEN ${useRange} THEN ${startDate ?? '1900-01-01'}::date ELSE CURRENT_DATE END
+            AND
+            CASE WHEN ${useRange} THEN ${endDate ?? '2100-01-01'}::date ELSE CURRENT_DATE + (${windowDays} || ' days')::interval END
       ),
       combined AS (
         SELECT * FROM move_ins  WHERE ${type === null || type === 'in'}
@@ -966,7 +976,7 @@ router.get("/jasmine/move-schedule", async (req: Request, res: Response) => {
       move_out_date: r.move_out_date,
       monthly_rent:  r.monthly_rent !== null ? parseFloat(r.monthly_rent) : null,
     }));
-    if (!type && windowDays === 30) responseCache.set('move-schedule:30', moveScheduleResult);
+    if (!type && windowDays === 30 && !useRange) responseCache.set('move-schedule:30', moveScheduleResult);
     res.json(moveScheduleResult);
   } catch (err: unknown) {
     const error = err instanceof Error ? err.message : String(err);
