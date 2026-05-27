@@ -3606,7 +3606,7 @@ app.get("/api/v1/maintenance", async (req: Request, res: Response) => {
       const s = String(v);
       // Handle MM/DD/YYYY or ISO datetime
       const mdy = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})/);
-      if (mdy) return \`\${mdy[3]}-\${mdy[1].padStart(2,'0')}-\${mdy[2].padStart(2,'0')}\`;
+      if (mdy) return `${mdy[3]}-${mdy[1].padStart(2,'0')}-${mdy[2].padStart(2,'0')}`;
       return s.slice(0, 10);
     };
     const workOrders: MaintenanceWorkOrder[] = goldRows.map(r => ({
