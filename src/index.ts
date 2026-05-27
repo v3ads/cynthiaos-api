@@ -3594,32 +3594,32 @@ app.get("/api/v1/maintenance", async (req: Request, res: Response) => {
         work_order_number,
         status,
         priority,
-        unit_name as unit_id,
+        unit_id,
         vendor,
         amount,
         work_order_issue as issue,
         job_description as description,
         primary_tenant,
-        created_at_et as created_at,
-        completed_on_et as completed_on,
-        scheduled_start_et as scheduled_start,
-        scheduled_end_et as scheduled_end,
+        created_at,
+        completed_on,
+        scheduled_start,
+        scheduled_end,
         submitted_by_tenant
       FROM gold_maintenance
       WHERE 1=1
       ${statusFilter   ? sql`AND LOWER(status) LIKE ${'%' + statusFilter + '%'}` : sql``}
       ${priorityFilter ? sql`AND LOWER(priority) LIKE ${'%' + priorityFilter + '%'}` : sql``}
-      ${unitFilter     ? sql`AND unit_name = ${unitFilter}` : sql``}
-      ${fromFilter     ? sql`AND created_at_et >= ${fromFilter}` : sql``}
-      ${toFilter       ? sql`AND created_at_et <= ${toFilter}` : sql``}
-      ORDER BY created_at_et DESC
+      ${unitFilter     ? sql`AND unit_id = ${unitFilter}` : sql``}
+      ${fromFilter     ? sql`AND created_at::date >= ${fromFilter}` : sql``}
+      ${toFilter       ? sql`AND created_at::date <= ${toFilter}` : sql``}
+      ORDER BY created_at DESC NULLS LAST
       LIMIT ${limit}
     `;
 
     const workOrders: MaintenanceWorkOrder[] = goldRows.map(r => ({
       ...r,
       amount: r.amount ? parseFloat(r.amount) : null,
-      created_at: r.created_at ? new Date(r.created_at).toISOString().slice(0, 10) : null,
+      created_at: r.created_at ? String(r.created_at).slice(0, 10) : null,
       completed_on: r.completed_on ? new Date(r.completed_on).toISOString().slice(0, 10) : null,
       scheduled_start: r.scheduled_start ? new Date(r.scheduled_start).toISOString().slice(0, 10) : null,
       scheduled_end: r.scheduled_end ? new Date(r.scheduled_end).toISOString().slice(0, 10) : null,
