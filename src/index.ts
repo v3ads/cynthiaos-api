@@ -3587,16 +3587,41 @@ app.get("/api/v1/maintenance", async (req: Request, res: Response) => {
     const limitParam     = parseInt((req.query.limit as string) || "200", 10);
     const limit          = isNaN(limitParam) || limitParam < 1 ? 200 : Math.min(limitParam, 1000);
 
-    // Pull from Gold Maintenance layer — use SELECT * to avoid column name assumptions.
-    // gold_maintenance was created via a manual migration; exact date column names vary.
+    // Pull from Gold Maintenance layer, enriched with dates from Bronze.
+    // gold_maintenance.created_at is NULL (schema bug) — dates come from bronze work_order.
+    // Bronze stores: created_at='05/18/2026' (MM/DD/YYYY), work_done_on='05/18/2026'.
     const goldRows = await sql<any[]>`
-      SELECT *
-      FROM gold_maintenance
+      WITH latest_wo AS (
+        SELECT MAX(report_date) AS dt FROM bronze_appfolio_reports WHERE report_type = 'work_order'
+      ),
+      bronze_dates AS (
+        SELECT
+          TRIM(elem->>'WorkOrderId')     AS work_order_id,
+          TRIM(elem->>'CreatedAt')       AS created_at_raw,
+          TRIM(elem->>'WorkDoneOn')      AS work_done_on_raw,
+          TRIM(elem->>'ScheduledStart')  AS scheduled_start_raw,
+          TRIM(elem->>'ScheduledEnd')    AS scheduled_end_raw,
+          TRIM(elem->>'Issue')           AS issue_raw
+        FROM bronze_appfolio_reports b,
+             LATERAL jsonb_array_elements(b.raw_data->'results') AS elem,
+             latest_wo
+        WHERE b.report_type = 'work_order'
+          AND b.report_date = latest_wo.dt
+      )
+      SELECT
+        gm.*,
+        bd.created_at_raw,
+        bd.work_done_on_raw,
+        bd.scheduled_start_raw,
+        bd.scheduled_end_raw,
+        COALESCE(gm.issue, bd.issue_raw) AS issue_resolved
+      FROM gold_maintenance gm
+      LEFT JOIN bronze_dates bd ON bd.work_order_id = gm.work_order_id::text
       WHERE 1=1
-      ${statusFilter   ? sql`AND LOWER(status) LIKE ${'%' + statusFilter + '%'}` : sql``}
-      ${priorityFilter ? sql`AND LOWER(priority) LIKE ${'%' + priorityFilter + '%'}` : sql``}
-      ${unitFilter     ? sql`AND unit_id = ${unitFilter}` : sql``}
-      ORDER BY work_order_id DESC
+      ${statusFilter   ? sql`AND LOWER(gm.status) LIKE ${'%' + statusFilter + '%'}` : sql``}
+      ${priorityFilter ? sql`AND LOWER(gm.priority) LIKE ${'%' + priorityFilter + '%'}` : sql``}
+      ${unitFilter     ? sql`AND gm.unit_id = ${unitFilter}` : sql``}
+      ORDER BY gm.work_order_id DESC
       LIMIT ${limit}
     `;
 
@@ -3617,13 +3642,13 @@ app.get("/api/v1/maintenance", async (req: Request, res: Response) => {
       unit_id:             String(r.unit_id  ?? r.unit_name ?? '').trim() || null,
       vendor:              String(r.vendor   ?? '').trim() || null,
       amount:              r.amount ? parseFloat(String(r.amount)) : null,
-      issue:               String(r.issue ?? r.work_order_issue ?? r.work_issue ?? '').trim() || null,
+      issue:               String(r.issue_resolved ?? r.issue ?? r.work_order_issue ?? '').trim() || null,
       description:         String(r.description ?? r.job_description ?? r.notes ?? '').trim() || null,
       primary_tenant:      String(r.primary_tenant ?? r.tenant ?? '').trim() || null,
-      created_at:          toDate(r.created_at ?? r.created_at_et ?? r.date_created ?? r.work_order_date),
-      completed_on:        toDate(r.completed_on ?? r.completed_on_et ?? r.date_completed),
-      scheduled_start:     toDate(r.scheduled_start ?? r.scheduled_start_et ?? r.start_date),
-      scheduled_end:       toDate(r.scheduled_end   ?? r.scheduled_end_et   ?? r.end_date),
+      created_at:          toDate(r.created_at_raw ?? r.created_at ?? r.created_at_et ?? r.date_created),
+      completed_on:        toDate(r.work_done_on_raw ?? r.completed_on ?? r.completed_on_et ?? r.work_done),
+      scheduled_start:     toDate(r.scheduled_start_raw ?? r.scheduled_start ?? r.scheduled_start_et),
+      scheduled_end:       toDate(r.scheduled_end_raw   ?? r.scheduled_end   ?? r.scheduled_end_et),
       submitted_by_tenant: Boolean(r.submitted_by_tenant ?? r.tenant_submitted ?? false),
     }));
 
