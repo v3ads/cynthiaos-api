@@ -3614,7 +3614,7 @@ app.get("/api/v1/maintenance", async (req: Request, res: Response) => {
         bd.work_done_on_raw,
         bd.scheduled_start_raw,
         bd.scheduled_end_raw,
-        COALESCE(gm.issue, bd.issue_raw) AS issue_resolved
+        bd.issue_raw AS issue_resolved
       FROM gold_maintenance gm
       LEFT JOIN bronze_dates bd ON bd.work_order_id = gm.work_order_id::text
       WHERE 1=1
