@@ -3587,83 +3587,48 @@ app.get("/api/v1/maintenance", async (req: Request, res: Response) => {
     const limitParam     = parseInt((req.query.limit as string) || "200", 10);
     const limit          = isNaN(limitParam) || limitParam < 1 ? 200 : Math.min(limitParam, 1000);
 
-    // Pull from the latest Bronze work_order report
-    const bronzeRows = await sql<{ raw_data: Record<string, unknown> }[]>`
-      SELECT raw_data
-      FROM bronze_appfolio_reports
-      WHERE report_type = 'work_order'
-      ORDER BY ingested_at DESC
-      LIMIT 1
+    // Pull from Gold Maintenance layer
+    const goldRows = await sql<any[]>`
+      SELECT 
+        work_order_id,
+        work_order_number,
+        status,
+        priority,
+        unit_name as unit_id,
+        vendor,
+        amount,
+        work_order_issue as issue,
+        job_description as description,
+        primary_tenant,
+        created_at_et as created_at,
+        completed_on_et as completed_on,
+        scheduled_start_et as scheduled_start,
+        scheduled_end_et as scheduled_end,
+        submitted_by_tenant
+      FROM gold_maintenance
+      WHERE 1=1
+      ${statusFilter   ? sql`AND LOWER(status) LIKE ${'%' + statusFilter + '%'}` : sql``}
+      ${priorityFilter ? sql`AND LOWER(priority) LIKE ${'%' + priorityFilter + '%'}` : sql``}
+      ${unitFilter     ? sql`AND unit_name = ${unitFilter}` : sql``}
+      ${fromFilter     ? sql`AND created_at_et >= ${fromFilter}` : sql``}
+      ${toFilter       ? sql`AND created_at_et <= ${toFilter}` : sql``}
+      ORDER BY created_at_et DESC
+      LIMIT ${limit}
     `;
 
-    if (!bronzeRows.length) {
-      return res.status(200).json({
-        success: true,
-        total: 0,
-        source: 'bronze_work_order',
-        data: [],
-        message: 'No work_order report found in Bronze layer',
-      });
-    }
-
-    const raw = bronzeRows[0].raw_data as { results?: Record<string, unknown>[] };
-    const allRows: Record<string, unknown>[] = raw.results ?? [];
-
-    // Parse and filter
-    const parseDate = (s: unknown): string | null => {
-      if (!s || typeof s !== 'string') return null;
-      // AppFolio format: MM/DD/YYYY
-      const m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})/);
-      if (m) return `${m[3]}-${m[1].padStart(2,'0')}-${m[2].padStart(2,'0')}`;
-      return s.slice(0, 10); // fallback: take first 10 chars
-    };
-
-    const parseAmt = (v: unknown): number | null => {
-      if (v == null || v === '') return null;
-      const n = parseFloat(String(v).replace(/,/g, ''));
-      return isNaN(n) ? null : n;
-    };
-
-    const workOrders: MaintenanceWorkOrder[] = [];
-    for (const r of allRows) {
-      const createdAt = parseDate(r.CreatedAt);
-      const status    = String(r.Status    ?? '').trim();
-      const priority  = String(r.Priority  ?? '').trim();
-      const unitName  = String(r.UnitName  ?? '').trim();
-
-      // Apply filters
-      if (statusFilter   && !status.toLowerCase().includes(statusFilter))   continue;
-      if (priorityFilter && !priority.toLowerCase().includes(priorityFilter)) continue;
-      if (unitFilter     && unitName !== unitFilter)                          continue;
-      if (fromFilter     && createdAt && createdAt < fromFilter)              continue;
-      if (toFilter       && createdAt && createdAt > toFilter)                continue;
-
-      workOrders.push({
-        work_order_id:       String(r.WorkOrderId    ?? '').trim() || null,
-        work_order_number:   String(r.WorkOrderNumber ?? '').trim() || null,
-        status:              status  || null,
-        priority:            priority || null,
-        unit_id:             unitName || null,
-        vendor:              String(r.Vendor ?? '').trim() || null,
-        amount:              parseAmt(r.Amount),
-        issue:               String(r.WorkOrderIssue   ?? '').trim() || null,
-        description:         String(r.JobDescription   ?? '').trim() || null,
-        primary_tenant:      String(r.PrimaryTenant    ?? '').trim() || null,
-        created_at:          createdAt,
-        completed_on:        parseDate(r.CompletedOn),
-        scheduled_start:     parseDate(r.ScheduledStart),
-        scheduled_end:       parseDate(r.ScheduledEnd),
-        submitted_by_tenant: r.SubmittedByTenant === true || r.SubmittedByTenant === 'true' || null,
-      });
-
-      if (workOrders.length >= limit) break;
-    }
+    const workOrders: MaintenanceWorkOrder[] = goldRows.map(r => ({
+      ...r,
+      amount: r.amount ? parseFloat(r.amount) : null,
+      created_at: r.created_at ? new Date(r.created_at).toISOString().slice(0, 10) : null,
+      completed_on: r.completed_on ? new Date(r.completed_on).toISOString().slice(0, 10) : null,
+      scheduled_start: r.scheduled_start ? new Date(r.scheduled_start).toISOString().slice(0, 10) : null,
+      scheduled_end: r.scheduled_end ? new Date(r.scheduled_end).toISOString().slice(0, 10) : null,
+    }));
 
     // Summary stats
-    const allFiltered = workOrders;
     const statusCounts: Record<string, number> = {};
     const priorityCounts: Record<string, number> = {};
-    for (const wo of allFiltered) {
+    for (const wo of workOrders) {
       if (wo.status)   statusCounts[wo.status]     = (statusCounts[wo.status]     || 0) + 1;
       if (wo.priority) priorityCounts[wo.priority] = (priorityCounts[wo.priority] || 0) + 1;
     }
@@ -3671,7 +3636,7 @@ app.get("/api/v1/maintenance", async (req: Request, res: Response) => {
     res.status(200).json({
       success: true,
       total: workOrders.length,
-      source: 'bronze_work_order',
+      source: 'gold_maintenance',
       summary: {
         by_status:   statusCounts,
         by_priority: priorityCounts,
