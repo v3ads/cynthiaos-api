@@ -1719,7 +1719,7 @@ cacheLoaders.set('units:all', async () => {
         gu.unit_id,
         gu.unit_status AS status,
         gu.unit_group,
-        tl.tenant_name,
+        tl.full_name AS tenant_name,
         tl.email,
         tl.phone,
         le.lease_end_date::text,
@@ -1732,11 +1732,11 @@ cacheLoaders.set('units:all', async () => {
       LEFT JOIN (
         SELECT DISTINCT ON (unit_id)
           unit_id,
-          tenant_name,
+          full_name AS tenant_name,
           email,
           phone
         FROM gold_tenants
-        ORDER BY unit_id, (tenant_status ILIKE '%primary%') DESC
+        ORDER BY unit_id, (is_primary = true) DESC, (tenant_status ILIKE '%primary%') DESC
       ) tl ON tl.unit_id = gu.unit_id
       LEFT JOIN (
         SELECT
@@ -1773,12 +1773,25 @@ cacheLoaders.set('leases:90', async () => {
   try {
     return await sql`
       SELECT
-        unit_id, tenant_name, email, phone,
-        lease_end_date::text, days_until_expiration, monthly_rent, market_rent
-      FROM gold_lease_expirations
-      WHERE days_until_expiration >= 0
-        AND days_until_expiration <= 90
-      ORDER BY days_until_expiration ASC
+        le.unit_id,
+        gt.full_name AS tenant_name,
+        gt.email,
+        gt.phone,
+        le.lease_end_date::text,
+        le.days_until_expiration,
+        NULL::numeric AS monthly_rent,
+        NULL::numeric AS market_rent
+      FROM gold_lease_expirations le
+      LEFT JOIN LATERAL (
+        SELECT full_name, email, phone
+        FROM gold_tenants
+        WHERE unit_id = le.unit_id
+        ORDER BY (is_primary = true) DESC
+        LIMIT 1
+      ) gt ON true
+      WHERE le.days_until_expiration >= 0
+        AND le.days_until_expiration <= 90
+      ORDER BY le.days_until_expiration ASC
     `;
   } finally { await sql.end(); }
 });
@@ -1786,11 +1799,26 @@ cacheLoaders.set('leases:90', async () => {
 cacheLoaders.set('notices', async () => {
   const sql = getDb();
   try {
+    // Units on notice: join gold_units (has unit_status) with lease and tenant data
     return await sql`
-      SELECT unit_id, tenant_name, email, phone, lease_end_date::text, days_until_expiration
-      FROM gold_lease_expirations
-      WHERE tenant_status ILIKE '%notice%'
-      ORDER BY lease_end_date ASC
+      SELECT
+        gu.unit_id,
+        gt.full_name AS tenant_name,
+        gt.email,
+        gt.phone,
+        le.lease_end_date::text,
+        le.days_until_expiration
+      FROM gold_units gu
+      LEFT JOIN gold_lease_expirations le ON le.unit_id = gu.unit_id
+      LEFT JOIN LATERAL (
+        SELECT full_name, email, phone
+        FROM gold_tenants
+        WHERE unit_id = gu.unit_id
+        ORDER BY (is_primary = true) DESC
+        LIMIT 1
+      ) gt ON true
+      WHERE gu.unit_status ILIKE '%notice%'
+      ORDER BY le.lease_end_date ASC NULLS LAST
     `;
   } finally { await sql.end(); }
 });
@@ -1800,10 +1828,23 @@ cacheLoaders.set('delinquency:all', async () => {
   try {
     return await sql`
       SELECT
-        unit_id, tenant_name, email, phone,
-        balance::text, days_overdue, risk_level
-      FROM gold_collections_risk
-      ORDER BY balance DESC
+        dr.unit_id,
+        gt.full_name AS tenant_name,
+        gt.email,
+        gt.phone,
+        dr.balance_due::text AS balance,
+        dr.days_overdue,
+        dr.risk_level
+      FROM gold_delinquency_records dr
+      LEFT JOIN LATERAL (
+        SELECT full_name, email, phone
+        FROM gold_tenants
+        WHERE unit_id = dr.unit_id
+        ORDER BY (is_primary = true) DESC
+        LIMIT 1
+      ) gt ON true
+      WHERE dr.balance_due > 0
+      ORDER BY dr.balance_due DESC
     `;
   } finally { await sql.end(); }
 });
@@ -1813,18 +1854,36 @@ cacheLoaders.set('below-market:5', async () => {
   try {
     const excluded = excludedUnitIds;
     return await sql`
+      -- gold_lease_expirations has no tenant_name/market_rent/monthly_rent.
+      -- Use gold_units + gold_tenants + bronze rent_roll for rent data.
       SELECT
-        le.unit_id,
-        le.tenant_name,
-        le.monthly_rent,
-        le.market_rent,
-        ROUND(((le.market_rent - le.monthly_rent) / NULLIF(le.market_rent, 0)) * 100, 1)::float AS percent_below
-      FROM gold_lease_expirations le
-      WHERE le.market_rent IS NOT NULL
-        AND le.monthly_rent IS NOT NULL
-        AND le.market_rent > le.monthly_rent
-        AND le.unit_id NOT IN (SELECT unit_id FROM jasmine_unit_overrides WHERE exclude_from_revenue = true)
-        AND ROUND(((le.market_rent - le.monthly_rent) / NULLIF(le.market_rent, 0)) * 100, 1) >= 5
+        gu.unit_id,
+        gt.full_name AS tenant_name,
+        rr.monthly_rent,
+        rr.market_rent,
+        ROUND(((rr.market_rent - rr.monthly_rent) / NULLIF(rr.market_rent, 0)) * 100, 1)::float AS percent_below
+      FROM gold_units gu
+      LEFT JOIN LATERAL (
+        SELECT full_name FROM gold_tenants WHERE unit_id = gu.unit_id
+        ORDER BY (is_primary = true) DESC LIMIT 1
+      ) gt ON true
+      LEFT JOIN LATERAL (
+        SELECT
+          NULLIF(REPLACE(elem->>'Rent', ',', ''), '')::numeric          AS monthly_rent,
+          NULLIF(REPLACE(elem->>'MarketRent', ',', ''), '')::numeric    AS market_rent
+        FROM bronze_appfolio_reports b,
+             LATERAL jsonb_array_elements(b.raw_data->'results') AS elem
+        WHERE b.report_type = 'rent_roll'
+          AND b.report_date = (SELECT MAX(report_date) FROM bronze_appfolio_reports WHERE report_type = 'rent_roll')
+          AND LOWER(REGEXP_REPLACE(elem->>'Unit','[^a-zA-Z0-9]','','g')) = gu.unit_id
+          AND elem->>'Status' ILIKE '%current%'
+        LIMIT 1
+      ) rr ON true
+      WHERE rr.market_rent IS NOT NULL
+        AND rr.monthly_rent IS NOT NULL
+        AND rr.market_rent > rr.monthly_rent
+        AND gu.unit_id NOT IN (SELECT unit_id FROM jasmine_unit_overrides WHERE exclude_from_revenue = true)
+        AND ROUND(((rr.market_rent - rr.monthly_rent) / NULLIF(rr.market_rent, 0)) * 100, 1) >= 5
       ORDER BY percent_below DESC
     `;
   } finally { await sql.end(); }
