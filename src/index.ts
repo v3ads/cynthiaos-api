@@ -3587,42 +3587,44 @@ app.get("/api/v1/maintenance", async (req: Request, res: Response) => {
     const limitParam     = parseInt((req.query.limit as string) || "200", 10);
     const limit          = isNaN(limitParam) || limitParam < 1 ? 200 : Math.min(limitParam, 1000);
 
-    // Pull from Gold Maintenance layer
+    // Pull from Gold Maintenance layer — use SELECT * to avoid column name assumptions.
+    // gold_maintenance was created via a manual migration; exact date column names vary.
     const goldRows = await sql<any[]>`
-      SELECT 
-        work_order_id,
-        work_order_number,
-        status,
-        priority,
-        unit_id,
-        vendor,
-        amount,
-        work_order_issue as issue,
-        job_description as description,
-        primary_tenant,
-        created_at,
-        completed_on,
-        scheduled_start,
-        scheduled_end,
-        submitted_by_tenant
+      SELECT *
       FROM gold_maintenance
       WHERE 1=1
       ${statusFilter   ? sql`AND LOWER(status) LIKE ${'%' + statusFilter + '%'}` : sql``}
       ${priorityFilter ? sql`AND LOWER(priority) LIKE ${'%' + priorityFilter + '%'}` : sql``}
       ${unitFilter     ? sql`AND unit_id = ${unitFilter}` : sql``}
-      ${fromFilter     ? sql`AND created_at::date >= ${fromFilter}` : sql``}
-      ${toFilter       ? sql`AND created_at::date <= ${toFilter}` : sql``}
-      ORDER BY created_at DESC NULLS LAST
+      ORDER BY work_order_id DESC
       LIMIT ${limit}
     `;
 
+    // Dynamically normalise fields — handles any date column naming convention
+    const toDate = (v: unknown): string | null => {
+      if (!v) return null;
+      const s = String(v);
+      // Handle MM/DD/YYYY or ISO datetime
+      const mdy = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})/);
+      if (mdy) return \`\${mdy[3]}-\${mdy[1].padStart(2,'0')}-\${mdy[2].padStart(2,'0')}\`;
+      return s.slice(0, 10);
+    };
     const workOrders: MaintenanceWorkOrder[] = goldRows.map(r => ({
-      ...r,
-      amount: r.amount ? parseFloat(r.amount) : null,
-      created_at: r.created_at ? String(r.created_at).slice(0, 10) : null,
-      completed_on: r.completed_on ? new Date(r.completed_on).toISOString().slice(0, 10) : null,
-      scheduled_start: r.scheduled_start ? new Date(r.scheduled_start).toISOString().slice(0, 10) : null,
-      scheduled_end: r.scheduled_end ? new Date(r.scheduled_end).toISOString().slice(0, 10) : null,
+      work_order_id:       String(r.work_order_id    ?? r.id ?? '').trim() || null,
+      work_order_number:   String(r.work_order_number ?? '').trim() || null,
+      status:              String(r.status   ?? '').trim() || null,
+      priority:            String(r.priority ?? '').trim() || null,
+      unit_id:             String(r.unit_id  ?? r.unit_name ?? '').trim() || null,
+      vendor:              String(r.vendor   ?? '').trim() || null,
+      amount:              r.amount ? parseFloat(String(r.amount)) : null,
+      issue:               String(r.issue ?? r.work_order_issue ?? r.work_issue ?? '').trim() || null,
+      description:         String(r.description ?? r.job_description ?? r.notes ?? '').trim() || null,
+      primary_tenant:      String(r.primary_tenant ?? r.tenant ?? '').trim() || null,
+      created_at:          toDate(r.created_at ?? r.created_at_et ?? r.date_created ?? r.work_order_date),
+      completed_on:        toDate(r.completed_on ?? r.completed_on_et ?? r.date_completed),
+      scheduled_start:     toDate(r.scheduled_start ?? r.scheduled_start_et ?? r.start_date),
+      scheduled_end:       toDate(r.scheduled_end   ?? r.scheduled_end_et   ?? r.end_date),
+      submitted_by_tenant: Boolean(r.submitted_by_tenant ?? r.tenant_submitted ?? false),
     }));
 
     // Summary stats
