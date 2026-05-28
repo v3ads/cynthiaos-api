@@ -3587,15 +3587,37 @@ app.get("/api/v1/maintenance", async (req: Request, res: Response) => {
     const limitParam     = parseInt((req.query.limit as string) || "200", 10);
     const limit          = isNaN(limitParam) || limitParam < 1 ? 200 : Math.min(limitParam, 1000);
 
-    // Pull from Gold Maintenance — created_at, work_done_on, issue now native Gold columns
+    // Pull from Gold Maintenance with bronze fallback for created_at.
+    // gold_maintenance.created_at is populated by the new strategy but existing
+    // rows may still be NULL — bronze JOIN provides the fallback until backfilled.
     const goldRows = await sql<any[]>`
-      SELECT *
-      FROM gold_maintenance
+      WITH latest_wo AS (
+        SELECT MAX(report_date) AS dt
+        FROM bronze_appfolio_reports WHERE report_type = 'work_order'
+      ),
+      bronze_dates AS (
+        SELECT
+          TRIM(elem->>'WorkOrderId') AS work_order_id,
+          TRIM(elem->>'CreatedAt')   AS created_at_raw,
+          TRIM(elem->>'WorkDoneOn')  AS work_done_on_raw,
+          TRIM(elem->>'Issue')       AS issue_raw
+        FROM bronze_appfolio_reports b,
+             LATERAL jsonb_array_elements(b.raw_data->'results') AS elem,
+             latest_wo
+        WHERE b.report_type = 'work_order' AND b.report_date = latest_wo.dt
+      )
+      SELECT
+        gm.*,
+        COALESCE(gm.created_at::text, bd.created_at_raw)  AS created_at_resolved,
+        COALESCE(gm.work_done_on::text, bd.work_done_on_raw) AS work_done_on_resolved,
+        COALESCE(gm.issue, bd.issue_raw) AS issue_resolved
+      FROM gold_maintenance gm
+      LEFT JOIN bronze_dates bd ON bd.work_order_id = gm.work_order_id::text
       WHERE 1=1
-      ${statusFilter   ? sql`AND LOWER(status) LIKE ${'%' + statusFilter + '%'}` : sql``}
-      ${priorityFilter ? sql`AND LOWER(priority) LIKE ${'%' + priorityFilter + '%'}` : sql``}
-      ${unitFilter     ? sql`AND unit_id = ${unitFilter}` : sql``}
-      ORDER BY work_order_id DESC
+      ${statusFilter   ? sql`AND LOWER(gm.status) LIKE ${'%' + statusFilter + '%'}` : sql``}
+      ${priorityFilter ? sql`AND LOWER(gm.priority) LIKE ${'%' + priorityFilter + '%'}` : sql``}
+      ${unitFilter     ? sql`AND gm.unit_id = ${unitFilter}` : sql``}
+      ORDER BY gm.work_order_id DESC
       LIMIT ${limit}
     `;
 
@@ -3616,11 +3638,11 @@ app.get("/api/v1/maintenance", async (req: Request, res: Response) => {
       unit_id:             String(r.unit_id  ?? r.unit_name ?? '').trim() || null,
       vendor:              String(r.vendor   ?? '').trim() || null,
       amount:              r.amount ? parseFloat(String(r.amount)) : null,
-      issue:               String(r.issue ?? r.work_order_issue ?? '').trim() || null,
+      issue:               String(r.issue_resolved ?? r.issue ?? r.work_order_issue ?? '').trim() || null,
       description:         String(r.description ?? r.job_description ?? r.notes ?? '').trim() || null,
       primary_tenant:      String(r.primary_tenant ?? r.tenant ?? '').trim() || null,
-      created_at:          toDate(r.created_at ?? r.date_created),
-      completed_on:        toDate(r.work_done_on ?? r.completed_on ?? r.work_done),
+      created_at:          toDate(r.created_at_resolved ?? r.created_at ?? r.date_created),
+      completed_on:        toDate(r.work_done_on_resolved ?? r.work_done_on ?? r.completed_on),
       scheduled_start:     toDate(r.scheduled_start),
       scheduled_end:       toDate(r.scheduled_end),
       submitted_by_tenant: Boolean(r.submitted_by_tenant ?? r.tenant_submitted ?? false),
