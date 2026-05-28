@@ -3592,19 +3592,24 @@ app.get("/api/v1/maintenance", async (req: Request, res: Response) => {
     // rows may still be NULL — bronze JOIN provides the fallback until backfilled.
     const goldRows = await sql<any[]>`
       WITH latest_wo AS (
-        SELECT MAX(report_date) AS dt
-        FROM bronze_appfolio_reports WHERE report_type = 'work_order'
+        -- Pick the single most-recently INGESTED work_order report, not all
+        -- reports sharing the latest report_date (multiple same-day runs would
+        -- otherwise multiply rows via the LATERAL unnest below).
+        SELECT id
+        FROM bronze_appfolio_reports
+        WHERE report_type = 'work_order'
+        ORDER BY ingested_at DESC
+        LIMIT 1
       ),
       bronze_dates AS (
-        SELECT
+        SELECT DISTINCT ON (TRIM(elem->>'WorkOrderId'))
           TRIM(elem->>'WorkOrderId') AS work_order_id,
           TRIM(elem->>'CreatedAt')   AS created_at_raw,
           TRIM(elem->>'WorkDoneOn')  AS work_done_on_raw,
           TRIM(elem->>'Issue')       AS issue_raw
         FROM bronze_appfolio_reports b,
-             LATERAL jsonb_array_elements(b.raw_data->'results') AS elem,
-             latest_wo
-        WHERE b.report_type = 'work_order' AND b.report_date = latest_wo.dt
+             LATERAL jsonb_array_elements(b.raw_data->'results') AS elem
+        WHERE b.id = (SELECT id FROM latest_wo)
       )
       SELECT
         gm.*,
