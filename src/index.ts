@@ -3688,35 +3688,62 @@ app.get("/api/v1/maintenance", async (req: Request, res: Response) => {
 const CRON_WORKER_URL_SYNC = process.env.CRON_WORKER_URL ||
   'https://cynthiaos-cron-worker-production.up.railway.app';
 
+const TRANSFORM_WORKER_URL = process.env.TRANSFORM_WORKER_URL ||
+  'https://cynthiaos-transform-worker-production.up.railway.app';
+
+// ── POST /api/v1/pipeline/sync ────────────────────────────────────────────────
+// Sync Now button: triggers Gold promotion on the transform worker.
+// This re-promotes all pending Silver → Gold records instantly (~5-10s).
+// A full AppFolio re-fetch (which ingests new data from AppFolio) is handled
+// by the daily 6 AM ET cron job, or via Railway's "Run Now" on the cron-worker.
 app.post('/api/v1/pipeline/sync', async (_req: Request, res: Response) => {
   const startedAt = new Date().toISOString();
   const jobId = `sync_${Date.now()}`;
 
   try {
-    const cronRes = await fetch(`${CRON_WORKER_URL_SYNC}/run`, {
+    // Run Gold promotion on the transform worker — always available, responds in <10s
+    const goldRes = await fetch(`${TRANSFORM_WORKER_URL}/gold/run`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
+      signal: AbortSignal.timeout(30_000),
     });
-    const body = await cronRes.json() as { success?: boolean; error?: string; message?: string };
-    if (!cronRes.ok || !body.success) {
-      res.status(cronRes.status).json({
-        success: false,
-        error: body.error ?? 'Cron worker rejected the request',
-      });
+
+    if (!goldRes.ok) {
+      const errText = await goldRes.text().catch(() => '');
+      res.status(502).json({ success: false, error: `Transform worker error: ${errText || goldRes.status}` });
       return;
     }
+
+    const body = await goldRes.json() as {
+      success?: boolean;
+      processed?: boolean;
+      reason?: string;
+      integrity?: { all_passed?: boolean; checks?: Array<{ table?: string; actual?: number; passed?: boolean }> };
+    };
+
+    // Build a human-readable summary of Gold record counts
+    const counts: Record<string, number> = {};
+    for (const c of (body.integrity?.checks ?? [])) {
+      if (c.table && typeof c.actual === 'number') counts[c.table] = c.actual;
+    }
+
+    const message = body.processed
+      ? 'Gold data promoted — dashboard will reflect the latest data.'
+      : 'Gold data is already current — no new records to promote.';
+
     res.json({
       success: true,
       job_id: jobId,
       started_at: startedAt,
-      message: body.message ?? 'Pipeline sync started. Data will be updated in approximately 5–10 minutes.',
+      message,
+      gold_counts: counts,
+      integrity_passed: body.integrity?.all_passed ?? null,
     });
+
   } catch (err) {
-    console.error(`[pipeline/sync] Failed to reach cron worker:`, (err as Error).message);
-    res.status(502).json({
-      success: false,
-      error: 'Could not reach the pipeline worker. Please try again.',
-    });
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`[pipeline/sync] Transform worker error:`, msg);
+    res.status(502).json({ success: false, error: 'Could not reach the transform worker. Please try again.' });
   }
 });
 
