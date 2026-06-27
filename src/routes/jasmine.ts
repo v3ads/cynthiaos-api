@@ -477,22 +477,22 @@ router.get("/jasmine/leases", async (req: Request, res: Response) => {
       )
       SELECT
         le.unit_id,
-        gt.full_name           AS tenant_name,
+        gt.full_name                                          AS tenant_name,
         rl.unit_type,
         le.lease_end_date::text,
-        le.days_until_expiration,
-        rl.monthly_rent::text,
+        (le.lease_end_date - CURRENT_DATE)::int               AS days_until_expiration,
+        rl.monthly_rent::text                                  AS monthly_rent,
         gt.phone,
         gt.email
       FROM gold_lease_expirations le
       LEFT JOIN gold_tenants gt ON gt.unit_id = le.unit_id
       LEFT JOIN rent_lookup  rl ON rl.unit_id = le.unit_id
-      WHERE le.days_until_expiration >= 0
-        AND le.days_until_expiration <= ${windowDays}
-      ORDER BY le.days_until_expiration ASC
+      WHERE le.lease_end_date >= CURRENT_DATE
+        AND le.lease_end_date <= CURRENT_DATE + (${windowDays} || ' days')::INTERVAL
+      ORDER BY le.lease_end_date ASC
     `;
 
-     const leasesResult = rows.map(r => ({
+    const leasesResult = rows.map(r => ({
       unit_id:               r.unit_id,
       tenant_name:           r.tenant_name,
       unit_type:             r.unit_type,
