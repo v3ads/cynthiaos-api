@@ -400,7 +400,7 @@ router.get("/jasmine/units/:unit_id", async (req: Request, res: Response) => {
         gt.email,
         gt.lease_start_date::text,
         COALESCE(le.lease_end_date::text, gt.lease_end_date::text) AS lease_end_date,
-        le.days_until_expiration,
+        (COALESCE(le.lease_end_date, gt.lease_end_date::date) - CURRENT_DATE)::int AS days_until_expiration,
         un.notes,
         un.contacted           AS contact_status,
         un.flagged
@@ -1009,14 +1009,14 @@ router.get("/jasmine/tasks", async (_req: Request, res: Response) => {
         le.unit_id,
         gt.full_name           AS tenant_name,
         le.lease_end_date::text,
-        le.days_until_expiration,
+        (le.lease_end_date - CURRENT_DATE)::int AS days_until_expiration,
         gt.phone,
         gt.email
       FROM gold_lease_expirations le
       LEFT JOIN gold_tenants gt ON gt.unit_id = le.unit_id
-      WHERE le.days_until_expiration >= 0
-        AND le.days_until_expiration <= 60
-      ORDER BY le.days_until_expiration ASC
+      WHERE le.lease_end_date >= CURRENT_DATE
+        AND le.lease_end_date <= CURRENT_DATE + INTERVAL '60 days'
+      ORDER BY le.lease_end_date ASC
     `;
 
     const tasks = rows.map((r, idx) => {
@@ -1723,7 +1723,7 @@ cacheLoaders.set('units:all', async () => {
         tl.email,
         tl.phone,
         le.lease_end_date::text,
-        le.days_until_expiration,
+        (le.lease_end_date - CURRENT_DATE)::int AS days_until_expiration,
         le.monthly_rent,
         le.market_rent,
         uv.days_vacant
@@ -1778,7 +1778,7 @@ cacheLoaders.set('leases:90', async () => {
         gt.email,
         gt.phone,
         le.lease_end_date::text,
-        le.days_until_expiration,
+        (le.lease_end_date - CURRENT_DATE)::int AS days_until_expiration,
         NULL::numeric AS monthly_rent,
         NULL::numeric AS market_rent
       FROM gold_lease_expirations le
@@ -1789,9 +1789,9 @@ cacheLoaders.set('leases:90', async () => {
         ORDER BY (is_primary = true) DESC
         LIMIT 1
       ) gt ON true
-      WHERE le.days_until_expiration >= 0
-        AND le.days_until_expiration <= 90
-      ORDER BY le.days_until_expiration ASC
+      WHERE le.lease_end_date >= CURRENT_DATE
+        AND le.lease_end_date <= CURRENT_DATE + INTERVAL '90 days'
+      ORDER BY le.lease_end_date ASC
     `;
   } finally { await sql.end(); }
 });
@@ -1953,14 +1953,14 @@ cacheLoaders.set('tasks', async () => {
         le.unit_id,
         gt.full_name           AS tenant_name,
         le.lease_end_date::text,
-        le.days_until_expiration,
+        (le.lease_end_date - CURRENT_DATE)::int AS days_until_expiration,
         gt.phone,
         gt.email
       FROM gold_lease_expirations le
       LEFT JOIN gold_tenants gt ON gt.unit_id = le.unit_id
-      WHERE le.days_until_expiration >= 0
-        AND le.days_until_expiration <= 60
-      ORDER BY le.days_until_expiration ASC
+      WHERE le.lease_end_date >= CURRENT_DATE
+        AND le.lease_end_date <= CURRENT_DATE + INTERVAL '60 days'
+      ORDER BY le.lease_end_date ASC
     `;
     const tasks = rows.map(r => {
       const days = r.days_until_expiration ?? 999;
