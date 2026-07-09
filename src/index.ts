@@ -1665,9 +1665,22 @@ app.get("/api/v1/insights/at-risk-revenue", async (req: Request, res: Response) 
 // LEFT JOIN gold_delinquency_records ON le.tenant_id = d.tenant_id
 // LEFT JOIN gold_aged_receivables  ON le.tenant_id = ar.tenant_id
 //
+// Renewal/move-in verification:
+//   A lease is excluded from risk if the unit has been resolved via one of:
+//   1. Renewal   — gold_tenants has an active-status tenant on the same unit
+//                  with a lease_end_date > CURRENT_DATE (same or new tenant)
+//   2. New move-in — gold_unit_turnover has a move_in event for the unit
+//                    with move_in_date >= the expired lease_end_date
+//   Only truly unresolved expired/expiring leases are surfaced.
+//
+// days_until_expiration derivation:
+//   Computed live from lease_end_date vs CURRENT_DATE so stale ingested values
+//   never cause past leases to appear as future risks.
+//
 // expiration_risk derivation:
-//   HIGH   → days_until_expiration <= 60 AND (risk_score >= 2000 OR delinquency_level IS NOT NULL)
-//   MEDIUM → days_until_expiration <= 90
+//   HIGH   → live_days_until <= 60 AND (risk_score >= 2000 OR delinquency_level IS NOT NULL)
+//          OR live_days_until < 0  (already expired, unresolved)
+//   MEDIUM → live_days_until <= 90
 //   LOW    → otherwise
 
 interface LeaseExpirationRiskRow {
@@ -1680,6 +1693,7 @@ interface LeaseExpirationRiskRow {
   days_overdue:          number | null;
   delinquency_level:     string | null;
   expiration_risk:       string;
+  is_overdue:            boolean;
 }
 
 app.get("/api/v1/insights/lease-expiration-risk", async (req: Request, res: Response) => {
@@ -1699,14 +1713,39 @@ app.get("/api/v1/insights/lease-expiration-risk", async (req: Request, res: Resp
 
     const baseQuery = sql<LeaseExpirationRiskRow[]>`
       WITH
+      -- ── Step 1: deduplicate lease expirations, compute live days_until ──────
       le_deduped AS (
-        SELECT DISTINCT ON (tenant_id)
+        SELECT DISTINCT ON (unit_id)
           tenant_id, unit_id,
           lease_end_date::text AS lease_end_date,
-          days_until_expiration
+          -- Live calculation: ignore stale ingested value
+          (lease_end_date::date - CURRENT_DATE)::int AS live_days_until
         FROM gold_lease_expirations
-        ORDER BY tenant_id, lease_end_date ASC, created_at DESC
+        WHERE lease_end_date IS NOT NULL
+        ORDER BY unit_id, lease_end_date ASC, created_at DESC
       ),
+      -- ── Step 2: detect renewed leases ────────────────────────────────────────
+      -- A unit is considered renewed if gold_tenants has an active-status
+      -- tenant on that unit whose lease_end_date is in the future.
+      renewed_units AS (
+        SELECT DISTINCT unit_id
+        FROM gold_tenants
+        WHERE lease_status = 'active'
+          AND lease_end_date IS NOT NULL
+          AND lease_end_date::date > CURRENT_DATE
+      ),
+      -- ── Step 3: detect new move-ins after lease expiry ────────────────────────
+      -- A unit is resolved if a move_in event occurred on or after the
+      -- expired lease_end_date (covers re-leasing to a new tenant).
+      moved_in_units AS (
+        SELECT DISTINCT t.unit_id
+        FROM gold_unit_turnover t
+        INNER JOIN le_deduped le ON le.unit_id = t.unit_id
+        WHERE t.event_type = 'move_in'
+          AND t.move_in_date IS NOT NULL
+          AND t.move_in_date::date >= le.lease_end_date::date
+      ),
+      -- ── Step 4: financial enrichment CTEs ────────────────────────────────────
       ar_deduped AS (
         SELECT DISTINCT ON (tenant_id)
           tenant_id, unit_id AS ar_unit_id,
@@ -1726,21 +1765,27 @@ app.get("/api/v1/insights/lease-expiration-risk", async (req: Request, res: Resp
         FROM gold_tenants
         ORDER BY tenant_id, updated_at DESC
       ),
+      -- ── Step 5: join and classify risk ───────────────────────────────────────
       joined AS (
         SELECT
           le.tenant_id,
           COALESCE(t.full_name, le.tenant_id)         AS full_name,
           COALESCE(le.unit_id, ar.ar_unit_id)         AS unit_id,
           le.lease_end_date,
-          le.days_until_expiration,
+          le.live_days_until                          AS days_until_expiration,
           ar.risk_score,
           d.days_overdue,
           d.delinquency_level,
+          -- Overdue = lease already expired and unresolved
+          (le.live_days_until < 0)                    AS is_overdue,
           CASE
-            WHEN le.days_until_expiration <= 60
+            -- Already expired (past lease end) and unresolved → always HIGH
+            WHEN le.live_days_until < 0
+            THEN 'HIGH'
+            WHEN le.live_days_until <= 60
                  AND (ar.risk_score >= 2000 OR d.delinquency_level IS NOT NULL)
             THEN 'HIGH'
-            WHEN le.days_until_expiration <= 90
+            WHEN le.live_days_until <= 90
             THEN 'MEDIUM'
             WHEN ar.risk_score >= 2000 OR d.delinquency_level IS NOT NULL
             THEN 'HIGH'
@@ -1750,14 +1795,20 @@ app.get("/api/v1/insights/lease-expiration-risk", async (req: Request, res: Resp
         LEFT JOIN t_deduped  t  ON le.tenant_id = t.tenant_id
         LEFT JOIN ar_deduped ar ON le.tenant_id = ar.tenant_id
         LEFT JOIN d_deduped  d  ON le.tenant_id = d.tenant_id
+        -- Exclude units that have been renewed or re-leased
+        WHERE le.unit_id NOT IN (SELECT unit_id FROM renewed_units)
+          AND le.unit_id NOT IN (SELECT unit_id FROM moved_in_units)
       )
       SELECT *
       FROM joined
       WHERE
-        days_until_expiration > 0
+        -- Include both upcoming expirations and already-expired unresolved leases
+        (days_until_expiration <= 90 OR is_overdue = TRUE)
         AND ${riskFilter ? sql`expiration_risk = ${riskFilter}` : sql`TRUE`}
         AND ${daysWindow ? sql`days_until_expiration <= ${daysWindow}` : sql`TRUE`}
       ORDER BY
+        -- Overdue (past) leases surface first, then by urgency
+        is_overdue DESC,
         CASE expiration_risk WHEN 'HIGH' THEN 1 WHEN 'MEDIUM' THEN 2 ELSE 3 END,
         days_until_expiration ASC NULLS LAST,
         risk_score DESC NULLS LAST,
@@ -1768,10 +1819,28 @@ app.get("/api/v1/insights/lease-expiration-risk", async (req: Request, res: Resp
     const countQuery = sql<{ count: string }[]>`
       WITH
       le_deduped AS (
-        SELECT DISTINCT ON (tenant_id)
-          tenant_id, days_until_expiration
+        SELECT DISTINCT ON (unit_id)
+          tenant_id, unit_id,
+          lease_end_date::text AS lease_end_date,
+          (lease_end_date::date - CURRENT_DATE)::int AS live_days_until
         FROM gold_lease_expirations
-        ORDER BY tenant_id, lease_end_date ASC, created_at DESC
+        WHERE lease_end_date IS NOT NULL
+        ORDER BY unit_id, lease_end_date ASC, created_at DESC
+      ),
+      renewed_units AS (
+        SELECT DISTINCT unit_id
+        FROM gold_tenants
+        WHERE lease_status = 'active'
+          AND lease_end_date IS NOT NULL
+          AND lease_end_date::date > CURRENT_DATE
+      ),
+      moved_in_units AS (
+        SELECT DISTINCT t.unit_id
+        FROM gold_unit_turnover t
+        INNER JOIN le_deduped le ON le.unit_id = t.unit_id
+        WHERE t.event_type = 'move_in'
+          AND t.move_in_date IS NOT NULL
+          AND t.move_in_date::date >= le.lease_end_date::date
       ),
       ar_deduped AS (
         SELECT DISTINCT ON (tenant_id)
@@ -1788,14 +1857,18 @@ app.get("/api/v1/insights/lease-expiration-risk", async (req: Request, res: Resp
       joined AS (
         SELECT
           le.tenant_id,
-          le.days_until_expiration,
+          le.unit_id,
+          le.live_days_until                          AS days_until_expiration,
+          (le.live_days_until < 0)                    AS is_overdue,
           ar.risk_score,
           d.delinquency_level,
           CASE
-            WHEN le.days_until_expiration <= 60
+            WHEN le.live_days_until < 0
+            THEN 'HIGH'
+            WHEN le.live_days_until <= 60
                  AND (ar.risk_score >= 2000 OR d.delinquency_level IS NOT NULL)
             THEN 'HIGH'
-            WHEN le.days_until_expiration <= 90
+            WHEN le.live_days_until <= 90
             THEN 'MEDIUM'
             WHEN ar.risk_score >= 2000 OR d.delinquency_level IS NOT NULL
             THEN 'HIGH'
@@ -1804,11 +1877,13 @@ app.get("/api/v1/insights/lease-expiration-risk", async (req: Request, res: Resp
         FROM le_deduped le
         LEFT JOIN ar_deduped ar ON le.tenant_id = ar.tenant_id
         LEFT JOIN d_deduped  d  ON le.tenant_id = d.tenant_id
+        WHERE le.unit_id NOT IN (SELECT unit_id FROM renewed_units)
+          AND le.unit_id NOT IN (SELECT unit_id FROM moved_in_units)
       )
       SELECT COUNT(*) AS count
       FROM joined
       WHERE
-        days_until_expiration > 0
+        (days_until_expiration <= 90 OR is_overdue = TRUE)
         AND ${riskFilter ? sql`expiration_risk = ${riskFilter}` : sql`TRUE`}
         AND ${daysWindow ? sql`days_until_expiration <= ${daysWindow}` : sql`TRUE`}
     `;
@@ -1834,6 +1909,7 @@ app.get("/api/v1/insights/lease-expiration-risk", async (req: Request, res: Resp
         days_overdue:          r.days_overdue,
         delinquency_level:     r.delinquency_level,
         expiration_risk:       r.expiration_risk,
+        is_overdue:            r.is_overdue ?? false,  // true = lease already expired and unresolved
       })),
     });
   } catch (err: unknown) {
