@@ -3266,7 +3266,7 @@ app.get("/api/v1/units", async (_req: Request, res: Response) => {
   try {
     sql = getDb();
     // Enrich unit_status from the latest unit_vacancy Bronze report
-    const rows = await sql<{ unit_id: string; unit_status: string | null; created_at: string }[]>`
+    const rows = await sql<{ unit_id: string; unit_status: string | null; exclude_from_occupancy: boolean; created_at: string }[]>`
       WITH latest_uv AS (
         SELECT MAX(report_date) AS dt FROM bronze_appfolio_reports WHERE report_type = 'unit_vacancy'
       ),
@@ -3289,10 +3289,10 @@ app.get("/api/v1/units", async (_req: Request, res: Response) => {
       SELECT
         gu.unit_id,
         COALESCE(vs.unit_status, gu.unit_status, 'occupied') AS unit_status,
+        COALESCE(gu.exclude_from_occupancy, false) AS exclude_from_occupancy,
         gu.created_at::text
       FROM gold_units gu
       LEFT JOIN vacancy_status vs ON vs.unit_id = gu.unit_id
-      WHERE gu.exclude_from_occupancy IS NOT TRUE
       ORDER BY gu.unit_id ASC
     `;
     res.status(200).json({
