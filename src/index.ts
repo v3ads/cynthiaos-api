@@ -1,9 +1,9 @@
-import express, { Request, Response, NextFunction } from "express";
+import express, { Express, Request, Response, NextFunction } from "express";
 import postgres from "postgres";
 import jasmineRouter from "./routes/jasmine";
 import pagesRouter from "./routes/pages";
 
-const app = express();
+const app: Express = express();
 const PORT = parseInt(process.env.PORT ?? "3003", 10);
 const SERVICE_NAME = "cynthiaos-api";
 const API_VERSION = "v1";
@@ -807,52 +807,44 @@ app.get("/api/v1/delinquency", async (req: Request, res: Response) => {
 
     sql = getDb();
 
-    // Deduplicate to one row per tenant (most recent ingestion wins).
-    // LEFT JOIN gold_tenants to enrich with human-readable display_name.
-    const rows = riskLevel
-      ? await sql<GoldDelinquencyRecord[]>`
-          SELECT DISTINCT ON (d.tenant_id)
-                 d.id, d.bronze_report_id, d.tenant_id,
-                 COALESCE(t.full_name, d.tenant_id) AS display_name,
-                 d.unit_id,
-                 d.balance_due::text AS balance_due,
-                 d.days_overdue, d.risk_level, d.created_at
-          FROM gold_delinquency_records d
-          LEFT JOIN LATERAL (
-            SELECT full_name FROM gold_tenants
-            WHERE tenant_id = d.tenant_id
-            ORDER BY updated_at DESC LIMIT 1
-          ) t ON true
-          WHERE d.risk_level = ${riskLevel}
-          ORDER BY d.tenant_id, d.created_at DESC, d.balance_due::numeric DESC
-          LIMIT ${limit} OFFSET ${offset}
-        `
-      : await sql<GoldDelinquencyRecord[]>`
-          SELECT DISTINCT ON (d.tenant_id)
-                 d.id, d.bronze_report_id, d.tenant_id,
-                 COALESCE(t.full_name, d.tenant_id) AS display_name,
-                 d.unit_id,
-                 d.balance_due::text AS balance_due,
-                 d.days_overdue, d.risk_level, d.created_at
-          FROM gold_delinquency_records d
-          LEFT JOIN LATERAL (
-            SELECT full_name FROM gold_tenants
-            WHERE tenant_id = d.tenant_id
-            ORDER BY updated_at DESC LIMIT 1
-          ) t ON true
-          ORDER BY d.tenant_id, d.created_at DESC, d.balance_due::numeric DESC
-          LIMIT ${limit} OFFSET ${offset}
-        `;
+    // The source entity is one delinquency record per unit, not per tenant.
+    // A tenant can legitimately owe balances on multiple units, so collapsing by
+    // tenant made the endpoint report 131 while Gold correctly contained 132 rows.
+    // Carry the total from the exact relation being paginated.
+    const rows = await sql<(GoldDelinquencyRecord & { full_count: string })[]>`
+      SELECT
+        d.id,
+        d.bronze_report_id,
+        d.tenant_id,
+        COALESCE(t.full_name, d.tenant_id) AS display_name,
+        d.unit_id,
+        d.balance_due::text AS balance_due,
+        d.days_overdue,
+        d.risk_level,
+        d.created_at,
+        COUNT(*) OVER()::text AS full_count
+      FROM gold_delinquency_records d
+      LEFT JOIN LATERAL (
+        SELECT full_name
+        FROM gold_tenants
+        WHERE tenant_id = d.tenant_id
+        ORDER BY updated_at DESC
+        LIMIT 1
+      ) t ON true
+      WHERE ${riskLevel === null} OR d.risk_level = ${riskLevel ?? ""}
+      ORDER BY d.balance_due::numeric DESC, d.tenant_id, d.unit_id
+      LIMIT ${limit} OFFSET ${offset}
+    `;
 
-    const countRes = riskLevel
-      ? await sql<{ count: string }[]>`
-          SELECT COUNT(DISTINCT tenant_id) AS count FROM gold_delinquency_records WHERE risk_level = ${riskLevel}
-        `
-      : await sql<{ count: string }[]>`
-          SELECT COUNT(DISTINCT tenant_id) AS count FROM gold_delinquency_records
-        `;
-
-    const total = parseInt(countRes[0].count, 10);
+    // A page requested beyond the end contains no window count; use the same
+    // unit-level filtered relation for that edge case only.
+    const total = rows.length > 0
+      ? parseInt(rows[0].full_count, 10)
+      : parseInt((await sql<{ count: string }[]>`
+          SELECT COUNT(*)::text AS count
+          FROM gold_delinquency_records
+          WHERE ${riskLevel === null} OR risk_level = ${riskLevel ?? ""}
+        `)[0].count, 10);
 
     res.status(200).json({
       success: true,
@@ -1928,6 +1920,7 @@ interface PortfolioHealthRow {
   vacant_units:          string | null;
   notice_units:          string | null;
   net_operating_income:  string | null;
+  gross_revenue:         string | null;
   profit_margin:         string | null;
   total_delinquency:     string | null;
   avg_risk_score:        string | null;
@@ -1985,6 +1978,13 @@ app.get("/api/v1/insights/portfolio-health", async (_req: Request, res: Response
           LIMIT 1
         ) AS net_operating_income,
         (
+          SELECT total_income::text
+          FROM gold_income_statements
+          WHERE total_income > 0
+          ORDER BY report_date DESC, created_at DESC
+          LIMIT 1
+        ) AS gross_revenue,
+        (
           -- Only return profit_margin when expenses are actually available
           -- (total_expenses = 0 means AppFolio didn't export expense data)
           SELECT CASE WHEN total_expenses > 0 THEN profit_margin::text ELSE NULL END
@@ -2011,28 +2011,26 @@ app.get("/api/v1/insights/portfolio-health", async (_req: Request, res: Response
             ORDER BY tenant_id, risk_score DESC, created_at DESC
           ) ar
         ) AS avg_risk_score,
-        -- Risk: count of HIGH expiration-risk leases (within 60 days, with financial risk)
+        -- Expiration risk: distinct units with a lease ending in the next 30 days.
+        -- Compute from lease_end_date at request time; stored days_until_expiration
+        -- can become stale between pipeline runs.
         (
           SELECT COUNT(*)::text
           FROM (
-            SELECT DISTINCT ON (le.tenant_id)
-              le.tenant_id,
-              le.days_until_expiration,
-              ar.risk_score
-            FROM gold_lease_expirations le
-            LEFT JOIN gold_aged_receivables ar
-              ON le.tenant_id = ar.tenant_id
-            ORDER BY le.tenant_id, le.lease_end_date ASC
-          ) j
-          WHERE days_until_expiration <= 60
-            AND (risk_score >= 2000 OR risk_score IS NOT NULL)
+            SELECT DISTINCT ON (unit_id)
+              unit_id, lease_end_date
+            FROM gold_lease_expirations
+            WHERE lease_end_date >= CURRENT_DATE
+              AND lease_end_date < CURRENT_DATE + INTERVAL '31 days'
+            ORDER BY unit_id, lease_end_date ASC, created_at DESC
+          ) expiring_units
         ) AS high_expiration_count
       FROM unit_counts uc
     `;
 
     // ── Parse raw values ────────────────────────────────────────────────────
-    // Occupancy: derived from canonical gold_units universe (182 units)
-    const totalUnits    = parseInt(row.total_units    ?? "180", 10);
+    // Occupancy: derived from the live canonical gold_units universe.
+    const totalUnits    = parseInt(row.total_units    ?? "0", 10);
     const occupiedUnits = parseInt(row.occupied_units ?? "0",   10);
     const vacantUnits   = parseInt(row.vacant_units   ?? "0",   10);
     const noticeUnits   = parseInt(row.notice_units   ?? "0",   10);
@@ -2040,6 +2038,7 @@ app.get("/api/v1/insights/portfolio-health", async (_req: Request, res: Response
     const occupancyRate = totalUnits > 0 ? occupiedUnits / totalUnits : null;
     const vacancyRate   = totalUnits > 0 ? (vacantUnits + noticeUnits) / totalUnits : null;
     const noi             = row.net_operating_income !== null ? parseFloat(row.net_operating_income) : null;
+    const grossRevenue    = row.gross_revenue !== null ? parseFloat(row.gross_revenue) : null;
     const profitMargin    = row.profit_margin     !== null ? parseFloat(row.profit_margin)    : null;
     const totalDelinquency = parseFloat(row.total_delinquency ?? "0");
     const avgRiskScore    = parseFloat(row.avg_risk_score ?? "0");
@@ -2104,7 +2103,8 @@ app.get("/api/v1/insights/portfolio-health", async (_req: Request, res: Response
         occupancy: {
           score:       occupancyHealth,
           weight:      "30%",
-          description: "Derived from canonical gold_units universe (182 units)",
+          description: `Linear scale: 0 at 60% occupancy, 100 at 95% occupancy; current denominator is ${totalUnits} canonical units`,
+          formula: "round(clamp((occupancy_rate - 0.60) / 0.35 * 100, 0, 100))",
         },
         risk: {
           score:       riskHealth,
@@ -2113,7 +2113,7 @@ app.get("/api/v1/insights/portfolio-health", async (_req: Request, res: Response
         },
       },
       supporting_metrics: {
-        // Unit counts — canonical 182-unit universe
+        // Unit counts — live canonical gold_units universe.
         total_units:            totalUnits,
         occupied_units:         occupiedUnits,
         vacant_units:           vacantUnits,
@@ -2124,7 +2124,7 @@ app.get("/api/v1/insights/portfolio-health", async (_req: Request, res: Response
         // Financial
         net_operating_income:   noi,
         profit_margin:          profitMargin,   // null when expense data unavailable
-        gross_revenue:          noi,            // always available as fallback
+        gross_revenue:          grossRevenue,
         total_delinquency_balance: totalDelinquency,
         avg_aged_receivables_risk_score: avgRiskScore,
         high_expiration_risk_count: highExpCount,
@@ -2158,6 +2158,9 @@ interface CollectionsRiskRow {
   delinquency_level:     string | null;
   lease_end_date:        string | null;
   days_until_expiration: number | null;
+  collections_risk_score: string;
+  collections_classification: string;
+  total_count: string;
 }
 
 app.get("/api/v1/insights/collections-risk", async (req: Request, res: Response) => {
@@ -2178,8 +2181,9 @@ app.get("/api/v1/insights/collections-risk", async (req: Request, res: Response)
     }
 
     sql = getDb();
+    const db = sql;
 
-    const baseQuery = sql<CollectionsRiskRow[]>`
+    const fetchRows = (pageLimit: number, pageOffset: number) => db<CollectionsRiskRow[]>`
       WITH
       -- Current tenants: sourced from AR (primary) + delinquency + lease expirations
       ar_deduped AS (
@@ -2335,38 +2339,26 @@ app.get("/api/v1/insights/collections-risk", async (req: Request, res: Response)
           END AS collections_classification
         FROM deduped
       )
-      SELECT *
+      SELECT classified.*, COUNT(*) OVER()::text AS total_count
       FROM classified
       WHERE
-        ${classFilter ? sql`collections_classification = ${classFilter}` : sql`TRUE`}
+        ${classFilter ? db`collections_classification = ${classFilter}` : db`TRUE`}
       ORDER BY tenant_status ASC, collections_risk_score DESC, tenant_id ASC
-      LIMIT ${limit} OFFSET ${offset}
+      LIMIT ${pageLimit} OFFSET ${pageOffset}
     `;
 
-    const countQuery = sql<{ count: string }[]>`
-      WITH
-      ar_deduped AS (
-        SELECT DISTINCT ON (tenant_id) tenant_id
-        FROM gold_aged_receivables
-        WHERE tenant_status = 'current'
-        ORDER BY tenant_id, risk_score DESC, created_at DESC
-      ),
-      d_past AS (
-        SELECT DISTINCT ON (tenant_id) tenant_id
-        FROM gold_delinquency_records
-        WHERE tenant_status = 'past'
-        ORDER BY tenant_id, days_overdue DESC NULLS LAST, created_at DESC
-      ),
-      all_tenants AS (
-        SELECT tenant_id FROM ar_deduped
-        UNION
-        SELECT tenant_id FROM d_past
-      )
-      SELECT COUNT(*)::text AS count FROM all_tenants
-    `;
-
-    const [rows, countRows] = await Promise.all([baseQuery, countQuery]);
-    const total = parseInt(countRows[0]?.count ?? "0", 10);
+    const rows = await fetchRows(limit, offset);
+    // A page beyond the end has no row from which to read the window count.
+    // Re-read a single first row so `total` remains correct for every offset.
+    const countSource = rows.length > 0
+      ? rows
+      : offset > 0
+      ? await fetchRows(1, 0)
+      : [];
+    const total = parseInt(
+      String(countSource[0]?.total_count ?? "0"),
+      10
+    );
 
     res.status(200).json({
       success: true,
@@ -2387,8 +2379,8 @@ app.get("/api/v1/insights/collections-risk", async (req: Request, res: Response)
         delinquency_level:      r.delinquency_level,
         lease_end_date:         r.lease_end_date,
         days_until_expiration:  r.days_until_expiration,
-        collections_risk_score: parseInt(String((r as unknown as { collections_risk_score: string }).collections_risk_score ?? "0"), 10),
-        collections_classification: (r as unknown as { collections_classification: string }).collections_classification,
+        collections_risk_score: parseInt(String(r.collections_risk_score ?? "0"), 10),
+        collections_classification: r.collections_classification,
       })),
     });
   } catch (err: unknown) {

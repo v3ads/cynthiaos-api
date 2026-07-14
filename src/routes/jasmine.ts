@@ -18,7 +18,7 @@
 import { Router, Request, Response } from "express";
 import postgres from "postgres";
 
-const router = Router();
+const router: Router = Router();
 
 // ── Database client factory (mirrors pattern in src/index.ts) ─────────────────
 function getDb(): postgres.Sql {
