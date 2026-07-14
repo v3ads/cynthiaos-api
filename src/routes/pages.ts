@@ -218,14 +218,31 @@ router.get('/pages/financials/income-statement', async (req: Request, res: Respo
     }
 
     const r = rows[0];
+    const ytdTotalIncome = parseFloat(r.total_income);
+    const ytdTotalExpenses = parseFloat(r.total_expenses);
+    const expenseToIncomeRatio = ytdTotalIncome === 0 ? null : ytdTotalExpenses / ytdTotalIncome;
+    // Production reconciliation on 2026-07-14 found that the AppFolio feed contains
+    // only a small subset of normal operating-expense categories. Keep the source
+    // figures intact, but disclose when they are not plausible as a complete scope.
+    const expenseScopeIsPartial = expenseToIncomeRatio !== null && expenseToIncomeRatio < 0.1;
+
     res.json({
       income_statement: {
         report_date:              r.report_date,
+        expense_scope: {
+          status: expenseScopeIsPartial ? 'partial' : 'reported',
+          is_complete: expenseScopeIsPartial ? false : null,
+          expense_to_income_ratio: expenseToIncomeRatio,
+          profit_margin_usable_for_full_property_performance: !expenseScopeIsPartial,
+          note: expenseScopeIsPartial
+            ? 'The AppFolio income-statement feed contains only a partial operating-expense account scope; totals and margin must not be treated as complete property performance.'
+            : 'Expenses are reported as supplied by the AppFolio income-statement feed; completeness has not been independently certified.',
+        },
         ytd: {
-          total_income:           parseFloat(r.total_income),
+          total_income:           ytdTotalIncome,
           rental_income:          parseFloat(r.rental_income),
           other_income:           parseFloat(r.other_income),
-          total_expenses:         parseFloat(r.total_expenses),
+          total_expenses:         ytdTotalExpenses,
           operating_expenses:     parseFloat(r.operating_expenses),
           net_operating_income:   parseFloat(r.net_operating_income),
           profit_margin:          parseFloat(r.profit_margin),
