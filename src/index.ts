@@ -2260,7 +2260,7 @@ app.get("/api/v1/insights/collections-risk", async (req: Request, res: Response)
           ar.dominant_bucket,
           dc.days_overdue,
           dc.delinquency_level,
-          le.lease_end_date,
+          le.lease_end_date::text               AS lease_end_date,
           (le.lease_end_date - CURRENT_DATE)::int AS days_until_expiration,
           LEAST(100, ROUND(
             COALESCE(
