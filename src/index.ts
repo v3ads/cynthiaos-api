@@ -177,65 +177,262 @@ function mapActionRow(r: LeaseActionRow) {
   };
 }
 
+// ── Canonical lease population: v_lease_population ───────────────────────────
+// One SQL relation defines every lease population served by this API and the
+// Jasmine agent. The July 14, 2026 figures audit traced up to seven different
+// lease totals to per-endpoint filter dialects; the frontend consolidation
+// fixed the visible symptoms, and this view is the server-side canonicalization
+// so every consumer (pages, Jasmine, Manus scripts, future features) inherits
+// one definition. Scopes are row-level boolean flags computed IN the view so
+// endpoint SQL, Jasmine loaders, and the transform worker's reconciliation
+// checks all reference identical predicates and can never drift independently.
+//
+// Flag semantics:
+//   is_soonest_for_unit         earliest dated lease row per unit across ALL
+//                               rows (the risk population's dedup)
+//   is_soonest_future_for_unit  earliest FUTURE (countdown > 0 days) lease row
+//                               per unit (the pages' dedup)
+//   is_superseded               gold_tenants shows an active lease ending
+//                               STRICTLY LATER than this row — the
+//                               supersede-only-when-later rule (decided
+//                               July 14, 2026). A same-date gold_tenants match
+//                               is the same lease seen through two tables, NOT
+//                               a renewal: as of that date 105 of 124 future
+//                               units matched gold_tenants and 0 had a later
+//                               date, so a blanket exclusion would have hidden
+//                               the entire real renewal pipeline.
+//   has_active_future_tenant_lease  the legacy renewed-unit semantics (ANY
+//                               active gold_tenants lease ending after today),
+//                               kept solely so the risk scope stays
+//                               output-identical to its pre-view behavior.
+//   is_released                 a move-in on/after this row's lease end exists
+//                               in gold_unit_turnover. After the July 14
+//                               canonical-event rework every turnover row has
+//                               event_type = 'turn', so the filter keys on
+//                               move_in_date rather than event_type — the old
+//                               event_type = 'move_in' filter matched zero
+//                               rows (same bug class fixed in
+//                               turnover-velocity that day).
+//   is_family_held              gold_units.unit_group = 'picinich_family'.
+//                               Family-held units are excluded from the
+//                               actionable active_future scope (decided
+//                               July 14, 2026) and surfaced separately.
+//
+// Rent/contact enrichment folds the rent_lookup/tenant_lookup Bronze scans in
+// ONCE (verbatim from the pre-view endpoint CTEs, including the regex literals
+// exactly as the driver has always cooked them, so join keys are
+// byte-identical). Plain view (not materialized): acceptable at this data size
+// (~153 lease rows, 2 Bronze reports per query).
+//
+// The view is (re)created idempotently at startup via CREATE OR REPLACE.
+// Gold promotion UPSERTs into gold_lease_expirations (never drops it), so the
+// view survives pipeline runs.
+const V_LEASE_POPULATION_DDL = `
+CREATE OR REPLACE VIEW v_lease_population AS
+WITH rent_lookup AS (
+  WITH latest_rr AS (SELECT MAX(report_date) AS dt FROM bronze_appfolio_reports WHERE report_type = 'rent_roll')
+  SELECT DISTINCT ON (LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g')))
+    LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g')) AS unit_id,
+    NULLIF(REPLACE(elem->>'Rent', ',', ''), '0.00')::numeric         AS monthly_rent,
+    NULLIF(TRIM(elem->>'UnitType'), '')                              AS unit_type
+  FROM bronze_appfolio_reports b,
+       jsonb_array_elements(b.raw_data->'results') AS elem,
+       latest_rr
+  WHERE b.report_type = 'rent_roll' AND b.report_date = latest_rr.dt
+    AND elem->>'Rent' IS NOT NULL
+),
+tenant_lookup AS (
+  WITH latest_td AS (SELECT MAX(report_date) AS dt FROM bronze_appfolio_reports WHERE report_type = 'tenant_directory')
+  SELECT DISTINCT ON (LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g')))
+    LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g'))       AS unit_id,
+    NULLIF(TRIM(elem->>'Emails'), '')                                      AS contact_email,
+    NULLIF(REGEXP_REPLACE(TRIM(COALESCE(elem->>'PhoneNumbers', '')),
+      '^(Mobile|Phone|Home|Work|Fax):\s*', '', 'i'), '')                  AS contact_phone,
+    NULLIF(TRIM(REGEXP_REPLACE(TRIM(COALESCE(elem->>'Tenant','')), '[[:space:]]{2,}', ' ', 'g')), '') AS tenant_name,
+    TRIM(elem->>'Unit')                                                    AS unit_display,
+    NULLIF(TRIM(elem->>'Property'), '')                                    AS property
+  FROM bronze_appfolio_reports b,
+       jsonb_array_elements(b.raw_data->'results') AS elem,
+       latest_td
+  WHERE b.report_type = 'tenant_directory' AND b.report_date = latest_td.dt
+    AND (elem->>'Status' ILIKE '%current%' OR elem->>'Status' ILIKE '%notice%')
+    AND elem->>'Unit' IS NOT NULL
+  ORDER BY LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g')),
+           (elem->>'PrimaryTenant' = 'Yes') DESC
+),
+gt_active AS (
+  SELECT unit_id, MAX(lease_end_date::date) AS max_active_end
+  FROM gold_tenants
+  WHERE lease_status = 'active'
+    AND lease_end_date IS NOT NULL
+    AND lease_end_date::date > CURRENT_DATE
+  GROUP BY unit_id
+),
+base AS (
+  SELECT
+    le.id, le.bronze_report_id, le.tenant_id, le.unit_id,
+    le.lease_start_date, le.lease_end_date, le.created_at,
+    (le.lease_end_date - CURRENT_DATE)::int AS days_until_expiration,
+    ROW_NUMBER() OVER (
+      PARTITION BY le.unit_id
+      ORDER BY le.lease_end_date ASC NULLS LAST, le.created_at DESC
+    ) AS unit_rank_all,
+    ROW_NUMBER() OVER (
+      PARTITION BY le.unit_id, (le.lease_end_date > CURRENT_DATE)
+      ORDER BY le.lease_end_date ASC, le.created_at DESC
+    ) AS unit_rank_scope
+  FROM gold_lease_expirations le
+)
+SELECT
+  b.id, b.bronze_report_id, b.tenant_id, b.unit_id,
+  b.lease_start_date, b.lease_end_date, b.created_at,
+  b.days_until_expiration,
+  (b.lease_end_date IS NOT NULL AND b.lease_end_date > CURRENT_DATE)    AS is_future,
+  (b.unit_rank_all = 1 AND b.lease_end_date IS NOT NULL)                AS is_soonest_for_unit,
+  (b.lease_end_date IS NOT NULL AND b.lease_end_date > CURRENT_DATE
+     AND b.unit_rank_scope = 1)                                         AS is_soonest_future_for_unit,
+  CASE
+    WHEN b.lease_end_date IS NULL THEN 'undated'
+    WHEN b.days_until_expiration < 0 THEN 'expired'
+    WHEN b.days_until_expiration <= 30 THEN '0-30'
+    WHEN b.days_until_expiration <= 60 THEN '31-60'
+    WHEN b.days_until_expiration <= 90 THEN '61-90'
+    ELSE 'later'
+  END                                                                   AS bucket,
+  (gta.unit_id IS NOT NULL)                                             AS has_active_future_tenant_lease,
+  (gta.unit_id IS NOT NULL AND b.lease_end_date IS NOT NULL
+     AND gta.max_active_end > GREATEST(b.lease_end_date, CURRENT_DATE)) AS is_superseded,
+  EXISTS (
+    SELECT 1 FROM gold_unit_turnover t
+    WHERE t.unit_id = b.unit_id
+      AND b.lease_end_date IS NOT NULL
+      AND t.move_in_date IS NOT NULL
+      AND t.move_in_date::date >= b.lease_end_date
+  )                                                                     AS is_released,
+  COALESCE(gu.unit_group = 'picinich_family', FALSE)                    AS is_family_held,
+  gu.unit_group,
+  gu.exclude_from_occupancy,
+  rl.monthly_rent,
+  rl.unit_type,
+  tl.contact_email,
+  tl.contact_phone,
+  tl.tenant_name,
+  tl.unit_display,
+  tl.property
+FROM base b
+LEFT JOIN gt_active     gta ON gta.unit_id = b.unit_id
+LEFT JOIN gold_units    gu  ON gu.unit_id  = b.unit_id
+LEFT JOIN rent_lookup   rl  ON rl.unit_id  = b.unit_id
+LEFT JOIN tenant_lookup tl  ON tl.unit_id  = b.unit_id
+`;
+
+// English definitions attached to every lease endpoint response so a lease
+// count can never again appear without its definition. Keep these in sync
+// with the view flags above.
+const LEASE_SCOPE_DEFINITIONS: Record<string, string> = {
+  including_expired:
+    "All lease-expiration rows in the Gold layer, including already-expired leases; countdowns computed at query time from lease_end_date.",
+  active_future:
+    "Actionable renewal pipeline: one row per unit — the soonest future-dated lease (countdown > 0 days) — excluding units whose active tenant record shows a strictly later lease end (already renewed) and family-held units (unit_group = picinich_family). Family-held future leases are returned separately in family_held.",
+  risk:
+    "Unresolved-expiration risk population: per-unit soonest dated lease with no active future tenant record and no post-expiry move-in, already expired or due within 90 days.",
+  future_window_all:
+    "All future lease rows with countdown inside the requested day window; includes family-held units.",
+};
+
 // ── GET /api/v1/leases/expirations ────────────────────────────────────────────
+// Supports ?scope=including_expired (default, backward-compatible) |
+// active_future | risk, and ?days=N windowing within active_future.
 app.get("/api/v1/leases/expirations", async (req: Request, res: Response) => {
   let sql: postgres.Sql | null = null;
   try {
     const limit  = Math.min(parseInt(String(req.query.limit  ?? "100"), 10), 500);
     const offset = Math.max(parseInt(String(req.query.offset ?? "0"),   10), 0);
+    const scope  = typeof req.query.scope === "string" ? req.query.scope.trim() : "including_expired";
+    const days   = req.query.days !== undefined ? parseInt(String(req.query.days), 10) : null;
+
+    if (!["including_expired", "active_future", "risk"].includes(scope)) {
+      res.status(400).json({ success: false, error: "scope must be including_expired, active_future, or risk" });
+      return;
+    }
+    if (days !== null && (!Number.isFinite(days) || days < 0 || days > 730)) {
+      res.status(400).json({ success: false, error: "days must be between 0 and 730" });
+      return;
+    }
+
     sql = getDb();
+
+    // All scopes read the SAME canonical relation; only the flag predicates
+    // differ. Column list and ordering are identical to the pre-view endpoint
+    // so response shapes are unchanged.
+    const scopeWhere =
+      scope === "active_future"
+        ? sql`is_soonest_future_for_unit AND NOT is_superseded AND NOT is_family_held
+              AND ${days !== null ? sql`days_until_expiration <= ${days}` : sql`TRUE`}`
+        : scope === "risk"
+        ? sql`is_soonest_for_unit AND NOT has_active_future_tenant_lease
+              AND NOT is_released AND days_until_expiration <= 90`
+        : sql`TRUE`;
+
     const rows = await sql<GoldLeaseExpiration[]>`
-      WITH rent_lookup AS (
-        WITH latest_rr AS (SELECT MAX(report_date) AS dt FROM bronze_appfolio_reports WHERE report_type = 'rent_roll')
-        SELECT DISTINCT ON (LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g')))
-          LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g')) AS unit_id,
-          NULLIF(REPLACE(elem->>'Rent', ',', ''), '0.00')::numeric         AS monthly_rent
-        FROM bronze_appfolio_reports b,
-             jsonb_array_elements(b.raw_data->'results') AS elem,
-             latest_rr
-        WHERE b.report_type = 'rent_roll' AND b.report_date = latest_rr.dt
-          AND elem->>'Rent' IS NOT NULL
-      ),
-      tenant_lookup AS (
-        WITH latest_td AS (SELECT MAX(report_date) AS dt FROM bronze_appfolio_reports WHERE report_type = 'tenant_directory')
-        SELECT DISTINCT ON (LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g')))
-          LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g'))       AS unit_id,
-          NULLIF(TRIM(elem->>'Emails'), '')                                      AS contact_email,
-          NULLIF(REGEXP_REPLACE(TRIM(COALESCE(elem->>'PhoneNumbers', '')),
-            '^(Mobile|Phone|Home|Work|Fax):\s*', '', 'i'), '')                  AS contact_phone,
-          NULLIF(TRIM(REGEXP_REPLACE(TRIM(COALESCE(elem->>'Tenant','')), '[[:space:]]{2,}', ' ', 'g')), '') AS tenant_name,
-          TRIM(elem->>'Unit')                                                    AS unit_display,
-          NULLIF(TRIM(elem->>'Property'), '')                                    AS property
-        FROM bronze_appfolio_reports b,
-             jsonb_array_elements(b.raw_data->'results') AS elem,
-             latest_td
-        WHERE b.report_type = 'tenant_directory' AND b.report_date = latest_td.dt
-          AND (elem->>'Status' ILIKE '%current%' OR elem->>'Status' ILIKE '%notice%')
-          AND elem->>'Unit' IS NOT NULL
-        ORDER BY LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g')),
-                 (elem->>'PrimaryTenant' = 'Yes') DESC
-      )
-      SELECT le.id, le.bronze_report_id, le.tenant_id, le.unit_id,
-             le.lease_start_date::text AS lease_start_date,
-             le.lease_end_date::text   AS lease_end_date,
-             (le.lease_end_date - CURRENT_DATE)::int AS days_until_expiration,
-             rl.monthly_rent::text     AS monthly_rent,
-             tl.contact_email,
-             tl.contact_phone,
-             tl.tenant_name,
-             tl.unit_display           AS unit,
-             tl.property,
-             gu.unit_group,
-             le.created_at
-      FROM gold_lease_expirations le
-      LEFT JOIN rent_lookup   rl ON rl.unit_id = le.unit_id
-      LEFT JOIN tenant_lookup tl ON tl.unit_id = le.unit_id
-      LEFT JOIN gold_units    gu ON gu.unit_id = le.unit_id
-      ORDER BY le.lease_end_date ASC NULLS LAST
+      SELECT id, bronze_report_id, tenant_id, unit_id,
+             lease_start_date::text AS lease_start_date,
+             lease_end_date::text   AS lease_end_date,
+             days_until_expiration,
+             monthly_rent::text     AS monthly_rent,
+             contact_email,
+             contact_phone,
+             tenant_name,
+             unit_display           AS unit,
+             property,
+             unit_group,
+             created_at
+      FROM v_lease_population
+      WHERE ${scopeWhere}
+      ORDER BY lease_end_date ASC NULLS LAST
       LIMIT ${limit} OFFSET ${offset}
     `;
-    const total = await sql<{ count: string }[]>`SELECT COUNT(*) AS count FROM gold_lease_expirations`;
-    res.status(200).json({ success: true, total: parseInt(total[0].count, 10), limit, offset, data: rows.map(mapRow) });
+    const totalRes = await sql<{ count: string }[]>`
+      SELECT COUNT(*) AS count FROM v_lease_population WHERE ${scopeWhere}
+    `;
+
+    const payload: Record<string, unknown> = {
+      success: true,
+      scope,
+      scope_definition: LEASE_SCOPE_DEFINITIONS[scope],
+      total: parseInt(totalRes[0].count, 10),
+      limit,
+      offset,
+      ...(days !== null ? { days_window: days } : {}),
+      data: rows.map(mapRow),
+    };
+
+    // active_future additionally returns the family-held future leases as a
+    // SEPARATE array so the Leases page can keep its family block without the
+    // actionable count ever including them (rows-vs-count mismatches are the
+    // bug class this endpoint exists to kill).
+    if (scope === "active_future") {
+      const familyRows = await sql<GoldLeaseExpiration[]>`
+        SELECT id, bronze_report_id, tenant_id, unit_id,
+               lease_start_date::text AS lease_start_date,
+               lease_end_date::text   AS lease_end_date,
+               days_until_expiration,
+               monthly_rent::text     AS monthly_rent,
+               contact_email,
+               contact_phone,
+               tenant_name,
+               unit_display           AS unit,
+               property,
+               unit_group,
+               created_at
+        FROM v_lease_population
+        WHERE is_soonest_future_for_unit AND is_family_held
+        ORDER BY lease_end_date ASC
+      `;
+      payload.family_held = familyRows.map(mapRow);
+    }
+
+    res.status(200).json(payload);
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
     console.error(`[${SERVICE_NAME}] GET /api/v1/leases/expirations error:`, message);
@@ -252,61 +449,44 @@ app.get("/api/v1/leases/expiring-soon", async (req: Request, res: Response) => {
     const days  = Math.min(parseInt(String(req.query.days  ?? "90"),  10), 730);
     const limit = Math.min(parseInt(String(req.query.limit ?? "100"), 10), 500);
     sql = getDb();
+    // Windowed slice of the canonical active_future scope — the same
+    // population the pages display, restricted to the requested day window.
+    // (Pre-view this endpoint had its own dialect: >= CURRENT_DATE i.e.
+    // day-0 leases in, no dedup, family units in. Verified July 14, 2026 that
+    // the canonical predicates return identical counts on live data — 27 at
+    // days=60 — because Gold is one-row-per-unit, no lease expires today, and
+    // all family leases sit 365 days out.)
     const rows = await sql<GoldLeaseExpiration[]>`
-      WITH rent_lookup AS (
-        WITH latest_rr AS (SELECT MAX(report_date) AS dt FROM bronze_appfolio_reports WHERE report_type = 'rent_roll')
-        SELECT DISTINCT ON (LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g')))
-          LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g')) AS unit_id,
-          NULLIF(REPLACE(elem->>'Rent', ',', ''), '0.00')::numeric         AS monthly_rent
-        FROM bronze_appfolio_reports b,
-             jsonb_array_elements(b.raw_data->'results') AS elem,
-             latest_rr
-        WHERE b.report_type = 'rent_roll' AND b.report_date = latest_rr.dt
-          AND elem->>'Rent' IS NOT NULL
-      ),
-      tenant_lookup AS (
-        WITH latest_td AS (SELECT MAX(report_date) AS dt FROM bronze_appfolio_reports WHERE report_type = 'tenant_directory')
-        SELECT DISTINCT ON (LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g')))
-          LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g'))       AS unit_id,
-          NULLIF(TRIM(elem->>'Emails'), '')                                      AS contact_email,
-          NULLIF(REGEXP_REPLACE(TRIM(COALESCE(elem->>'PhoneNumbers', '')),
-            '^(Mobile|Phone|Home|Work|Fax):\s*', '', 'i'), '')                  AS contact_phone
-        FROM bronze_appfolio_reports b,
-             jsonb_array_elements(b.raw_data->'results') AS elem,
-             latest_td
-        WHERE b.report_type = 'tenant_directory' AND b.report_date = latest_td.dt
-          AND (elem->>'Status' ILIKE '%current%' OR elem->>'Status' ILIKE '%notice%')
-          AND elem->>'Unit' IS NOT NULL
-        ORDER BY LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g')),
-                 (elem->>'PrimaryTenant' = 'Yes') DESC
-      )
-      SELECT le.id, le.bronze_report_id, le.tenant_id, le.unit_id,
-             le.lease_start_date::text AS lease_start_date,
-             le.lease_end_date::text   AS lease_end_date,
-             (le.lease_end_date - CURRENT_DATE)::int AS days_until_expiration,
-             rl.monthly_rent::text     AS monthly_rent,
-             tl.contact_email,
-             tl.contact_phone,
-             gu.unit_group,
-             le.created_at
-      FROM gold_lease_expirations le
-      LEFT JOIN rent_lookup   rl ON rl.unit_id = le.unit_id
-      LEFT JOIN tenant_lookup tl ON tl.unit_id = le.unit_id
-      LEFT JOIN gold_units    gu ON gu.unit_id = le.unit_id
-      WHERE le.lease_end_date IS NOT NULL
-        AND le.lease_end_date >= CURRENT_DATE
-        AND (le.lease_end_date - CURRENT_DATE) <= ${days}
-      ORDER BY le.lease_end_date ASC
+      SELECT id, bronze_report_id, tenant_id, unit_id,
+             lease_start_date::text AS lease_start_date,
+             lease_end_date::text   AS lease_end_date,
+             days_until_expiration,
+             monthly_rent::text     AS monthly_rent,
+             contact_email,
+             contact_phone,
+             unit_group,
+             created_at
+      FROM v_lease_population
+      WHERE is_soonest_future_for_unit AND NOT is_superseded AND NOT is_family_held
+        AND days_until_expiration <= ${days}
+      ORDER BY lease_end_date ASC
       LIMIT ${limit}
     `;
     const countRes = await sql<{ count: string }[]>`
-      SELECT COUNT(*) AS count FROM gold_lease_expirations
-      WHERE lease_end_date IS NOT NULL
-        AND lease_end_date >= CURRENT_DATE
-        AND (lease_end_date - CURRENT_DATE) <= ${days}
+      SELECT COUNT(*) AS count FROM v_lease_population
+      WHERE is_soonest_future_for_unit AND NOT is_superseded AND NOT is_family_held
+        AND days_until_expiration <= ${days}
     `;
     const total = parseInt(countRes[0].count, 10);
-    res.status(200).json({ success: true, days_window: days, total, count: rows.length, data: rows.map(mapRow) });
+    res.status(200).json({
+      success: true,
+      scope: "active_future",
+      scope_definition: LEASE_SCOPE_DEFINITIONS.active_future,
+      days_window: days,
+      total,
+      count: rows.length,
+      data: rows.map(mapRow),
+    });
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
     console.error(`[${SERVICE_NAME}] GET /api/v1/leases/expiring-soon error:`, message);
@@ -324,61 +504,47 @@ app.get("/api/v1/leases/upcoming-renewals", async (req: Request, res: Response) 
     const toDays   = Math.min(parseInt(String(req.query.to_days   ?? "180"), 10), 730);
     const limit    = Math.min(parseInt(String(req.query.limit     ?? "100"), 10), 500);
     sql = getDb();
+    // future_window_all scope: deliberately NOT the active_future predicates.
+    // This endpoint's pre-view semantics (all future rows in the window,
+    // family-held units included) are preserved output-identical; the Home
+    // renewals card consumes it at 300–400 days, where the three family-held
+    // leases (365 days out on July 14, 2026) sit permanently. Whether family
+    // units belong in the renewal window is an open product question — flagged
+    // July 14, 2026, decide separately rather than change the number silently.
     const rows = await sql<GoldLeaseExpiration[]>`
-      WITH rent_lookup AS (
-        WITH latest_rr AS (SELECT MAX(report_date) AS dt FROM bronze_appfolio_reports WHERE report_type = 'rent_roll')
-        SELECT DISTINCT ON (LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g')))
-          LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g')) AS unit_id,
-          NULLIF(REPLACE(elem->>'Rent', ',', ''), '0.00')::numeric         AS monthly_rent
-        FROM bronze_appfolio_reports b,
-             jsonb_array_elements(b.raw_data->'results') AS elem,
-             latest_rr
-        WHERE b.report_type = 'rent_roll' AND b.report_date = latest_rr.dt
-          AND elem->>'Rent' IS NOT NULL
-      ),
-      tenant_lookup AS (
-        WITH latest_td AS (SELECT MAX(report_date) AS dt FROM bronze_appfolio_reports WHERE report_type = 'tenant_directory')
-        SELECT DISTINCT ON (LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g')))
-          LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g'))       AS unit_id,
-          NULLIF(TRIM(elem->>'Emails'), '')                                      AS contact_email,
-          NULLIF(REGEXP_REPLACE(TRIM(COALESCE(elem->>'PhoneNumbers', '')),
-            '^(Mobile|Phone|Home|Work|Fax):\s*', '', 'i'), '')                  AS contact_phone
-        FROM bronze_appfolio_reports b,
-             jsonb_array_elements(b.raw_data->'results') AS elem,
-             latest_td
-        WHERE b.report_type = 'tenant_directory' AND b.report_date = latest_td.dt
-          AND (elem->>'Status' ILIKE '%current%' OR elem->>'Status' ILIKE '%notice%')
-          AND elem->>'Unit' IS NOT NULL
-        ORDER BY LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g')),
-                 (elem->>'PrimaryTenant' = 'Yes') DESC
-      )
-      SELECT le.id, le.bronze_report_id, le.tenant_id, le.unit_id,
-             le.lease_start_date::text AS lease_start_date,
-             le.lease_end_date::text   AS lease_end_date,
-             (le.lease_end_date - CURRENT_DATE)::int AS days_until_expiration,
-             rl.monthly_rent::text     AS monthly_rent,
-             tl.contact_email,
-             tl.contact_phone,
-             gu.unit_group,
-             le.created_at
-      FROM gold_lease_expirations le
-      LEFT JOIN rent_lookup   rl ON rl.unit_id = le.unit_id
-      LEFT JOIN tenant_lookup tl ON tl.unit_id = le.unit_id
-      LEFT JOIN gold_units    gu ON gu.unit_id = le.unit_id
-      WHERE le.lease_end_date IS NOT NULL
-        AND (le.lease_end_date - CURRENT_DATE) > ${fromDays}
-        AND (le.lease_end_date - CURRENT_DATE) <= ${toDays}
-      ORDER BY le.lease_end_date ASC
+      SELECT id, bronze_report_id, tenant_id, unit_id,
+             lease_start_date::text AS lease_start_date,
+             lease_end_date::text   AS lease_end_date,
+             days_until_expiration,
+             monthly_rent::text     AS monthly_rent,
+             contact_email,
+             contact_phone,
+             unit_group,
+             created_at
+      FROM v_lease_population
+      WHERE lease_end_date IS NOT NULL
+        AND days_until_expiration > ${fromDays}
+        AND days_until_expiration <= ${toDays}
+      ORDER BY lease_end_date ASC
       LIMIT ${limit}
     `;
     const countRes = await sql<{ count: string }[]>`
-      SELECT COUNT(*) AS count FROM gold_lease_expirations
+      SELECT COUNT(*) AS count FROM v_lease_population
       WHERE lease_end_date IS NOT NULL
-        AND (lease_end_date - CURRENT_DATE) > ${fromDays}
-        AND (lease_end_date - CURRENT_DATE) <= ${toDays}
+        AND days_until_expiration > ${fromDays}
+        AND days_until_expiration <= ${toDays}
     `;
     const total = parseInt(countRes[0].count, 10);
-    res.status(200).json({ success: true, from_days: fromDays, to_days: toDays, total, count: rows.length, data: rows.map(mapRow) });
+    res.status(200).json({
+      success: true,
+      scope: "future_window_all",
+      scope_definition: LEASE_SCOPE_DEFINITIONS.future_window_all,
+      from_days: fromDays,
+      to_days: toDays,
+      total,
+      count: rows.length,
+      data: rows.map(mapRow),
+    });
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
     console.error(`[${SERVICE_NAME}] GET /api/v1/leases/upcoming-renewals error:`, message);
@@ -1708,37 +1874,23 @@ app.get("/api/v1/insights/lease-expiration-risk", async (req: Request, res: Resp
 
     const baseQuery = sql<LeaseExpirationRiskRow[]>`
       WITH
-      -- ── Step 1: deduplicate lease expirations, compute live days_until ──────
+      -- ── Step 1-3: canonical risk population from v_lease_population ─────────
+      -- Dedup (is_soonest_for_unit), renewal exclusion
+      -- (has_active_future_tenant_lease — the legacy any-active-future-lease
+      -- semantics this endpoint has always used), and post-expiry move-in
+      -- exclusion (is_released) are all defined ONCE in the view. is_released
+      -- also fixes the latent event_type = 'move_in' bug: after the July 14,
+      -- 2026 canonical-event rework all turnover rows are event_type = 'turn',
+      -- so the old filter could never match; the view keys on move_in_date.
       le_deduped AS (
-        SELECT DISTINCT ON (unit_id)
+        SELECT
           tenant_id, unit_id,
           lease_end_date::text AS lease_end_date,
-          -- Live calculation: ignore stale ingested value
-          (lease_end_date::date - CURRENT_DATE)::int AS live_days_until
-        FROM gold_lease_expirations
-        WHERE lease_end_date IS NOT NULL
-        ORDER BY unit_id, lease_end_date ASC, created_at DESC
-      ),
-      -- ── Step 2: detect renewed leases ────────────────────────────────────────
-      -- A unit is considered renewed if gold_tenants has an active-status
-      -- tenant on that unit whose lease_end_date is in the future.
-      renewed_units AS (
-        SELECT DISTINCT unit_id
-        FROM gold_tenants
-        WHERE lease_status = 'active'
-          AND lease_end_date IS NOT NULL
-          AND lease_end_date::date > CURRENT_DATE
-      ),
-      -- ── Step 3: detect new move-ins after lease expiry ────────────────────────
-      -- A unit is resolved if a move_in event occurred on or after the
-      -- expired lease_end_date (covers re-leasing to a new tenant).
-      moved_in_units AS (
-        SELECT DISTINCT t.unit_id
-        FROM gold_unit_turnover t
-        INNER JOIN le_deduped le ON le.unit_id = t.unit_id
-        WHERE t.event_type = 'move_in'
-          AND t.move_in_date IS NOT NULL
-          AND t.move_in_date::date >= le.lease_end_date::date
+          days_until_expiration AS live_days_until
+        FROM v_lease_population
+        WHERE is_soonest_for_unit
+          AND NOT has_active_future_tenant_lease
+          AND NOT is_released
       ),
       -- ── Step 4: financial enrichment CTEs ────────────────────────────────────
       ar_deduped AS (
@@ -1790,9 +1942,7 @@ app.get("/api/v1/insights/lease-expiration-risk", async (req: Request, res: Resp
         LEFT JOIN t_deduped  t  ON le.tenant_id = t.tenant_id
         LEFT JOIN ar_deduped ar ON le.tenant_id = ar.tenant_id
         LEFT JOIN d_deduped  d  ON le.tenant_id = d.tenant_id
-        -- Exclude units that have been renewed or re-leased
-        WHERE le.unit_id NOT IN (SELECT unit_id FROM renewed_units)
-          AND le.unit_id NOT IN (SELECT unit_id FROM moved_in_units)
+        -- Renewal/re-lease exclusions already applied in le_deduped (view flags)
       )
       SELECT *
       FROM joined
@@ -1814,28 +1964,14 @@ app.get("/api/v1/insights/lease-expiration-risk", async (req: Request, res: Resp
     const countQuery = sql<{ count: string }[]>`
       WITH
       le_deduped AS (
-        SELECT DISTINCT ON (unit_id)
+        SELECT
           tenant_id, unit_id,
           lease_end_date::text AS lease_end_date,
-          (lease_end_date::date - CURRENT_DATE)::int AS live_days_until
-        FROM gold_lease_expirations
-        WHERE lease_end_date IS NOT NULL
-        ORDER BY unit_id, lease_end_date ASC, created_at DESC
-      ),
-      renewed_units AS (
-        SELECT DISTINCT unit_id
-        FROM gold_tenants
-        WHERE lease_status = 'active'
-          AND lease_end_date IS NOT NULL
-          AND lease_end_date::date > CURRENT_DATE
-      ),
-      moved_in_units AS (
-        SELECT DISTINCT t.unit_id
-        FROM gold_unit_turnover t
-        INNER JOIN le_deduped le ON le.unit_id = t.unit_id
-        WHERE t.event_type = 'move_in'
-          AND t.move_in_date IS NOT NULL
-          AND t.move_in_date::date >= le.lease_end_date::date
+          days_until_expiration AS live_days_until
+        FROM v_lease_population
+        WHERE is_soonest_for_unit
+          AND NOT has_active_future_tenant_lease
+          AND NOT is_released
       ),
       ar_deduped AS (
         SELECT DISTINCT ON (tenant_id)
@@ -1872,8 +2008,6 @@ app.get("/api/v1/insights/lease-expiration-risk", async (req: Request, res: Resp
         FROM le_deduped le
         LEFT JOIN ar_deduped ar ON le.tenant_id = ar.tenant_id
         LEFT JOIN d_deduped  d  ON le.tenant_id = d.tenant_id
-        WHERE le.unit_id NOT IN (SELECT unit_id FROM renewed_units)
-          AND le.unit_id NOT IN (SELECT unit_id FROM moved_in_units)
       )
       SELECT COUNT(*) AS count
       FROM joined
@@ -1888,6 +2022,8 @@ app.get("/api/v1/insights/lease-expiration-risk", async (req: Request, res: Resp
 
     res.status(200).json({
       success:      true,
+      scope:        "risk",
+      scope_definition: LEASE_SCOPE_DEFINITIONS.risk,
       total,
       limit,
       offset,
@@ -3951,6 +4087,13 @@ app.listen(PORT, "0.0.0.0", async () => {
     `;
     console.log(`[${SERVICE_NAME}] tenant_status migrations applied to gold_delinquency_records + gold_aged_receivables`);
     console.log(`[${SERVICE_NAME}] gold_units unit_group + exclude_from_occupancy migrations applied`);
+    // ── v_lease_population canonical view (idempotent) ─────────────────────
+    // CREATE OR REPLACE is atomic, so an overlapping old container never sees
+    // a missing view during deploys. Gold promotion only UPSERTs into
+    // gold_lease_expirations (never drops it), so the view persists across
+    // pipeline runs. See V_LEASE_POPULATION_DDL for full semantics.
+    await boot.unsafe(V_LEASE_POPULATION_DDL);
+    console.log(`[${SERVICE_NAME}] v_lease_population canonical lease view ensured`);
     const [cnt] = await boot<{ n: string }[]>`SELECT COUNT(*)::text AS n FROM gold_units`;
     if (parseInt(cnt.n, 10) === 0) {
       console.log(`[${SERVICE_NAME}] gold_units empty — seeding from Bronze unit_directory...`);

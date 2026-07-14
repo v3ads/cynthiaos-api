@@ -449,6 +449,11 @@ router.get("/jasmine/leases", async (req: Request, res: Response) => {
   try {
     sql = getDb();
 
+    // Canonical active_future scope from v_lease_population — the exact same
+    // predicates the pages' /api/v1/leases/expirations?scope=active_future
+    // uses, so Jasmine's lease answers match the pages tenant-for-tenant.
+    // Contact fields come from the view's Bronze tenant_directory lookup
+    // (same source as the pages), not gold_tenants.
     const rows = await sql<{
       unit_id: string;
       tenant_name: string | null;
@@ -459,37 +464,19 @@ router.get("/jasmine/leases", async (req: Request, res: Response) => {
       phone: string | null;
       email: string | null;
     }[]>`
-      WITH latest_rr AS (
-        SELECT MAX(report_date) AS dt FROM bronze_appfolio_reports WHERE report_type = 'rent_roll'
-      ),
-      rent_lookup AS (
-        SELECT DISTINCT ON (LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g')))
-          LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g'))   AS unit_id,
-          NULLIF(TRIM(elem->>'UnitType'), '')                                AS unit_type,
-          NULLIF(REPLACE(elem->>'Rent', ',', ''), '')::numeric               AS monthly_rent
-        FROM bronze_appfolio_reports b,
-             jsonb_array_elements(b.raw_data->'results') AS elem,
-             latest_rr
-        WHERE b.report_type = 'rent_roll'
-          AND b.report_date = latest_rr.dt
-          AND elem->>'Unit' IS NOT NULL
-        ORDER BY LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g'))
-      )
       SELECT
-        le.unit_id,
-        gt.full_name                                          AS tenant_name,
-        rl.unit_type,
-        le.lease_end_date::text,
-        (le.lease_end_date - CURRENT_DATE)::int               AS days_until_expiration,
-        rl.monthly_rent::text                                  AS monthly_rent,
-        gt.phone,
-        gt.email
-      FROM gold_lease_expirations le
-      LEFT JOIN gold_tenants gt ON gt.unit_id = le.unit_id
-      LEFT JOIN rent_lookup  rl ON rl.unit_id = le.unit_id
-      WHERE le.lease_end_date >= CURRENT_DATE
-        AND le.lease_end_date <= CURRENT_DATE + (${windowDays} || ' days')::INTERVAL
-      ORDER BY le.lease_end_date ASC
+        unit_id,
+        tenant_name,
+        unit_type,
+        lease_end_date::text,
+        days_until_expiration,
+        monthly_rent::text                                     AS monthly_rent,
+        contact_phone                                          AS phone,
+        contact_email                                          AS email
+      FROM v_lease_population
+      WHERE is_soonest_future_for_unit AND NOT is_superseded AND NOT is_family_held
+        AND days_until_expiration <= ${windowDays}
+      ORDER BY lease_end_date ASC
     `;
 
     const leasesResult = rows.map(r => ({
@@ -1005,18 +992,22 @@ router.get("/jasmine/tasks", async (_req: Request, res: Response) => {
       phone: string | null;
       email: string | null;
     }[]>`
+      -- Canonical active_future scope from v_lease_population at the 60-day
+      -- window, so generated renewal tasks always target the same population
+      -- the pages display (deduped, renewed-superseded and family-held units
+      -- excluded). Contacts come from the view's Bronze tenant_directory
+      -- lookup — same source as the pages.
       SELECT
-        le.unit_id,
-        gt.full_name           AS tenant_name,
-        le.lease_end_date::text,
-        (le.lease_end_date - CURRENT_DATE)::int AS days_until_expiration,
-        gt.phone,
-        gt.email
-      FROM gold_lease_expirations le
-      LEFT JOIN gold_tenants gt ON gt.unit_id = le.unit_id
-      WHERE le.lease_end_date >= CURRENT_DATE
-        AND le.lease_end_date <= CURRENT_DATE + INTERVAL '60 days'
-      ORDER BY le.lease_end_date ASC
+        unit_id,
+        tenant_name,
+        lease_end_date::text,
+        days_until_expiration,
+        contact_phone          AS phone,
+        contact_email          AS email
+      FROM v_lease_population
+      WHERE is_soonest_future_for_unit AND NOT is_superseded AND NOT is_family_held
+        AND days_until_expiration <= 60
+      ORDER BY lease_end_date ASC
     `;
 
     const tasks = rows.map((r, idx) => {
@@ -1771,35 +1762,58 @@ cacheLoaders.set('units:notice', async () => {
 cacheLoaders.set('leases:90', async () => {
   const sql = getDb();
   try {
-    return await sql`
+    // Canonical active_future scope from v_lease_population at the 90-day
+    // window — identical query to the live GET /jasmine/leases route, and
+    // mapped to the SAME shape the route caches, so the cached and uncached
+    // responses can no longer diverge. (Pre-view, this loader hardcoded
+    // monthly_rent to NULL and omitted unit_type while the live route
+    // computed both — two different shapes under one cache key depending on
+    // who populated it first.)
+    const rows = await sql<{
+      unit_id: string;
+      tenant_name: string | null;
+      unit_type: string | null;
+      lease_end_date: string | null;
+      days_until_expiration: number | null;
+      monthly_rent: string | null;
+      phone: string | null;
+      email: string | null;
+    }[]>`
       SELECT
-        le.unit_id,
-        gt.full_name AS tenant_name,
-        gt.email,
-        gt.phone,
-        le.lease_end_date::text,
-        (le.lease_end_date - CURRENT_DATE)::int AS days_until_expiration,
-        NULL::numeric AS monthly_rent,
-        NULL::numeric AS market_rent
-      FROM gold_lease_expirations le
-      LEFT JOIN LATERAL (
-        SELECT full_name, email, phone
-        FROM gold_tenants
-        WHERE unit_id = le.unit_id
-        ORDER BY (is_primary = true) DESC
-        LIMIT 1
-      ) gt ON true
-      WHERE le.lease_end_date >= CURRENT_DATE
-        AND le.lease_end_date <= CURRENT_DATE + INTERVAL '90 days'
-      ORDER BY le.lease_end_date ASC
+        unit_id,
+        tenant_name,
+        unit_type,
+        lease_end_date::text,
+        days_until_expiration,
+        monthly_rent::text AS monthly_rent,
+        contact_phone      AS phone,
+        contact_email      AS email
+      FROM v_lease_population
+      WHERE is_soonest_future_for_unit AND NOT is_superseded AND NOT is_family_held
+        AND days_until_expiration <= 90
+      ORDER BY lease_end_date ASC
     `;
+    return rows.map(r => ({
+      unit_id:               r.unit_id,
+      tenant_name:           r.tenant_name,
+      unit_type:             r.unit_type,
+      lease_end_date:        r.lease_end_date,
+      days_until_expiration: r.days_until_expiration,
+      monthly_rent:          r.monthly_rent !== null ? parseFloat(r.monthly_rent) : null,
+      phone:                 r.phone,
+      email:                 r.email,
+    }));
   } finally { await sql.end(); }
 });
 
 cacheLoaders.set('notices', async () => {
   const sql = getDb();
   try {
-    // Units on notice: join gold_units (has unit_status) with lease and tenant data
+    // Units on notice: join gold_units (has unit_status) with lease and tenant data.
+    // Lease fields come from v_lease_population (canonical countdown source);
+    // the LATERAL picks the unit's current lease — soonest future row if one
+    // exists, else the most recent past row — and caps at one row per unit so
+    // a unit can never be duplicated by multiple lease rows.
     return await sql`
       SELECT
         gu.unit_id,
@@ -1807,9 +1821,17 @@ cacheLoaders.set('notices', async () => {
         gt.email,
         gt.phone,
         le.lease_end_date::text,
-        (le.lease_end_date - CURRENT_DATE)::int AS days_until_expiration
+        le.days_until_expiration
       FROM gold_units gu
-      LEFT JOIN gold_lease_expirations le ON le.unit_id = gu.unit_id
+      LEFT JOIN LATERAL (
+        SELECT lease_end_date, days_until_expiration
+        FROM v_lease_population v
+        WHERE v.unit_id = gu.unit_id
+        ORDER BY v.is_future DESC,
+                 CASE WHEN v.is_future THEN v.lease_end_date END ASC,
+                 v.lease_end_date DESC NULLS LAST
+        LIMIT 1
+      ) le ON true
       LEFT JOIN LATERAL (
         SELECT full_name, email, phone
         FROM gold_tenants
@@ -1949,18 +1971,22 @@ cacheLoaders.set('tasks', async () => {
       phone: string | null;
       email: string | null;
     }[]>`
+      -- Canonical active_future scope from v_lease_population at the 60-day
+      -- window, so generated renewal tasks always target the same population
+      -- the pages display (deduped, renewed-superseded and family-held units
+      -- excluded). Contacts come from the view's Bronze tenant_directory
+      -- lookup — same source as the pages.
       SELECT
-        le.unit_id,
-        gt.full_name           AS tenant_name,
-        le.lease_end_date::text,
-        (le.lease_end_date - CURRENT_DATE)::int AS days_until_expiration,
-        gt.phone,
-        gt.email
-      FROM gold_lease_expirations le
-      LEFT JOIN gold_tenants gt ON gt.unit_id = le.unit_id
-      WHERE le.lease_end_date >= CURRENT_DATE
-        AND le.lease_end_date <= CURRENT_DATE + INTERVAL '60 days'
-      ORDER BY le.lease_end_date ASC
+        unit_id,
+        tenant_name,
+        lease_end_date::text,
+        days_until_expiration,
+        contact_phone          AS phone,
+        contact_email          AS email
+      FROM v_lease_population
+      WHERE is_soonest_future_for_unit AND NOT is_superseded AND NOT is_family_held
+        AND days_until_expiration <= 60
+      ORDER BY lease_end_date ASC
     `;
     const tasks = rows.map(r => {
       const days = r.days_until_expiration ?? 999;
