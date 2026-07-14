@@ -11,7 +11,7 @@
 import { Router, Request, Response } from 'express';
 import postgres from 'postgres';
 
-const router = Router();
+const router: Router = Router();
 
 function getDb(): postgres.Sql {
   const url = process.env.DATABASE_URL;
@@ -349,6 +349,9 @@ router.get('/pages/leasing-pipeline/prospects', async (req: Request, res: Respon
       move_in_preference: string;
       received_at: string;
       last_activity_date: string;
+      last_activity_at: string;
+      inactivity_days: number;
+      is_stale: boolean;
       last_activity_type: string;
       assigned_user: string;
       credit_score: number;
@@ -368,6 +371,9 @@ router.get('/pages/leasing-pipeline/prospects', async (req: Request, res: Respon
         move_in_preference::text,
         received_at::text,
         last_activity_date::text,
+        COALESCE(last_activity_date, received_at)::text AS last_activity_at,
+        GREATEST(0, CURRENT_DATE - COALESCE(last_activity_date, received_at)::date)::integer AS inactivity_days,
+        (COALESCE(last_activity_date, received_at)::date < CURRENT_DATE - INTERVAL '30 days') AS is_stale,
         last_activity_type,
         assigned_user,
         credit_score
@@ -391,6 +397,10 @@ router.get('/pages/leasing-pipeline/prospects', async (req: Request, res: Respon
       move_in_preference:  r.move_in_preference,
       received_at:         r.received_at,
       last_activity_date:  r.last_activity_date,
+      last_activity_at:    r.last_activity_at,
+      inactivity_days:     r.inactivity_days,
+      is_stale:            r.is_stale,
+      staleness_threshold_days: 30,
       last_activity_type:  r.last_activity_type,
       assigned_user:       r.assigned_user,
       credit_score:        r.credit_score,
@@ -501,7 +511,54 @@ router.get('/pages/unit-turns', async (req: Request, res: Response) => {
       target_days: number;
       total_billed: string;
       report_date: string;
+      status: string;
     }[]>`
+      WITH normalized AS (
+        SELECT
+          REGEXP_REPLACE(
+            REGEXP_REPLACE(
+              LOWER(REGEXP_REPLACE(TRIM(unit_id), '\\s*[_-]\\s*', '-', 'g')),
+              '^([0-9]+)-\\1-', '\\1-'
+            ),
+            '-+', '-', 'g'
+          ) AS unit_id,
+          tenant_id,
+          event_type,
+          move_in_date,
+          move_out_date,
+          expected_move_in_date,
+          turn_end_date,
+          days_to_complete,
+          target_days,
+          total_billed,
+          report_date,
+          created_at
+        FROM gold_unit_turnover
+      ),
+      deduped AS (
+        SELECT DISTINCT ON (
+          unit_id,
+          move_out_date,
+          expected_move_in_date,
+          turn_end_date,
+          days_to_complete
+        )
+          *,
+          CASE
+            WHEN move_out_date > CURRENT_DATE THEN 'scheduled'
+            WHEN turn_end_date IS NOT NULL AND turn_end_date <= CURRENT_DATE THEN 'completed'
+            ELSE 'in_progress'
+          END AS status
+        FROM normalized
+        ORDER BY
+          unit_id,
+          move_out_date,
+          expected_move_in_date,
+          turn_end_date,
+          days_to_complete,
+          report_date DESC NULLS LAST,
+          created_at DESC
+      )
       SELECT
         unit_id,
         tenant_id,
@@ -513,8 +570,9 @@ router.get('/pages/unit-turns', async (req: Request, res: Response) => {
         days_to_complete,
         target_days,
         total_billed::text,
-        report_date::text
-      FROM gold_unit_turnover
+        report_date::text,
+        status
+      FROM deduped
       WHERE ${eventType === null} OR event_type ILIKE ${eventType ?? ''}
       ORDER BY move_out_date DESC NULLS LAST
     `;
@@ -531,6 +589,8 @@ router.get('/pages/unit-turns', async (req: Request, res: Response) => {
       target_days:           r.target_days,
       total_billed:          r.total_billed ? parseFloat(r.total_billed) : null,
       report_date:           r.report_date,
+      status:                r.status,
+      is_current:            r.status === 'in_progress',
     }));
 
     res.json({ turns, count: turns.length });
