@@ -1807,7 +1807,7 @@ cacheLoaders.set('notices', async () => {
         gt.email,
         gt.phone,
         le.lease_end_date::text,
-        le.days_until_expiration
+        (le.lease_end_date - CURRENT_DATE)::int AS days_until_expiration
       FROM gold_units gu
       LEFT JOIN gold_lease_expirations le ON le.unit_id = gu.unit_id
       LEFT JOIN LATERAL (

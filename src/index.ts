@@ -218,7 +218,7 @@ app.get("/api/v1/leases/expirations", async (req: Request, res: Response) => {
       SELECT le.id, le.bronze_report_id, le.tenant_id, le.unit_id,
              le.lease_start_date::text AS lease_start_date,
              le.lease_end_date::text   AS lease_end_date,
-             le.days_until_expiration,
+             (le.lease_end_date - CURRENT_DATE)::int AS days_until_expiration,
              rl.monthly_rent::text     AS monthly_rent,
              tl.contact_email,
              tl.contact_phone,
@@ -431,7 +431,7 @@ app.get("/api/v1/leases/:id", async (req: Request, res: Response) => {
       SELECT le.id, le.bronze_report_id, le.tenant_id, le.unit_id,
              le.lease_start_date::text AS lease_start_date,
              le.lease_end_date::text   AS lease_end_date,
-             le.days_until_expiration,
+             (le.lease_end_date - CURRENT_DATE)::int AS days_until_expiration,
              rl.monthly_rent::text     AS monthly_rent,
              tl.contact_email,
              tl.contact_phone,
@@ -1519,8 +1519,8 @@ app.get("/api/v1/insights/at-risk-revenue", async (req: Request, res: Response) 
       le_deduped AS (
         SELECT DISTINCT ON (tenant_id)
           tenant_id,
-          lease_end_date::text AS lease_end_date,
-          days_until_expiration
+          lease_end_date,
+          (lease_end_date - CURRENT_DATE)::int AS days_until_expiration
         FROM gold_lease_expirations
         ORDER BY tenant_id, lease_end_date ASC
       ),
@@ -1541,13 +1541,13 @@ app.get("/api/v1/insights/at-risk-revenue", async (req: Request, res: Response) 
           d.risk_level                         AS delinquency_level,
           d.days_overdue,
           le.lease_end_date,
-          le.days_until_expiration,
+          (le.lease_end_date - CURRENT_DATE)::int AS days_until_expiration,
           CASE
             WHEN d.days_overdue >= 90 AND ar.bucket_90_plus > 0
             THEN 'HIGH'
             WHEN ar.risk_score >= 5000
-                 AND le.days_until_expiration IS NOT NULL
-                 AND le.days_until_expiration <= 90
+                 AND le.lease_end_date IS NOT NULL
+                 AND (le.lease_end_date - CURRENT_DATE) <= 90
             THEN 'HIGH'
             WHEN ar.risk_score >= 2000
             THEN 'MEDIUM'
@@ -1580,7 +1580,8 @@ app.get("/api/v1/insights/at-risk-revenue", async (req: Request, res: Response) 
       ),
       le_deduped AS (
         SELECT DISTINCT ON (tenant_id)
-          tenant_id, days_until_expiration
+          tenant_id, lease_end_date,
+          (lease_end_date - CURRENT_DATE)::int AS days_until_expiration
         FROM gold_lease_expirations
         ORDER BY tenant_id, lease_end_date ASC
       ),
@@ -1594,14 +1595,14 @@ app.get("/api/v1/insights/at-risk-revenue", async (req: Request, res: Response) 
         SELECT
           ar.tenant_id,
           ar.risk_score,
-          le.days_until_expiration,
+          (le.lease_end_date - CURRENT_DATE)::int AS days_until_expiration,
           d.days_overdue,
           CASE
             WHEN d.days_overdue >= 90 AND ar.bucket_90_plus > 0
             THEN 'HIGH'
             WHEN ar.risk_score >= 5000
-                 AND le.days_until_expiration IS NOT NULL
-                 AND le.days_until_expiration <= 90
+                 AND le.lease_end_date IS NOT NULL
+                 AND (le.lease_end_date - CURRENT_DATE) <= 90
             THEN 'HIGH'
             WHEN ar.risk_score >= 2000
             THEN 'MEDIUM'
@@ -1627,6 +1628,8 @@ app.get("/api/v1/insights/at-risk-revenue", async (req: Request, res: Response) 
       limit,
       offset,
       urgency_filter: urgencyFilter,
+      population_definition:
+        "All tenants with an aged-receivables record, deduplicated per tenant keeping the highest risk score. Includes zero-balance and credit-balance rows. Differs from collections-risk, which excludes non-positive balances — the two totals are distinct populations, not a reconciliation error.",
       data: rows.map((r) => ({
         tenant_id:             r.tenant_id,
         full_name:             r.full_name,
@@ -2223,8 +2226,8 @@ app.get("/api/v1/insights/collections-risk", async (req: Request, res: Response)
       le_deduped AS (
         SELECT DISTINCT ON (tenant_id)
           tenant_id,
-          lease_end_date::text          AS lease_end_date,
-          days_until_expiration
+          lease_end_date,
+          (lease_end_date - CURRENT_DATE)::int AS days_until_expiration
         FROM gold_lease_expirations
         ORDER BY tenant_id, lease_end_date ASC, created_at DESC
       ),
@@ -2258,7 +2261,7 @@ app.get("/api/v1/insights/collections-risk", async (req: Request, res: Response)
           dc.days_overdue,
           dc.delinquency_level,
           le.lease_end_date,
-          le.days_until_expiration,
+          (le.lease_end_date - CURRENT_DATE)::int AS days_until_expiration,
           LEAST(100, ROUND(
             COALESCE(
               CASE WHEN ar.total_balance > 0
@@ -2271,10 +2274,10 @@ app.get("/api/v1/insights/collections-risk", async (req: Request, res: Response)
             ) +
             COALESCE(
               CASE
-                WHEN le.days_until_expiration IS NULL THEN 0
-                WHEN le.days_until_expiration <= 30   THEN 25
-                WHEN le.days_until_expiration <= 60   THEN 18
-                WHEN le.days_until_expiration <= 90   THEN 10
+                WHEN le.lease_end_date IS NULL THEN 0
+                WHEN (le.lease_end_date - CURRENT_DATE) <= 30 THEN 25
+                WHEN (le.lease_end_date - CURRENT_DATE) <= 60 THEN 18
+                WHEN (le.lease_end_date - CURRENT_DATE) <= 90 THEN 10
                 ELSE 0
               END, 0
             )
@@ -2366,6 +2369,8 @@ app.get("/api/v1/insights/collections-risk", async (req: Request, res: Response)
       limit,
       offset,
       classification_filter: classFilter,
+      population_definition:
+        "Current and past tenants with outstanding collections exposure, classified and deduplicated per unit. Excludes zero/credit-balance aged-receivables rows included in at-risk-revenue — the two totals are distinct populations, not a reconciliation error.",
       data: rows.map((r) => ({
         tenant_id:              r.tenant_id,
         full_name:              r.full_name,
@@ -2419,8 +2424,13 @@ app.get("/api/v1/insights/turnover-velocity", async (req: Request, res: Response
     const unitQuery = sql<TurnoverUnitRow[]>`
       SELECT
         unit_id,
-        COUNT(*) FILTER (WHERE event_type = 'move_in')  AS number_of_move_ins,
-        COUNT(*) FILTER (WHERE event_type = 'move_out') AS number_of_move_outs,
+        -- gold_unit_turnover rows are canonical 'turn' events (event_type is
+        -- no longer 'move_in'/'move_out' after the July 2026 dedup rework),
+        -- so component counts derive from the event dates on the SAME
+        -- relation as turnover_count. The old event_type filters always
+        -- returned 0 alongside a nonzero turnover_count.
+        COUNT(*) FILTER (WHERE move_in_date IS NOT NULL OR event_type = 'move_in')   AS number_of_move_ins,
+        COUNT(*) FILTER (WHERE move_out_date IS NOT NULL OR event_type = 'move_out') AS number_of_move_outs,
         COUNT(*)                                         AS turnover_count,
         MIN(COALESCE(move_in_date, move_out_date))::text AS first_event_date,
         MAX(COALESCE(move_in_date, move_out_date))::text AS last_event_date
@@ -2612,7 +2622,7 @@ app.get("/api/v1/insights/unit-intelligence", async (req: Request, res: Response
           t.full_name              AS tenant_name,
           t.lease_status,
           le.lease_end_date,
-          le.days_until_expiration
+          (le.lease_end_date - CURRENT_DATE)::int AS days_until_expiration
         FROM gold_lease_expirations le
         LEFT JOIN gold_tenants t ON t.tenant_id = le.tenant_id
         ORDER BY le.unit_id, le.lease_end_date DESC NULLS LAST
@@ -2825,7 +2835,8 @@ app.get("/api/v1/insights/unit-intelligence", async (req: Request, res: Response
       ),
       latest_tenant_per_unit AS (
         SELECT DISTINCT ON (le.unit_id)
-          le.unit_id, le.tenant_id, le.lease_end_date, le.days_until_expiration
+          le.unit_id, le.tenant_id, le.lease_end_date,
+          (le.lease_end_date - CURRENT_DATE)::int AS days_until_expiration
         FROM gold_lease_expirations le
         ORDER BY le.unit_id, le.lease_end_date DESC NULLS LAST
       ),
@@ -2923,7 +2934,8 @@ app.get("/api/v1/insights/unit-intelligence", async (req: Request, res: Response
         SELECT unit_id FROM gold_units WHERE exclude_from_occupancy IS NOT TRUE
       ),
       latest_lease AS (
-        SELECT DISTINCT ON (unit_id) unit_id, lease_end_date, days_until_expiration
+        SELECT DISTINCT ON (unit_id) unit_id, lease_end_date,
+          (lease_end_date - CURRENT_DATE)::int AS days_until_expiration
         FROM gold_lease_expirations ORDER BY unit_id, lease_end_date DESC NULLS LAST
       ),
       unit_status_cte AS (
@@ -3299,6 +3311,12 @@ app.get("/api/v1/units", async (_req: Request, res: Response) => {
       success: true,
       total: rows.length,
       source: 'gold_units',
+      roster_notes: {
+        canonical_count: rows.length,
+        occupancy_excluded_units: rows.filter((r) => r.exclude_from_occupancy).map((r) => r.unit_id),
+        note:
+          'The canonical roster is the authoritative union of the latest AppFolio unit-directory, rent-roll, lease, and tenant sources (181 units as of July 2026). Jasmine may additionally reference one transient/system unit outside this roster, giving a "182 total system units" figure — that transient unit is not a leaseable canonical unit and is intentionally excluded here.',
+      },
       data: rows,
     });
   } catch (err: unknown) {
@@ -3695,13 +3713,37 @@ app.get("/api/v1/maintenance", async (req: Request, res: Response) => {
     `;
 
     // Dynamically normalise fields — handles any date column naming convention
+    const MONTH_NUM: Record<string, string> = {
+      jan: '01', feb: '02', mar: '03', apr: '04', may: '05', jun: '06',
+      jul: '07', aug: '08', sep: '09', oct: '10', nov: '11', dec: '12',
+    };
     const toDate = (v: unknown): string | null => {
       if (!v) return null;
-      const s = String(v);
-      // Handle MM/DD/YYYY or ISO datetime
+      const s = String(v).trim();
+      // ISO datetime / date
+      if (/^\d{4}-\d{2}-\d{2}/.test(s)) return s.slice(0, 10);
+      // MM/DD/YYYY
       const mdy = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})/);
       if (mdy) return `${mdy[3]}-${mdy[1].padStart(2,'0')}-${mdy[2].padStart(2,'0')}`;
-      return s.slice(0, 10);
+      // Year-less AppFolio format: "Fri Jul 10" / "Jul 10". Passing these
+      // through verbatim made downstream JS date parsing default the year
+      // to 2001 (the review's corrupted completion dates). Infer the year:
+      // current year, unless that lands more than ~180 days in the future,
+      // in which case it's a previous-year date (e.g. "Dec 30" in January).
+      const named = s.match(/^(?:[A-Za-z]{3,9},?\s+)?([A-Za-z]{3})[a-z]*\.?\s+(\d{1,2})$/);
+      if (named) {
+        const mon = MONTH_NUM[named[1].toLowerCase()];
+        if (mon) {
+          const day = named[2].padStart(2, '0');
+          const now = new Date();
+          let year = now.getFullYear();
+          const candidate = new Date(`${year}-${mon}-${day}T00:00:00Z`);
+          if (candidate.getTime() - now.getTime() > 180 * 86400000) year -= 1;
+          return `${year}-${mon}-${day}`;
+        }
+      }
+      // Unparseable → null rather than leaking a non-ISO string to clients.
+      return null;
     };
     const workOrders: MaintenanceWorkOrder[] = goldRows.map(r => ({
       work_order_id:       String(r.work_order_id    ?? r.id ?? '').trim() || null,
