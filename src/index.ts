@@ -2,6 +2,7 @@ import express, { Express, Request, Response, NextFunction } from "express";
 import postgres from "postgres";
 import jasmineRouter from "./routes/jasmine";
 import pagesRouter from "./routes/pages";
+import { requireAuth, actorFrom, type AuthedRequest } from "./auth";
 
 const app: Express = express();
 const PORT = parseInt(process.env.PORT ?? "3003", 10);
@@ -18,6 +19,12 @@ app.use((_req: Request, res: Response, next) => {
   if (_req.method === "OPTIONS") { res.status(204).end(); return; }
   next();
 });
+
+// ── Authentication boundary (Phase 1) ──────────────────────────────────────
+// Deny-by-default: every route except /health and / requires a valid Supabase
+// session (or the internal service secret). Runs after CORS so OPTIONS
+// preflight is answered above before auth is evaluated.
+app.use(requireAuth());
 
 // ── Database client ───────────────────────────────────────────────────────────
 function getDb(): postgres.Sql {
@@ -2357,7 +2364,7 @@ app.post("/api/v2/actions", async (req: Request, res: Response) => {
     `;
     await sql`
       INSERT INTO action_events (action_id, from_status, to_status, note, actor)
-      VALUES (${row.action_id}, NULL, 'open', 'created', ${b.owner ?? 'Cindy'})
+      VALUES (${row.action_id}, NULL, 'open', 'created', ${actorFrom(req as AuthedRequest) ?? b.owner ?? 'Cindy'})
     `;
     res.status(201).json({ success: true, data: row });
   } catch (err: unknown) {
@@ -2401,7 +2408,7 @@ app.patch("/api/v2/actions/:id", async (req: Request, res: Response) => {
     if (newStatus && newStatus !== current.status) {
       await sql`
         INSERT INTO action_events (action_id, from_status, to_status, note, actor)
-        VALUES (${id}, ${current.status}, ${newStatus}, ${b.note ?? null}, ${b.actor ?? 'Cindy'})
+        VALUES (${id}, ${current.status}, ${newStatus}, ${b.note ?? null}, ${actorFrom(req as AuthedRequest) ?? b.actor ?? 'Cindy'})
       `;
     }
     res.status(200).json({ success: true, data: row });
