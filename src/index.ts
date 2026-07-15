@@ -2404,6 +2404,63 @@ app.patch("/api/v2/actions/:id", async (req: Request, res: Response) => {
 // view. Lease scopes come from v_lease_population; prospect cohorts from
 // gold_prospects with the same 30-day staleness rule the pipeline page uses.
 // Every count is actionable (family/employee excluded from lease scopes).
+// ══ Release 3: Collections surface (/api/v2/collections) ═════════════════════
+// Stage-based collections queues by days overdue, headlined by positive
+// collectible exposure. Credits and zero balances excluded; deduplicated to
+// the latest record per tenant.
+app.get("/api/v2/collections", async (_req: Request, res: Response) => {
+  let sql: postgres.Sql | null = null;
+  try {
+    sql = getDb();
+    const [row] = await sql<{
+      exposure: string; tenants: string;
+      current_due: string; early: string; serious: string; severe: string;
+      early_amt: string; serious_amt: string; severe_amt: string;
+    }[]>`
+      WITH latest AS (
+        SELECT DISTINCT ON (tenant_id) tenant_id, balance_due, days_overdue
+        FROM gold_delinquency_records
+        ORDER BY tenant_id, created_at DESC
+      ), pos AS (
+        SELECT * FROM latest WHERE balance_due > 0
+      )
+      SELECT
+        COALESCE(SUM(balance_due), 0)::text AS exposure,
+        COUNT(*)::text AS tenants,
+        COUNT(*) FILTER (WHERE COALESCE(days_overdue,0) <= 0)::text AS current_due,
+        COUNT(*) FILTER (WHERE days_overdue BETWEEN 1 AND 30)::text AS early,
+        COUNT(*) FILTER (WHERE days_overdue BETWEEN 31 AND 60)::text AS serious,
+        COUNT(*) FILTER (WHERE days_overdue > 60)::text AS severe,
+        COALESCE(SUM(balance_due) FILTER (WHERE days_overdue BETWEEN 1 AND 30), 0)::text AS early_amt,
+        COALESCE(SUM(balance_due) FILTER (WHERE days_overdue BETWEEN 31 AND 60), 0)::text AS serious_amt,
+        COALESCE(SUM(balance_due) FILTER (WHERE days_overdue > 60), 0)::text AS severe_amt
+      FROM pos
+    `;
+    res.status(200).json({
+      success: true,
+      as_of: new Date().toISOString(),
+      headline: {
+        label: "Collectible exposure",
+        value: parseFloat(row.exposure),
+        tenants: parseInt(row.tenants, 10),
+        note: "Positive balances only, latest per tenant. Credits and zero balances excluded.",
+      },
+      stages: {
+        current_due: { label: "Due (not yet late)", value: parseInt(row.current_due, 10) },
+        early:       { label: "1–30 days late", value: parseInt(row.early, 10), amount: parseFloat(row.early_amt) },
+        serious:     { label: "31–60 days late", value: parseInt(row.serious, 10), amount: parseFloat(row.serious_amt) },
+        severe:      { label: "60+ days late", value: parseInt(row.severe, 10), amount: parseFloat(row.severe_amt) },
+      },
+    });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`[${SERVICE_NAME}] GET /api/v2/collections error:`, message);
+    res.status(500).json({ success: false, error: message });
+  } finally {
+    if (sql) await sql.end();
+  }
+});
+
 app.get("/api/v2/leasing", async (_req: Request, res: Response) => {
   let sql: postgres.Sql | null = null;
   try {
