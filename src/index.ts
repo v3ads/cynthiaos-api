@@ -347,6 +347,13 @@ SELECT
       AND t.move_in_date IS NOT NULL
       AND t.move_in_date::date >= b.lease_end_date
   )                                                                     AS is_released,
+  -- is_vacating: the tenant has given notice (unit_status='notice') or the
+  -- unit is no longer occupied while a future-dated lease record lingers.
+  -- Either way there is an active/pending move-out, so this is NOT a renewal
+  -- decision — it belongs in the move-out/turn workflow, not the renewals
+  -- queue. (Cindy, July 2026: notice-given units were wrongly showing as
+  -- renewals because renewed/released/family checks didn't cover notice.)
+  (vuo.unit_status = 'notice' OR vuo.unit_status = 'vacant')            AS is_vacating,
   COALESCE(gu.unit_group = 'picinich_family', FALSE)                    AS is_family_held,
   (juo.unit_id IS NOT NULL AND juo.override_type = 'employee')          AS is_employee_held,
   vuo.unit_status,
@@ -443,7 +450,7 @@ app.get("/api/v1/leases/expirations", async (req: Request, res: Response) => {
     // renewed (is_superseded), re-leased (is_released), family-held, and
     // employee-held units are all excluded from action scopes.
     const actionablePred = sql`is_soonest_future_for_unit AND NOT is_superseded
-              AND NOT is_released AND NOT is_family_held AND NOT is_employee_held`;
+              AND NOT is_released AND NOT is_vacating AND NOT is_family_held AND NOT is_employee_held`;
     const scopeWhere =
       scope === "active_future"
         ? sql`${actionablePred}
@@ -553,7 +560,7 @@ app.get("/api/v1/leases/expiring-soon", async (req: Request, res: Response) => {
              created_at
       FROM v_lease_population
       WHERE is_soonest_future_for_unit AND NOT is_superseded
-        AND NOT is_released AND NOT is_family_held AND NOT is_employee_held
+        AND NOT is_released AND NOT is_vacating AND NOT is_family_held AND NOT is_employee_held
         AND days_until_expiration <= ${days}
       ORDER BY lease_end_date ASC
       LIMIT ${limit}
@@ -561,7 +568,7 @@ app.get("/api/v1/leases/expiring-soon", async (req: Request, res: Response) => {
     const countRes = await sql<{ count: string }[]>`
       SELECT COUNT(*) AS count FROM v_lease_population
       WHERE is_soonest_future_for_unit AND NOT is_superseded
-        AND NOT is_released AND NOT is_family_held AND NOT is_employee_held
+        AND NOT is_released AND NOT is_vacating AND NOT is_family_held AND NOT is_employee_held
         AND days_until_expiration <= ${days}
     `;
     const total = parseInt(countRes[0].count, 10);
@@ -608,7 +615,7 @@ app.get("/api/v1/leases/upcoming-renewals", async (req: Request, res: Response) 
              created_at
       FROM v_lease_population
       WHERE is_soonest_future_for_unit AND NOT is_superseded
-        AND NOT is_released AND NOT is_family_held AND NOT is_employee_held
+        AND NOT is_released AND NOT is_vacating AND NOT is_family_held AND NOT is_employee_held
         AND days_until_expiration > ${fromDays}
         AND days_until_expiration <= ${toDays}
       ORDER BY lease_end_date ASC
@@ -617,7 +624,7 @@ app.get("/api/v1/leases/upcoming-renewals", async (req: Request, res: Response) 
     const countRes = await sql<{ count: string }[]>`
       SELECT COUNT(*) AS count FROM v_lease_population
       WHERE is_soonest_future_for_unit AND NOT is_superseded
-        AND NOT is_released AND NOT is_family_held AND NOT is_employee_held
+        AND NOT is_released AND NOT is_vacating AND NOT is_family_held AND NOT is_employee_held
         AND days_until_expiration > ${fromDays}
         AND days_until_expiration <= ${toDays}
     `;
@@ -2435,7 +2442,7 @@ app.get("/api/v2/portfolio", async (_req: Request, res: Response) => {
     const [lease] = await sql<{ renewals: string; holdover: string; closeout: string }[]>`
       SELECT
         COUNT(*) FILTER (WHERE is_soonest_future_for_unit AND NOT is_superseded
-          AND NOT is_released AND NOT is_family_held AND NOT is_employee_held
+          AND NOT is_released AND NOT is_vacating AND NOT is_family_held AND NOT is_employee_held
           AND days_until_expiration <= 90)::text AS renewals,
         COUNT(*) FILTER (WHERE is_holdover AND NOT is_family_held AND NOT is_employee_held)::text AS holdover,
         COUNT(*) FILTER (WHERE is_stale_closeout AND NOT is_family_held AND NOT is_employee_held)::text AS closeout
@@ -2663,10 +2670,10 @@ app.get("/api/v2/leasing", async (_req: Request, res: Response) => {
     }[]>`
       SELECT
         COUNT(*) FILTER (WHERE is_soonest_future_for_unit AND NOT is_superseded
-          AND NOT is_released AND NOT is_family_held AND NOT is_employee_held
+          AND NOT is_released AND NOT is_vacating AND NOT is_family_held AND NOT is_employee_held
           AND days_until_expiration <= 90)::text AS renewals_due,
         COUNT(*) FILTER (WHERE is_soonest_future_for_unit AND NOT is_superseded
-          AND NOT is_released AND NOT is_family_held AND NOT is_employee_held
+          AND NOT is_released AND NOT is_vacating AND NOT is_family_held AND NOT is_employee_held
           AND days_until_expiration <= 30)::text AS renewals_30,
         COUNT(*) FILTER (WHERE is_holdover AND NOT is_family_held AND NOT is_employee_held)::text AS holdover,
         COUNT(*) FILTER (WHERE is_stale_closeout AND NOT is_family_held AND NOT is_employee_held)::text AS stale_closeout,
@@ -2763,7 +2770,7 @@ app.get("/api/v2/today", async (_req: Request, res: Response) => {
     const [lease] = await sql<{ due: string; holdover: string; closeout: string }[]>`
       SELECT
         COUNT(*) FILTER (WHERE is_soonest_future_for_unit AND NOT is_superseded
-          AND NOT is_released AND NOT is_family_held AND NOT is_employee_held
+          AND NOT is_released AND NOT is_vacating AND NOT is_family_held AND NOT is_employee_held
           AND days_until_expiration <= 90)::text AS due,
         COUNT(*) FILTER (WHERE is_holdover AND NOT is_family_held AND NOT is_employee_held)::text AS holdover,
         COUNT(*) FILTER (WHERE is_stale_closeout AND NOT is_family_held AND NOT is_employee_held)::text AS closeout
@@ -2887,7 +2894,7 @@ app.get("/api/v1/metrics/summary", async (_req: Request, res: Response) => {
     const [lease] = await sql<{ renewals: string; holdover: string; closeout: string }[]>`
       SELECT
         COUNT(*) FILTER (WHERE is_soonest_future_for_unit AND NOT is_superseded
-          AND NOT is_released AND NOT is_family_held AND NOT is_employee_held
+          AND NOT is_released AND NOT is_vacating AND NOT is_family_held AND NOT is_employee_held
           AND days_until_expiration <= 90)::text AS renewals,
         COUNT(*) FILTER (WHERE is_holdover AND NOT is_family_held AND NOT is_employee_held)::text AS holdover,
         COUNT(*) FILTER (WHERE is_stale_closeout AND NOT is_family_held AND NOT is_employee_held)::text AS closeout
