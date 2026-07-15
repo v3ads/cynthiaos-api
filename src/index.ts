@@ -2408,6 +2408,62 @@ app.patch("/api/v2/actions/:id", async (req: Request, res: Response) => {
 // Stage-based collections queues by days overdue, headlined by positive
 // collectible exposure. Credits and zero balances excluded; deduplicated to
 // the latest record per tenant.
+// ══ Release 3: Operations surface (/api/v2/operations) ══════════════════════
+// Unified maintenance + turns under the source-proven deterministic states
+// (decision 8: Scheduled/Open/In Progress/Complete/Unknown). Emphasizes open
+// and overdue work and lost-rent turns.
+app.get("/api/v2/operations", async (_req: Request, res: Response) => {
+  let sql: postgres.Sql | null = null;
+  try {
+    sql = getDb();
+    const [maint] = await sql<{
+      total: string; open: string; assigned: string; completed: string;
+    }[]>`
+      SELECT
+        COUNT(*)::text AS total,
+        COUNT(*) FILTER (WHERE status IS NULL OR status ILIKE '%new%')::text AS open,
+        COUNT(*) FILTER (WHERE status ILIKE '%assigned%' OR status ILIKE '%scheduled%' OR status ILIKE '%work done%')::text AS assigned,
+        COUNT(*) FILTER (WHERE status ILIKE '%completed%')::text AS completed
+      FROM gold_maintenance
+    `;
+    const [turns] = await sql<{
+      completed: string; in_progress: string; scheduled: string; overdue: string;
+    }[]>`
+      SELECT
+        COUNT(*) FILTER (WHERE turn_end_date IS NOT NULL OR days_to_complete IS NOT NULL)::text AS completed,
+        COUNT(*) FILTER (WHERE move_out_date IS NOT NULL AND move_out_date::date <= CURRENT_DATE
+          AND turn_end_date IS NULL AND days_to_complete IS NULL)::text AS in_progress,
+        COUNT(*) FILTER (WHERE move_out_date IS NOT NULL AND move_out_date::date > CURRENT_DATE)::text AS scheduled,
+        COUNT(*) FILTER (WHERE move_out_date IS NOT NULL AND move_out_date::date <= CURRENT_DATE
+          AND turn_end_date IS NULL AND days_to_complete IS NULL
+          AND (CURRENT_DATE - move_out_date::date) > COALESCE(target_days, 10))::text AS overdue
+      FROM gold_unit_turnover
+    `;
+    res.status(200).json({
+      success: true,
+      as_of: new Date().toISOString(),
+      maintenance: {
+        total: parseInt(maint.total, 10),
+        open: { label: "Open / new", value: parseInt(maint.open, 10) },
+        assigned: { label: "Assigned / scheduled", value: parseInt(maint.assigned, 10) },
+        completed: { label: "Completed", value: parseInt(maint.completed, 10) },
+      },
+      turns: {
+        in_progress: { label: "In progress", value: parseInt(turns.in_progress, 10) },
+        overdue: { label: "Overdue (past target)", value: parseInt(turns.overdue, 10) },
+        scheduled: { label: "Scheduled", value: parseInt(turns.scheduled, 10) },
+        completed: { label: "Completed", value: parseInt(turns.completed, 10) },
+      },
+    });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`[${SERVICE_NAME}] GET /api/v2/operations error:`, message);
+    res.status(500).json({ success: false, error: message });
+  } finally {
+    if (sql) await sql.end();
+  }
+});
+
 app.get("/api/v2/collections", async (_req: Request, res: Response) => {
   let sql: postgres.Sql | null = null;
   try {
