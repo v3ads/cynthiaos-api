@@ -306,6 +306,16 @@ gt_active AS (
     AND lease_end_date::date > CURRENT_DATE
   GROUP BY unit_id
 ),
+gt_notice AS (
+  -- Authoritative "tenant has given notice" signal, straight from the tenant
+  -- lease-status source (the same fact the rent roll records). This is the
+  -- reliable source for is_vacating: it catches a notice-given tenant even
+  -- before the unit_vacancy occupancy report reflects it, closing the timing
+  -- gap that let notice units slip back into renewals.
+  SELECT DISTINCT unit_id
+  FROM gold_tenants
+  WHERE lease_status ILIKE '%notice%'
+),
 base AS (
   SELECT
     le.id, le.bronze_report_id, le.tenant_id, le.unit_id,
@@ -347,13 +357,16 @@ SELECT
       AND t.move_in_date IS NOT NULL
       AND t.move_in_date::date >= b.lease_end_date
   )                                                                     AS is_released,
-  -- is_vacating: the tenant has given notice (unit_status='notice') or the
-  -- unit is no longer occupied while a future-dated lease record lingers.
-  -- Either way there is an active/pending move-out, so this is NOT a renewal
-  -- decision — it belongs in the move-out/turn workflow, not the renewals
-  -- queue. (Cindy, July 2026: notice-given units were wrongly showing as
-  -- renewals because renewed/released/family checks didn't cover notice.)
-  (vuo.unit_status = 'notice' OR vuo.unit_status = 'vacant')            AS is_vacating,
+  -- is_vacating: the tenant has given notice OR the unit is no longer
+  -- occupied. Primary source is the authoritative tenant lease-status notice
+  -- flag (gtn), which records notice the moment it's given; the occupancy
+  -- states (notice/vacant) are the fallback that also catches units already
+  -- vacated. Using both closes the timing gap where a fresh notice hadn't yet
+  -- propagated to the vacancy report — the reliability fix for the renewal
+  -- exclusion (Cindy, July 2026).
+  (gtn.unit_id IS NOT NULL
+     OR vuo.unit_status = 'notice'
+     OR vuo.unit_status = 'vacant')                                     AS is_vacating,
   COALESCE(gu.unit_group = 'picinich_family', FALSE)                    AS is_family_held,
   (juo.unit_id IS NOT NULL AND juo.override_type = 'employee')          AS is_employee_held,
   vuo.unit_status,
@@ -394,6 +407,7 @@ SELECT
   tl.property
 FROM base b
 LEFT JOIN gt_active     gta ON gta.unit_id = b.unit_id
+LEFT JOIN gt_notice     gtn ON gtn.unit_id = b.unit_id
 LEFT JOIN gold_units    gu  ON gu.unit_id  = b.unit_id
 LEFT JOIN v_unit_occupancy vuo ON vuo.unit_id = b.unit_id
 LEFT JOIN jasmine_unit_overrides juo ON juo.unit_id = b.unit_id
