@@ -227,6 +227,44 @@ function mapActionRow(r: LeaseActionRow) {
 // The view is (re)created idempotently at startup via CREATE OR REPLACE.
 // Gold promotion UPSERTs into gold_lease_expirations (never drops it), so the
 // view survives pipeline runs.
+// Canonical unit occupancy: the ONE definition of a unit's live status.
+// gold_units.unit_status is a stale stored column (the July 15 partition
+// check caught it disagreeing with every displayed number); the live status
+// derives from the latest Bronze unit_vacancy report, normalized to
+// occupied/vacant/notice. Every consumer — /units, portfolio-health,
+// metrics/summary, v_lease_population, and the worker's occupancy_partition
+// check — reads this view. Do not re-derive.
+const V_UNIT_OCCUPANCY_DDL = `
+CREATE VIEW v_unit_occupancy AS
+WITH latest_uv AS (
+  SELECT MAX(report_date) AS dt FROM bronze_appfolio_reports WHERE report_type = 'unit_vacancy'
+),
+vacancy_status AS (
+  SELECT DISTINCT ON (LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\\s*-\\s*', '-', 'g')))
+    LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\\s*-\\s*', '-', 'g')) AS unit_id,
+    CASE
+      WHEN (elem->>'UnitStatus') ILIKE '%notice%' THEN 'notice'
+      WHEN (elem->>'UnitStatus') ILIKE '%vacant%' OR (elem->>'UnitStatus') ILIKE '%unoccupied%' THEN 'vacant'
+      ELSE 'occupied'
+    END AS unit_status
+  FROM bronze_appfolio_reports bar,
+       jsonb_array_elements(bar.raw_data->'results') AS elem,
+       latest_uv
+  WHERE bar.report_type = 'unit_vacancy'
+    AND bar.report_date = latest_uv.dt
+    AND elem->>'Unit' IS NOT NULL
+  ORDER BY LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\\s*-\\s*', '-', 'g'))
+)
+SELECT
+  gu.unit_id,
+  COALESCE(vs.unit_status, gu.unit_status, 'occupied') AS unit_status,
+  COALESCE(gu.exclude_from_occupancy, false)           AS exclude_from_occupancy,
+  gu.unit_group,
+  gu.created_at
+FROM gold_units gu
+LEFT JOIN vacancy_status vs ON vs.unit_id = gu.unit_id
+`;
+
 const V_LEASE_POPULATION_DDL = `
 CREATE OR REPLACE VIEW v_lease_population AS
 WITH rent_lookup AS (
@@ -311,7 +349,7 @@ SELECT
   )                                                                     AS is_released,
   COALESCE(gu.unit_group = 'picinich_family', FALSE)                    AS is_family_held,
   (juo.unit_id IS NOT NULL AND juo.override_type = 'employee')          AS is_employee_held,
-  gu.unit_status,
+  vuo.unit_status,
   -- Holdover: soonest per-unit lease is expired, no renewal or re-lease
   -- evidence, and the unit is still reported occupied — the tenant likely
   -- stayed past the lease end without a renewal being ingested.
@@ -324,7 +362,7 @@ SELECT
          AND t.move_in_date IS NOT NULL
          AND t.move_in_date::date >= b.lease_end_date
      )
-     AND gu.unit_status = 'occupied')                                   AS is_holdover,
+     AND vuo.unit_status = 'occupied')                                  AS is_holdover,
   -- Stale closeout: same expired-unresolved evidence but the unit is now
   -- vacant — the lease record should be closed and the unit routed to the
   -- vacancy/turn workflow.
@@ -337,7 +375,7 @@ SELECT
          AND t.move_in_date IS NOT NULL
          AND t.move_in_date::date >= b.lease_end_date
      )
-     AND gu.unit_status IS DISTINCT FROM 'occupied')                    AS is_stale_closeout,
+     AND vuo.unit_status IS DISTINCT FROM 'occupied')                   AS is_stale_closeout,
   gu.unit_group,
   gu.exclude_from_occupancy,
   rl.monthly_rent,
@@ -350,6 +388,7 @@ SELECT
 FROM base b
 LEFT JOIN gt_active     gta ON gta.unit_id = b.unit_id
 LEFT JOIN gold_units    gu  ON gu.unit_id  = b.unit_id
+LEFT JOIN v_unit_occupancy vuo ON vuo.unit_id = b.unit_id
 LEFT JOIN jasmine_unit_overrides juo ON juo.unit_id = b.unit_id
 LEFT JOIN rent_lookup   rl  ON rl.unit_id  = b.unit_id
 LEFT JOIN tenant_lookup tl  ON tl.unit_id  = b.unit_id
@@ -2252,7 +2291,7 @@ app.get("/api/v1/metrics/summary", async (_req: Request, res: Response) => {
              COUNT(*) FILTER (WHERE unit_status='vacant')::text   AS vacant,
              COUNT(*) FILTER (WHERE unit_status='notice')::text   AS notice,
              COUNT(*) FILTER (WHERE exclude_from_occupancy)::text AS excluded
-      FROM gold_units
+      FROM v_unit_occupancy
     `;
     const eligible = parseInt(units.total, 10) - parseInt(units.excluded, 10);
     const [lease] = await sql<{ renewals: string; holdover: string; closeout: string }[]>`
@@ -2339,36 +2378,17 @@ app.get("/api/v1/insights/portfolio-health", async (_req: Request, res: Response
   try {
     sql = getDb();
 
-    // Gather all signals in a single query using subqueries
+    // Gather all signals in a single query using subqueries.
+    // Unit counting reads v_unit_occupancy — the canonical derivation.
     const [row] = await sql<PortfolioHealthRow[]>`
-      WITH latest_uv AS (
-        SELECT MAX(report_date) AS dt FROM bronze_appfolio_reports WHERE report_type = 'unit_vacancy'
-      ),
-      vacancy_status AS (
-        SELECT DISTINCT ON (LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g')))
-          LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g')) AS unit_id,
-          CASE
-            WHEN (elem->>'UnitStatus') ILIKE '%notice%' THEN 'notice'
-            WHEN (elem->>'UnitStatus') ILIKE '%vacant%' OR (elem->>'UnitStatus') ILIKE '%unoccupied%' THEN 'vacant'
-            ELSE 'occupied'
-          END AS unit_status
-        FROM bronze_appfolio_reports bar,
-             jsonb_array_elements(bar.raw_data->'results') AS elem,
-             latest_uv
-        WHERE bar.report_type = 'unit_vacancy'
-          AND bar.report_date = latest_uv.dt
-          AND elem->>'Unit' IS NOT NULL
-        ORDER BY LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g'))
-      ),
-      unit_counts AS (
+      WITH unit_counts AS (
         SELECT
-          COUNT(*)                                                                   AS total_units,
-          COUNT(*) FILTER (WHERE COALESCE(vs.unit_status, 'occupied') = 'occupied') AS occupied_units,
-          COUNT(*) FILTER (WHERE COALESCE(vs.unit_status, 'occupied') = 'vacant')   AS vacant_units,
-          COUNT(*) FILTER (WHERE COALESCE(vs.unit_status, 'occupied') = 'notice')   AS notice_units
-        FROM gold_units gu
-        LEFT JOIN vacancy_status vs ON vs.unit_id = gu.unit_id
-        WHERE gu.exclude_from_occupancy IS NOT TRUE
+          COUNT(*)                                            AS total_units,
+          COUNT(*) FILTER (WHERE unit_status = 'occupied')    AS occupied_units,
+          COUNT(*) FILTER (WHERE unit_status = 'vacant')      AS vacant_units,
+          COUNT(*) FILTER (WHERE unit_status = 'notice')      AS notice_units
+        FROM v_unit_occupancy
+        WHERE exclude_from_occupancy IS NOT TRUE
       )
       SELECT
         -- Occupancy: derived from canonical gold_units (182-unit universe)
@@ -3730,35 +3750,11 @@ app.get("/api/v1/units", async (_req: Request, res: Response) => {
   let sql: ReturnType<typeof getDb> | null = null;
   try {
     sql = getDb();
-    // Enrich unit_status from the latest unit_vacancy Bronze report
+    // Canonical occupancy view — one definition, one place.
     const rows = await sql<{ unit_id: string; unit_status: string | null; exclude_from_occupancy: boolean; created_at: string }[]>`
-      WITH latest_uv AS (
-        SELECT MAX(report_date) AS dt FROM bronze_appfolio_reports WHERE report_type = 'unit_vacancy'
-      ),
-      vacancy_status AS (
-        SELECT DISTINCT ON (LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g')))
-          LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g')) AS unit_id,
-          CASE
-            WHEN (elem->>'UnitStatus') ILIKE '%notice%' THEN 'notice'
-            WHEN (elem->>'UnitStatus') ILIKE '%vacant%' OR (elem->>'UnitStatus') ILIKE '%unoccupied%' THEN 'vacant'
-            ELSE 'occupied'
-          END AS unit_status
-        FROM bronze_appfolio_reports bar,
-             jsonb_array_elements(bar.raw_data->'results') AS elem,
-             latest_uv
-        WHERE bar.report_type = 'unit_vacancy'
-          AND bar.report_date = latest_uv.dt
-          AND elem->>'Unit' IS NOT NULL
-        ORDER BY LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g'))
-      )
-      SELECT
-        gu.unit_id,
-        COALESCE(vs.unit_status, gu.unit_status, 'occupied') AS unit_status,
-        COALESCE(gu.exclude_from_occupancy, false) AS exclude_from_occupancy,
-        gu.created_at::text
-      FROM gold_units gu
-      LEFT JOIN vacancy_status vs ON vs.unit_id = gu.unit_id
-      ORDER BY gu.unit_id ASC
+      SELECT unit_id, unit_status, exclude_from_occupancy, created_at::text
+      FROM v_unit_occupancy
+      ORDER BY unit_id ASC
     `;
     res.status(200).json({
       success: true,
@@ -4416,6 +4412,8 @@ app.listen(PORT, "0.0.0.0", async () => {
     // view is only absent for the milliseconds between the two statements
     // during startup.
     await boot.unsafe(`DROP VIEW IF EXISTS v_lease_population`);
+    await boot.unsafe(`DROP VIEW IF EXISTS v_unit_occupancy`);
+    await boot.unsafe(V_UNIT_OCCUPANCY_DDL);
     await boot.unsafe(V_LEASE_POPULATION_DDL.replace('CREATE OR REPLACE VIEW', 'CREATE VIEW'));
     console.log(`[${SERVICE_NAME}] v_lease_population canonical lease view ensured`);
     const [cnt] = await boot<{ n: string }[]>`SELECT COUNT(*)::text AS n FROM gold_units`;
