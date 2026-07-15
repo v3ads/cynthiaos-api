@@ -2289,11 +2289,14 @@ app.get("/api/v2/actions", async (req: Request, res: Response) => {
     const owner  = req.query.owner as string | undefined;
     const entityType = req.query.entity_type as string | undefined;
     const entityId   = req.query.entity_id as string | undefined;
-    // Default view excludes done/dismissed unless explicitly requested.
+    // Status semantics: a specific status filters to it; 'all' returns every
+    // status; omitting status returns the working set (excludes done/dismissed).
+    const specificStatus = status && status !== 'all' ? status : null;
+    const excludeResolved = !status; // only when status omitted entirely
     const rows = await sql`
       SELECT * FROM actions
-      WHERE (${status ?? null}::text IS NULL OR status = ${status ?? null})
-        AND (${status ? null : true} IS NULL OR status NOT IN ('done','dismissed'))
+      WHERE (${specificStatus}::text IS NULL OR status = ${specificStatus})
+        AND (${!excludeResolved}::boolean OR status NOT IN ('done','dismissed'))
         AND (${type ?? null}::text IS NULL OR type = ${type ?? null})
         AND (${owner ?? null}::text IS NULL OR owner = ${owner ?? null})
         AND (${entityType ?? null}::text IS NULL OR entity_type = ${entityType ?? null})
