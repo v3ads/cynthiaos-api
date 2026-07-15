@@ -2562,8 +2562,13 @@ app.get("/api/v2/operations", async (_req: Request, res: Response) => {
     }[]>`
       SELECT
         COUNT(*)::text AS total,
-        COUNT(*) FILTER (WHERE status IS NULL OR status ILIKE '%new%')::text AS open,
-        COUNT(*) FILTER (WHERE status ILIKE '%assigned%' OR status ILIKE '%scheduled%' OR status ILIKE '%work done%')::text AS assigned,
+        -- Canonical 'open' = not completed and not canceled (matches
+        -- metrics/summary and Today, which read 20). Sub-states below break
+        -- that down and SUM to open, rather than defining a narrower 'open'
+        -- that hid 19 active orders under a separate bucket.
+        COUNT(*) FILTER (WHERE (status IS NULL OR (status NOT ILIKE '%completed%' AND status NOT ILIKE '%canceled%')))::text AS open,
+        COUNT(*) FILTER (WHERE status IS NULL OR status ILIKE '%new%')::text AS new_unassigned,
+        COUNT(*) FILTER (WHERE status ILIKE '%assigned%' OR status ILIKE '%scheduled%' OR status ILIKE '%work done%')::text AS in_progress,
         COUNT(*) FILTER (WHERE status ILIKE '%completed%')::text AS completed
       FROM gold_maintenance
     `;
@@ -2585,8 +2590,9 @@ app.get("/api/v2/operations", async (_req: Request, res: Response) => {
       as_of: new Date().toISOString(),
       maintenance: {
         total: parseInt(maint.total, 10),
-        open: { label: "Open / new", value: parseInt(maint.open, 10) },
-        assigned: { label: "Assigned / scheduled", value: parseInt(maint.assigned, 10) },
+        open: { label: "Open", value: parseInt(maint.open, 10) },
+        new_unassigned: { label: "New / unassigned", value: parseInt(maint.new_unassigned, 10) },
+        in_progress: { label: "In progress", value: parseInt(maint.in_progress, 10) },
         completed: { label: "Completed", value: parseInt(maint.completed, 10) },
       },
       turns: {
@@ -2968,7 +2974,10 @@ app.get("/api/v1/metrics/summary", async (_req: Request, res: Response) => {
           ? { denominator: v.denominator, denominator_definition: m.denominator_definition }
           : {}),
         confidence,
-        affected_checks: failing,
+        affected_checks: structurallyBlocked ? ["expense_scope_disclosure"] : failing,
+        ...(structurallyBlocked
+          ? { blocked_reason: "Expenses paid through an external system; not tracked in AppFolio." }
+          : {}),
         drilldown_url: m.drilldown_url,
       };
     });
