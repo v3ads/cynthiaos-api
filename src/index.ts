@@ -2432,28 +2432,37 @@ app.get("/api/v2/leasing", async (_req: Request, res: Response) => {
       WHERE move_out_date IS NOT NULL AND move_out_date::date > CURRENT_DATE
     `;
 
-    // Prospect cohorts. One pass, classified by status + activity + move-in.
+    // Prospect cohorts. All prospects share status='Active' in the source,
+    // so cohorts derive from real signals: engagement quality
+    // (last_activity_type), future move-in intent, and 30-day staleness.
     const cohorts = await sql<{
-      total: string; new_uncontacted: string; follow_up_due: string;
-      qualified: string; application_pending: string; converted: string; stale: string;
+      total: string; fresh_engaged: string; follow_up_due: string;
+      qualified: string; future_movein: string; auto_only_stale: string; stale: string;
     }[]>`
       WITH p AS (
         SELECT
-          status,
           COALESCE(last_activity_date, received_at)::date AS last_act,
           (COALESCE(last_activity_date, received_at)::date < CURRENT_DATE - INTERVAL '30 days') AS is_stale,
-          credit_score
+          last_activity_type,
+          move_in_preference::date AS movein
         FROM gold_prospects
       )
       SELECT
         COUNT(*)::text AS total,
-        COUNT(*) FILTER (WHERE status ILIKE '%new%' AND NOT is_stale)::text AS new_uncontacted,
-        COUNT(*) FILTER (WHERE status ILIKE '%active%' AND NOT is_stale
+        -- Genuinely engaged and fresh: a real two-way touch (not just an
+        -- auto-response), active within 30 days.
+        COUNT(*) FILTER (WHERE NOT is_stale
+          AND last_activity_type NOT ILIKE '%auto%')::text AS fresh_engaged,
+        -- Follow-up due: fresh but last touch is 3-30 days old.
+        COUNT(*) FILTER (WHERE NOT is_stale
           AND last_act < CURRENT_DATE - INTERVAL '3 days')::text AS follow_up_due,
-        COUNT(*) FILTER (WHERE status ILIKE '%qualif%' AND NOT is_stale)::text AS qualified,
-        COUNT(*) FILTER (WHERE status ILIKE '%application%' AND NOT is_stale)::text AS application_pending,
-        COUNT(*) FILTER (WHERE status ILIKE '%convert%' OR status ILIKE '%approved%')::text AS converted,
-        COUNT(*) FILTER (WHERE is_stale AND status NOT ILIKE '%convert%')::text AS stale
+        -- Qualified: submitted a pre-qualification form.
+        COUNT(*) FILTER (WHERE last_activity_type ILIKE '%qualif%')::text AS qualified,
+        -- Future move-in intent stated.
+        COUNT(*) FILTER (WHERE movein IS NOT NULL AND movein > CURRENT_DATE)::text AS future_movein,
+        -- Stale and only ever auto-responded to — effectively dead leads.
+        COUNT(*) FILTER (WHERE is_stale AND last_activity_type ILIKE '%auto%')::text AS auto_only_stale,
+        COUNT(*) FILTER (WHERE is_stale)::text AS stale
       FROM p
     `;
 
@@ -2468,13 +2477,12 @@ app.get("/api/v2/leasing", async (_req: Request, res: Response) => {
         scheduled_moveouts:{ label: "Scheduled move-outs", value: parseInt(sched.n, 10) },
       },
       prospect_cohorts: {
-        total:               parseInt(c.total, 10),
-        new_uncontacted:     { label: "New — uncontacted", value: parseInt(c.new_uncontacted, 10) },
-        follow_up_due:       { label: "Follow-up due", value: parseInt(c.follow_up_due, 10) },
-        qualified:           { label: "Qualified", value: parseInt(c.qualified, 10) },
-        application_pending: { label: "Application pending", value: parseInt(c.application_pending, 10) },
-        converted:          { label: "Converted", value: parseInt(c.converted, 10) },
-        stale:               { label: "Stale (30d+ inactive)", value: parseInt(c.stale, 10) },
+        total:            parseInt(c.total, 10),
+        fresh_engaged:    { label: "Engaged (fresh)", value: parseInt(c.fresh_engaged, 10), note: "Real two-way contact within 30 days" },
+        follow_up_due:    { label: "Follow-up due", value: parseInt(c.follow_up_due, 10), note: "Active but no touch in 3+ days" },
+        qualified:        { label: "Pre-qualified", value: parseInt(c.qualified, 10), note: "Submitted a pre-qualification form" },
+        future_movein:    { label: "Future move-in", value: parseInt(c.future_movein, 10), note: "Stated a future move-in date" },
+        stale:            { label: "Stale (30d+)", value: parseInt(c.stale, 10), note: "No activity in 30+ days", sub_auto_only: parseInt(c.auto_only_stale, 10) },
       },
     });
   } catch (err: unknown) {
