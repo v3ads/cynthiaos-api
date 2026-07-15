@@ -232,10 +232,15 @@ router.get('/pages/financials/income-statement', async (req: Request, res: Respo
         expense_scope: {
           status: expenseScopeIsPartial ? 'partial' : 'reported',
           is_complete: expenseScopeIsPartial ? false : null,
+          reason: expenseScopeIsPartial ? 'external_expense_system' : null,
           expense_to_income_ratio: expenseToIncomeRatio,
           profit_margin_usable_for_full_property_performance: !expenseScopeIsPartial,
+          // World B confirmed July 15 2026: property expenses are paid
+          // through an external system outside AppFolio by design. Income is
+          // complete and authoritative; expenses here are only the small
+          // AppFolio-recorded subset.
           note: expenseScopeIsPartial
-            ? 'The AppFolio income-statement feed contains only a partial operating-expense account scope; totals and margin must not be treated as complete property performance.'
+            ? 'Property expenses are paid through an external system and are not tracked in AppFolio. Income figures are complete and authoritative; expense figures reflect only AppFolio-recorded items, so NOI and profit margin are not available as property performance.'
             : 'Expenses are reported as supplied by the AppFolio income-statement feed; completeness has not been independently certified.',
         },
         ytd: {

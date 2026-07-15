@@ -2231,21 +2231,30 @@ const METRIC_REGISTRY: MetricRegistryEntry[] = [
     drilldown_url: "/insights",
   },
   {
+    metric_id: "total_income_ytd",
+    label: "Income (YTD)",
+    population_definition:
+      "Total YTD income from the latest AppFolio income statement. Complete and authoritative — all rent and income flows through AppFolio.",
+    affected_checks: ["expense_scope_disclosure"],
+    blocked_when_failing: false,
+    drilldown_url: "/financials",
+  },
+  {
     metric_id: "noi_ytd",
     label: "NOI (YTD)",
     population_definition:
-      "Total income minus total expenses from the latest AppFolio income statement. BLOCKED while the expense feed is partial (expenses under 10% of income).",
-    affected_checks: ["financial_expense_scope_plausibility"],
-    blocked_when_failing: true,
+      "Not available by design: property expenses are paid through an external system and are not tracked in CynthiaOS, so NOI cannot be computed as property performance.",
+    affected_checks: ["expense_scope_disclosure"],
+    blocked_when_failing: false,
     drilldown_url: "/financials",
   },
   {
     metric_id: "profit_margin_ytd",
     label: "Profit margin (YTD)",
     population_definition:
-      "NOI over total income from the latest AppFolio income statement. BLOCKED while the expense feed is partial.",
-    affected_checks: ["financial_expense_scope_plausibility"],
-    blocked_when_failing: true,
+      "Not available by design: property expenses are paid externally and are not tracked in CynthiaOS.",
+    affected_checks: ["expense_scope_disclosure"],
+    blocked_when_failing: false,
     drilldown_url: "/financials",
   },
   {
@@ -2336,6 +2345,12 @@ app.get("/api/v1/metrics/summary", async (_req: Request, res: Response) => {
       holdover_count:       { value: parseInt(lease.holdover, 10) },
       stale_closeout_count: { value: parseInt(lease.closeout, 10) },
       collectible_exposure: { value: parseFloat(coll.exposure) },
+      total_income_ytd:     { value: fin?.noi !== undefined ? await (async () => {
+        const [inc] = await sql!<{ v: string | null }[]>`
+          SELECT total_income::text AS v FROM gold_income_statements
+          WHERE total_income > 0 ORDER BY report_date DESC, created_at DESC LIMIT 1`;
+        return inc?.v ? parseFloat(inc.v) : null;
+      })() : null },
       noi_ytd:              { value: expenseBlocked ? null : (fin?.noi ? parseFloat(fin.noi) : null) },
       profit_margin_ytd:    { value: expenseBlocked ? null : (fin?.margin ? parseFloat(fin.margin) : null) },
       open_maintenance:     { value: parseInt(maint.open, 10) },
@@ -2347,7 +2362,14 @@ app.get("/api/v1/metrics/summary", async (_req: Request, res: Response) => {
       const failing = m.affected_checks.filter(
         (c) => checkState.has(c) && checkState.get(c) === false
       );
-      const confidence = failing.length === 0
+      // External-expense reality (World B, July 15 2026): NOI/margin are
+      // structurally unavailable regardless of check state — confidence comes
+      // from the value-layer ratio rule, not from a failing check.
+      const structurallyBlocked =
+        expenseBlocked && (m.metric_id === "noi_ytd" || m.metric_id === "profit_margin_ytd");
+      const confidence = structurallyBlocked
+        ? "blocked"
+        : failing.length === 0
         ? "trusted"
         : m.blocked_when_failing ? "blocked" : "warning";
       const v = values[m.metric_id] ?? { value: null };
@@ -2550,7 +2572,7 @@ app.get("/api/v1/insights/portfolio-health", async (_req: Request, res: Response
       classification,
       score_confidence: expenseScopeBlocked ? "warning" : "trusted",
       score_note: expenseScopeBlocked
-        ? "Financial component blocked: the AppFolio expense feed is partial (expenses under 10% of income), so margin cannot be scored. Score is renormalized over occupancy and risk only."
+        ? "Financial component excluded: property expenses are paid through an external system and are not tracked in CynthiaOS, so margin cannot be scored. Score is renormalized over occupancy and risk only."
         : null,
       breakdown: {
         financial: expenseScopeBlocked
@@ -2558,8 +2580,8 @@ app.get("/api/v1/insights/portfolio-health", async (_req: Request, res: Response
               score:       null,
               confidence:  "blocked",
               weight:      "excluded (renormalized)",
-              description: "BLOCKED — partial expense feed; NOI/margin unavailable for scoring",
-              affected_checks: ["financial_expense_scope_plausibility"],
+              description: "Excluded by design — expenses are paid externally and not tracked in CynthiaOS; NOI/margin unavailable for scoring",
+              affected_checks: ["expense_scope_disclosure"],
             }
           : {
               score:       financialHealth,
