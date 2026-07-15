@@ -366,9 +366,9 @@ const LEASE_SCOPE_DEFINITIONS: Record<string, string> = {
   renewals_due:
     "Lease decisions due: the actionable renewal pipeline (active_future predicates) limited to the management decision window — default 90 days [Decision 3, July 15 2026], overridable via ?days=N.",
   holdover:
-    "Holdover / missing renewal: per-unit soonest lease is expired with no renewal or re-lease evidence, and the unit is still reported occupied. Action: confirm month-to-month status or ingest the renewal.",
+    "Holdover / missing renewal: per-unit soonest lease is expired with no renewal or re-lease evidence, and the unit is still reported occupied. Family/employee-held units excluded (always-occupied by rule; a lapsed lease on them is expected, not actionable). Action: confirm month-to-month status or ingest the renewal.",
   stale_closeout:
-    "Vacant stale closeout: per-unit soonest lease is expired with no renewal or re-lease evidence, and the unit is now vacant. Action: close the stale lease record and route the unit to the vacancy/turn workflow.",
+    "Vacant stale closeout: per-unit soonest lease is expired with no renewal or re-lease evidence, and the unit is now vacant. Family/employee-held units excluded per the action-scope rule. Action: close the stale lease record and route the unit to the vacancy/turn workflow.",
   risk:
     "Unresolved-expiration risk population: per-unit soonest dated lease with no active future tenant record and no post-expiry move-in, already expired or due within 90 days.",
   future_window_actionable:
@@ -415,9 +415,9 @@ app.get("/api/v1/leases/expirations", async (req: Request, res: Response) => {
         ? sql`is_soonest_for_unit AND NOT has_active_future_tenant_lease
               AND NOT is_released AND days_until_expiration <= 90`
         : scope === "holdover"
-        ? sql`is_holdover`
+        ? sql`is_holdover AND NOT is_family_held AND NOT is_employee_held`
         : scope === "stale_closeout"
-        ? sql`is_stale_closeout`
+        ? sql`is_stale_closeout AND NOT is_family_held AND NOT is_employee_held`
         : sql`TRUE`;
 
     const rows = await sql<GoldLeaseExpiration[]>`
