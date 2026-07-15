@@ -2115,6 +2115,225 @@ interface PortfolioHealthRow {
   high_expiration_count: string | null;
 }
 
+// ── Management metric contract (R1 items 1.5–1.6, July 15 2026) ──────────────
+// One registry defines every management KPI: its plain-language population
+// definition, the integrity checks that can change its interpretation, and
+// its drilldown. GET /api/v1/metrics/summary serves all of them in the
+// standard contract envelope with confidence computed live from
+// integrity_check_results (persisted by the transform worker on every
+// integrity run). A KPI whose material check is failing is served as
+// confidence 'warning' (or 'blocked' for the financially material ones) —
+// confidence travels with the metric instead of living only on Status.
+interface MetricRegistryEntry {
+  metric_id: string;
+  label: string;
+  population_definition: string;
+  affected_checks: string[];        // check_name values in integrity_check_results
+  blocked_when_failing: boolean;    // true → failing check blocks the value entirely
+  drilldown_url: string;
+  denominator_definition?: string;
+}
+
+const METRIC_REGISTRY: MetricRegistryEntry[] = [
+  {
+    metric_id: "occupancy_rate",
+    label: "Occupancy",
+    population_definition:
+      "Occupied units over occupancy-eligible units (canonical roster minus exclude_from_occupancy units).",
+    affected_checks: ["occupancy_partition", "canonical_unit_reconciliation"],
+    blocked_when_failing: false,
+    drilldown_url: "/unit-intelligence",
+    denominator_definition: "Occupancy-eligible units (canonical roster minus excluded).",
+  },
+  {
+    metric_id: "vacancy_rate",
+    label: "Vacancy (incl. notice)",
+    population_definition:
+      "Vacant plus notice units over occupancy-eligible units — the exact complement of occupancy.",
+    affected_checks: ["occupancy_partition", "canonical_unit_reconciliation"],
+    blocked_when_failing: false,
+    drilldown_url: "/unit-intelligence",
+    denominator_definition: "Occupancy-eligible units (canonical roster minus excluded).",
+  },
+  {
+    metric_id: "renewals_due_90d",
+    label: "Lease decisions due (90d)",
+    population_definition:
+      "Actionable renewal pipeline within the 90-day decision window: per-unit soonest future lease, excluding renewed, re-leased, family-held, and employee-held units.",
+    affected_checks: ["lease_expiration_reconciliation", "lease_scope_reconciliation"],
+    blocked_when_failing: false,
+    drilldown_url: "/lease-expirations",
+  },
+  {
+    metric_id: "holdover_count",
+    label: "Holdovers / missing renewals",
+    population_definition:
+      "Expired soonest-per-unit leases with no renewal or re-lease evidence where the unit is still occupied; family/employee-held units excluded.",
+    affected_checks: ["lease_expiration_reconciliation", "lease_scope_reconciliation"],
+    blocked_when_failing: false,
+    drilldown_url: "/lease-expirations",
+  },
+  {
+    metric_id: "stale_closeout_count",
+    label: "Stale lease closeouts",
+    population_definition:
+      "Expired soonest-per-unit leases with no renewal or re-lease evidence where the unit is now vacant; family/employee-held units excluded.",
+    affected_checks: ["lease_expiration_reconciliation", "lease_scope_reconciliation"],
+    blocked_when_failing: false,
+    drilldown_url: "/lease-expirations",
+  },
+  {
+    metric_id: "collectible_exposure",
+    label: "Collections exposure",
+    population_definition:
+      "Current and past tenants with positive collections exposure, classified and deduplicated per unit; credits and zero balances excluded.",
+    affected_checks: ["collections_pagination_reconciliation"],
+    blocked_when_failing: false,
+    drilldown_url: "/insights",
+  },
+  {
+    metric_id: "noi_ytd",
+    label: "NOI (YTD)",
+    population_definition:
+      "Total income minus total expenses from the latest AppFolio income statement. BLOCKED while the expense feed is partial (expenses under 10% of income).",
+    affected_checks: ["financial_expense_scope_plausibility"],
+    blocked_when_failing: true,
+    drilldown_url: "/financials",
+  },
+  {
+    metric_id: "profit_margin_ytd",
+    label: "Profit margin (YTD)",
+    population_definition:
+      "NOI over total income from the latest AppFolio income statement. BLOCKED while the expense feed is partial.",
+    affected_checks: ["financial_expense_scope_plausibility"],
+    blocked_when_failing: true,
+    drilldown_url: "/financials",
+  },
+  {
+    metric_id: "open_maintenance",
+    label: "Open maintenance",
+    population_definition:
+      "Work orders in the latest authoritative snapshot with a non-terminal status (not completed or canceled).",
+    affected_checks: ["maintenance_chronology", "maintenance_source_reconciliation"],
+    blocked_when_failing: false,
+    drilldown_url: "/maintenance",
+  },
+  {
+    metric_id: "turns_in_progress",
+    label: "Turns in progress",
+    population_definition:
+      "Canonical turn events with status in_progress: move-out has occurred and the turn has not completed. Scheduled (future move-out) events counted separately.",
+    affected_checks: ["scheduled_turn_classification", "unit_turn_event_reconciliation"],
+    blocked_when_failing: false,
+    drilldown_url: "/unit-turns",
+  },
+];
+
+app.get("/api/v1/metrics/summary", async (_req: Request, res: Response) => {
+  let sql: postgres.Sql | null = null;
+  try {
+    sql = getDb();
+
+    // Live check states persisted by the worker on every integrity run.
+    const checkRows = await sql<{ check_name: string; passed: boolean; run_at: string }[]>`
+      SELECT check_name, bool_and(passed) AS passed, MAX(run_at)::text AS run_at
+      FROM integrity_check_results
+      GROUP BY check_name
+    `.catch(() => [] as { check_name: string; passed: boolean; run_at: string }[]);
+    const checkState = new Map(checkRows.map((r) => [r.check_name, r.passed]));
+    const checksAsOf = checkRows.length > 0
+      ? checkRows.reduce((m, r) => (r.run_at > m ? r.run_at : m), checkRows[0].run_at)
+      : null;
+
+    // Values: one round-trip per metric family, all from canonical relations.
+    const [units] = await sql<{ total: string; occupied: string; vacant: string; notice: string; excluded: string }[]>`
+      SELECT COUNT(*)::text AS total,
+             COUNT(*) FILTER (WHERE unit_status='occupied')::text AS occupied,
+             COUNT(*) FILTER (WHERE unit_status='vacant')::text   AS vacant,
+             COUNT(*) FILTER (WHERE unit_status='notice')::text   AS notice,
+             COUNT(*) FILTER (WHERE exclude_from_occupancy)::text AS excluded
+      FROM gold_units
+    `;
+    const eligible = parseInt(units.total, 10) - parseInt(units.excluded, 10);
+    const [lease] = await sql<{ renewals: string; holdover: string; closeout: string }[]>`
+      SELECT
+        COUNT(*) FILTER (WHERE is_soonest_future_for_unit AND NOT is_superseded
+          AND NOT is_released AND NOT is_family_held AND NOT is_employee_held
+          AND days_until_expiration <= 90)::text AS renewals,
+        COUNT(*) FILTER (WHERE is_holdover AND NOT is_family_held AND NOT is_employee_held)::text AS holdover,
+        COUNT(*) FILTER (WHERE is_stale_closeout AND NOT is_family_held AND NOT is_employee_held)::text AS closeout
+      FROM v_lease_population
+    `;
+    const [maint] = await sql<{ open: string }[]>`
+      SELECT COUNT(*)::text AS open FROM gold_maintenance
+      WHERE status IS NULL OR (status NOT ILIKE '%completed%' AND status NOT ILIKE '%canceled%')
+    `;
+    const [turns] = await sql<{ in_progress: string }[]>`
+      SELECT COUNT(*)::text AS in_progress FROM gold_unit_turnover
+      WHERE move_out_date IS NOT NULL AND move_out_date::date <= CURRENT_DATE
+        AND turn_end_date IS NULL AND days_to_complete IS NULL
+    `;
+    const [fin] = await sql<{ noi: string | null; margin: string | null; ratio: string | null }[]>`
+      SELECT net_operating_income::text AS noi, profit_margin::text AS margin,
+             CASE WHEN total_income > 0 THEN (total_expenses/total_income)::text END AS ratio
+      FROM gold_income_statements WHERE total_income > 0
+      ORDER BY report_date DESC, created_at DESC LIMIT 1
+    `;
+    const [coll] = await sql<{ exposure: string }[]>`
+      SELECT COALESCE(SUM(balance_due) FILTER (WHERE balance_due > 0), 0)::text AS exposure
+      FROM (SELECT DISTINCT ON (tenant_id) balance_due FROM gold_delinquency_records
+            ORDER BY tenant_id, created_at DESC) d
+    `;
+    const expenseBlocked = fin?.ratio !== null && fin?.ratio !== undefined && parseFloat(fin.ratio) < 0.1;
+
+    const values: Record<string, { value: number | null; denominator?: number }> = {
+      occupancy_rate:       { value: eligible > 0 ? Math.round((parseInt(units.occupied,10) / eligible) * 10000) / 10000 : null, denominator: eligible },
+      vacancy_rate:         { value: eligible > 0 ? Math.round(((parseInt(units.vacant,10) + parseInt(units.notice,10)) / eligible) * 10000) / 10000 : null, denominator: eligible },
+      renewals_due_90d:     { value: parseInt(lease.renewals, 10) },
+      holdover_count:       { value: parseInt(lease.holdover, 10) },
+      stale_closeout_count: { value: parseInt(lease.closeout, 10) },
+      collectible_exposure: { value: parseFloat(coll.exposure) },
+      noi_ytd:              { value: expenseBlocked ? null : (fin?.noi ? parseFloat(fin.noi) : null) },
+      profit_margin_ytd:    { value: expenseBlocked ? null : (fin?.margin ? parseFloat(fin.margin) : null) },
+      open_maintenance:     { value: parseInt(maint.open, 10) },
+      turns_in_progress:    { value: parseInt(turns.in_progress, 10) },
+    };
+
+    const asOf = new Date().toISOString();
+    const metrics = METRIC_REGISTRY.map((m) => {
+      const failing = m.affected_checks.filter(
+        (c) => checkState.has(c) && checkState.get(c) === false
+      );
+      const confidence = failing.length === 0
+        ? "trusted"
+        : m.blocked_when_failing ? "blocked" : "warning";
+      const v = values[m.metric_id] ?? { value: null };
+      return {
+        metric_id: m.metric_id,
+        label: m.label,
+        value: confidence === "blocked" ? null : v.value,
+        population_definition: m.population_definition,
+        as_of: asOf,
+        source_freshness: checksAsOf,
+        ...(v.denominator !== undefined
+          ? { denominator: v.denominator, denominator_definition: m.denominator_definition }
+          : {}),
+        confidence,
+        affected_checks: failing,
+        drilldown_url: m.drilldown_url,
+      };
+    });
+
+    res.status(200).json({ success: true, as_of: asOf, metrics });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`[${SERVICE_NAME}] GET /api/v1/metrics/summary error:`, message);
+    res.status(500).json({ success: false, error: message });
+  } finally {
+    if (sql) await sql.end();
+  }
+});
+
 app.get("/api/v1/insights/portfolio-health", async (_req: Request, res: Response) => {
   let sql: ReturnType<typeof getDb> | null = null;
   try {
