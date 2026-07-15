@@ -2412,6 +2412,140 @@ app.patch("/api/v2/actions/:id", async (req: Request, res: Response) => {
 // Unified maintenance + turns under the source-proven deterministic states
 // (decision 8: Scheduled/Open/In Progress/Complete/Unknown). Emphasizes open
 // and overdue work and lost-rent turns.
+// ══ Release 4: Portfolio surface + targets (/api/v2/portfolio, /targets) ═════
+// Joins the live metric contract against metric_targets to compute variance
+// and an on/off-target status per KPI. This is the executive view: not just
+// "what is the number" but "how does it compare to where it should be".
+app.get("/api/v2/portfolio", async (_req: Request, res: Response) => {
+  let sql: postgres.Sql | null = null;
+  try {
+    sql = getDb();
+
+    // Reuse the metric values via a lightweight recompute (same relations the
+    // metric contract uses) so Portfolio and the metric cards never disagree.
+    const [units] = await sql<{ total: string; occupied: string; vacant: string; notice: string; excluded: string }[]>`
+      SELECT COUNT(*)::text AS total,
+             COUNT(*) FILTER (WHERE unit_status='occupied' AND NOT exclude_from_occupancy)::text AS occupied,
+             COUNT(*) FILTER (WHERE unit_status='vacant'   AND NOT exclude_from_occupancy)::text AS vacant,
+             COUNT(*) FILTER (WHERE unit_status='notice'   AND NOT exclude_from_occupancy)::text AS notice,
+             COUNT(*) FILTER (WHERE exclude_from_occupancy)::text AS excluded
+      FROM v_unit_occupancy
+    `;
+    const eligible = parseInt(units.total, 10) - parseInt(units.excluded, 10);
+    const [lease] = await sql<{ renewals: string; holdover: string; closeout: string }[]>`
+      SELECT
+        COUNT(*) FILTER (WHERE is_soonest_future_for_unit AND NOT is_superseded
+          AND NOT is_released AND NOT is_family_held AND NOT is_employee_held
+          AND days_until_expiration <= 90)::text AS renewals,
+        COUNT(*) FILTER (WHERE is_holdover AND NOT is_family_held AND NOT is_employee_held)::text AS holdover,
+        COUNT(*) FILTER (WHERE is_stale_closeout AND NOT is_family_held AND NOT is_employee_held)::text AS closeout
+      FROM v_lease_population
+    `;
+    const [maint] = await sql<{ open: string }[]>`
+      SELECT COUNT(*)::text AS open FROM gold_maintenance
+      WHERE status IS NULL OR (status NOT ILIKE '%completed%' AND status NOT ILIKE '%canceled%')
+    `;
+    const [turns] = await sql<{ ip: string }[]>`
+      SELECT COUNT(*)::text AS ip FROM gold_unit_turnover
+      WHERE move_out_date IS NOT NULL AND move_out_date::date <= CURRENT_DATE
+        AND turn_end_date IS NULL AND days_to_complete IS NULL
+    `;
+    const [coll] = await sql<{ exposure: string }[]>`
+      SELECT COALESCE(SUM(balance_due) FILTER (WHERE balance_due > 0), 0)::text AS exposure
+      FROM (SELECT DISTINCT ON (tenant_id) balance_due FROM gold_delinquency_records
+            ORDER BY tenant_id, created_at DESC) d
+    `;
+
+    const values: Record<string, number> = {
+      occupancy_rate:       eligible > 0 ? parseInt(units.occupied, 10) / eligible : 0,
+      vacancy_rate:         eligible > 0 ? (parseInt(units.vacant, 10) + parseInt(units.notice, 10)) / eligible : 0,
+      renewals_due_90d:     parseInt(lease.renewals, 10),
+      holdover_count:       parseInt(lease.holdover, 10),
+      stale_closeout_count: parseInt(lease.closeout, 10),
+      collectible_exposure: parseFloat(coll.exposure),
+      open_maintenance:     parseInt(maint.open, 10),
+      turns_in_progress:    parseInt(turns.ip, 10),
+    };
+
+    const targets = await sql<{
+      metric_id: string; target: string; direction: string; unit: string; label: string; is_default: boolean;
+    }[]>`SELECT metric_id, target::text, direction, unit, label, is_default FROM metric_targets`;
+
+    const metrics = targets.map((t) => {
+      const value = values[t.metric_id];
+      const target = parseFloat(t.target);
+      // on_target: for 'higher', value >= target is good; for 'lower', value <= target.
+      const onTarget = t.direction === "higher" ? value >= target : value <= target;
+      // variance vs target, signed toward "good" (positive = better than target).
+      const rawDelta = value - target;
+      const variance = t.direction === "higher" ? rawDelta : -rawDelta;
+      const variancePct = target !== 0 ? variance / Math.abs(target) : null;
+      return {
+        metric_id: t.metric_id,
+        label: t.label,
+        value: value ?? null,
+        target,
+        direction: t.direction,
+        unit: t.unit,
+        on_target: onTarget,
+        variance,
+        variance_pct: variancePct,
+        target_is_default: t.is_default,
+        status: onTarget ? "on_target" : "off_target",
+      };
+    });
+
+    const offTarget = metrics.filter((m) => !m.on_target).length;
+    res.status(200).json({
+      success: true,
+      as_of: new Date().toISOString(),
+      on_target: metrics.length - offTarget,
+      off_target: offTarget,
+      metrics,
+    });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`[${SERVICE_NAME}] GET /api/v2/portfolio error:`, message);
+    res.status(500).json({ success: false, error: message });
+  } finally {
+    if (sql) await sql.end();
+  }
+});
+
+// PATCH /api/v2/targets/:id — set a real target (marks it no longer default).
+app.patch("/api/v2/targets/:id", async (req: Request, res: Response) => {
+  let sql: postgres.Sql | null = null;
+  try {
+    sql = getDb();
+    const id = req.params.id;
+    const b = req.body ?? {};
+    if (b.target == null || isNaN(Number(b.target))) {
+      res.status(400).json({ success: false, error: "numeric target is required" });
+      return;
+    }
+    const [row] = await sql`
+      UPDATE metric_targets SET
+        target = ${Number(b.target)},
+        direction = COALESCE(${b.direction ?? null}, direction),
+        is_default = false,
+        updated_at = NOW(),
+        updated_by = ${b.updated_by ?? 'Cindy'}
+      WHERE metric_id = ${id}
+      RETURNING *
+    `;
+    if (!row) {
+      res.status(404).json({ success: false, error: "target not found" });
+      return;
+    }
+    res.status(200).json({ success: true, data: row });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    res.status(500).json({ success: false, error: message });
+  } finally {
+    if (sql) await sql.end();
+  }
+});
+
 app.get("/api/v2/operations", async (_req: Request, res: Response) => {
   let sql: postgres.Sql | null = null;
   try {
@@ -4927,6 +5061,37 @@ app.listen(PORT, "0.0.0.0", async () => {
       ON CONFLICT (natural_key) DO NOTHING
     `;
     console.log(`[${SERVICE_NAME}] actions + action_events tables ensured (Release 2)`);
+
+    // ── metric_targets (Release 4 — executive intelligence) ───────────────
+    // Targets give the Portfolio surface something to compute variance
+    // against. Seeded with reasonable multifamily benchmarks; editable via
+    // PATCH /api/v2/targets/:id so Cindy/Ayman can set real budget values.
+    // direction = which way is good ('higher' or 'lower').
+    await boot`
+      CREATE TABLE IF NOT EXISTS metric_targets (
+        metric_id   TEXT PRIMARY KEY,
+        target      NUMERIC NOT NULL,
+        direction   TEXT NOT NULL DEFAULT 'higher',  -- 'higher' | 'lower'
+        unit        TEXT NOT NULL DEFAULT 'count',    -- 'rate' | 'currency' | 'count'
+        label       TEXT,
+        is_default  BOOLEAN NOT NULL DEFAULT true,    -- false once a human edits it
+        updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_by  TEXT
+      )
+    `;
+    await boot`
+      INSERT INTO metric_targets (metric_id, target, direction, unit, label) VALUES
+        ('occupancy_rate',       0.95,   'higher', 'rate',     'Occupancy target'),
+        ('vacancy_rate',         0.05,   'lower',  'rate',     'Vacancy ceiling'),
+        ('renewals_due_90d',     0,      'lower',  'count',    'Open renewal decisions'),
+        ('holdover_count',       0,      'lower',  'count',    'Holdovers'),
+        ('stale_closeout_count', 0,      'lower',  'count',    'Stale closeouts'),
+        ('collectible_exposure', 50000,  'lower',  'currency', 'Collections exposure ceiling'),
+        ('open_maintenance',     15,     'lower',  'count',    'Open work orders'),
+        ('turns_in_progress',    10,     'lower',  'count',    'Turns in progress')
+      ON CONFLICT (metric_id) DO NOTHING
+    `;
+    console.log(`[${SERVICE_NAME}] metric_targets table ensured (Release 4)`);
     await boot`
       ALTER TABLE gold_delinquency_records
         ADD COLUMN IF NOT EXISTS tenant_status TEXT NOT NULL DEFAULT 'current'
