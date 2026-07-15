@@ -2399,6 +2399,93 @@ app.patch("/api/v2/actions/:id", async (req: Request, res: Response) => {
 // actions table. Composes canonical relations + the action layer so the
 // property manager sees material issues with owner/impact/next-action
 // without opening a raw table (Release 2 / plan item 2.4).
+// ══ Release 3: Leasing surface (/api/v2/leasing) ════════════════════════════
+// Composes the lease decision queues and prospect cohorts into one management
+// view. Lease scopes come from v_lease_population; prospect cohorts from
+// gold_prospects with the same 30-day staleness rule the pipeline page uses.
+// Every count is actionable (family/employee excluded from lease scopes).
+app.get("/api/v2/leasing", async (_req: Request, res: Response) => {
+  let sql: postgres.Sql | null = null;
+  try {
+    sql = getDb();
+
+    // Lease decision queues.
+    const [lease] = await sql<{
+      renewals_due: string; renewals_30: string; holdover: string;
+      stale_closeout: string; scheduled_moveout: string;
+    }[]>`
+      SELECT
+        COUNT(*) FILTER (WHERE is_soonest_future_for_unit AND NOT is_superseded
+          AND NOT is_released AND NOT is_family_held AND NOT is_employee_held
+          AND days_until_expiration <= 90)::text AS renewals_due,
+        COUNT(*) FILTER (WHERE is_soonest_future_for_unit AND NOT is_superseded
+          AND NOT is_released AND NOT is_family_held AND NOT is_employee_held
+          AND days_until_expiration <= 30)::text AS renewals_30,
+        COUNT(*) FILTER (WHERE is_holdover AND NOT is_family_held AND NOT is_employee_held)::text AS holdover,
+        COUNT(*) FILTER (WHERE is_stale_closeout AND NOT is_family_held AND NOT is_employee_held)::text AS stale_closeout,
+        0::text AS scheduled_moveout
+      FROM v_lease_population
+    `;
+    // Scheduled move-outs (units on notice with a future move-out) from turnover.
+    const [sched] = await sql<{ n: string }[]>`
+      SELECT COUNT(*)::text AS n FROM gold_unit_turnover
+      WHERE move_out_date IS NOT NULL AND move_out_date::date > CURRENT_DATE
+    `;
+
+    // Prospect cohorts. One pass, classified by status + activity + move-in.
+    const cohorts = await sql<{
+      total: string; new_uncontacted: string; follow_up_due: string;
+      qualified: string; application_pending: string; converted: string; stale: string;
+    }[]>`
+      WITH p AS (
+        SELECT
+          status,
+          COALESCE(last_activity_date, received_at)::date AS last_act,
+          (COALESCE(last_activity_date, received_at)::date < CURRENT_DATE - INTERVAL '30 days') AS is_stale,
+          credit_score
+        FROM gold_prospects
+      )
+      SELECT
+        COUNT(*)::text AS total,
+        COUNT(*) FILTER (WHERE status ILIKE '%new%' AND NOT is_stale)::text AS new_uncontacted,
+        COUNT(*) FILTER (WHERE status ILIKE '%active%' AND NOT is_stale
+          AND last_act < CURRENT_DATE - INTERVAL '3 days')::text AS follow_up_due,
+        COUNT(*) FILTER (WHERE status ILIKE '%qualif%' AND NOT is_stale)::text AS qualified,
+        COUNT(*) FILTER (WHERE status ILIKE '%application%' AND NOT is_stale)::text AS application_pending,
+        COUNT(*) FILTER (WHERE status ILIKE '%convert%' OR status ILIKE '%approved%')::text AS converted,
+        COUNT(*) FILTER (WHERE is_stale AND status NOT ILIKE '%convert%')::text AS stale
+      FROM p
+    `;
+
+    const c = cohorts[0];
+    res.status(200).json({
+      success: true,
+      as_of: new Date().toISOString(),
+      lease_queues: {
+        renewals_due:      { label: "Renewals due (90d)", value: parseInt(lease.renewals_due, 10), urgent: parseInt(lease.renewals_30, 10), scope: "renewals_due" },
+        holdovers:         { label: "Holdovers", value: parseInt(lease.holdover, 10), scope: "holdover" },
+        stale_closeouts:   { label: "Stale closeouts", value: parseInt(lease.stale_closeout, 10), scope: "stale_closeout" },
+        scheduled_moveouts:{ label: "Scheduled move-outs", value: parseInt(sched.n, 10) },
+      },
+      prospect_cohorts: {
+        total:               parseInt(c.total, 10),
+        new_uncontacted:     { label: "New — uncontacted", value: parseInt(c.new_uncontacted, 10) },
+        follow_up_due:       { label: "Follow-up due", value: parseInt(c.follow_up_due, 10) },
+        qualified:           { label: "Qualified", value: parseInt(c.qualified, 10) },
+        application_pending: { label: "Application pending", value: parseInt(c.application_pending, 10) },
+        converted:          { label: "Converted", value: parseInt(c.converted, 10) },
+        stale:               { label: "Stale (30d+ inactive)", value: parseInt(c.stale, 10) },
+      },
+    });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`[${SERVICE_NAME}] GET /api/v2/leasing error:`, message);
+    res.status(500).json({ success: false, error: message });
+  } finally {
+    if (sql) await sql.end();
+  }
+});
+
 app.get("/api/v2/today", async (_req: Request, res: Response) => {
   let sql: postgres.Sql | null = null;
   try {
