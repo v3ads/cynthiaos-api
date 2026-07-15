@@ -2822,6 +2822,16 @@ app.get("/api/v2/today", async (_req: Request, res: Response) => {
         due_at ASC NULLS LAST, created_at DESC
       LIMIT 50
     `;
+    // True count of open exceptions matching the SAME predicate as the capped
+    // queue above, so the UI can disclose truncation ("Top 50 of N") instead of
+    // presenting the 50-row subset as the entire worklist.
+    const [openCountRow] = await sql<{ total: string }[]>`
+      SELECT COUNT(*)::text AS total
+      FROM actions
+      WHERE status IN ('open','in_progress')
+        AND (snoozed_until IS NULL OR snoozed_until <= CURRENT_DATE)
+    `;
+    const queueTotalOpen = parseInt(openCountRow?.total ?? "0", 10);
 
     const failing = parseInt(checkRows[0]?.failing ?? "0", 10);
     res.status(200).json({
@@ -2871,6 +2881,7 @@ app.get("/api/v2/today", async (_req: Request, res: Response) => {
       },
       queue,
       queue_total: queue.length,
+      queue_total_open: queueTotalOpen,
     });
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
