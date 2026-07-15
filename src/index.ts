@@ -2558,7 +2558,7 @@ app.get("/api/v2/operations", async (_req: Request, res: Response) => {
   try {
     sql = getDb();
     const [maint] = await sql<{
-      total: string; open: string; assigned: string; completed: string;
+      total: string; open: string; new_unassigned: string; in_progress: string; completed: string;
     }[]>`
       SELECT
         COUNT(*)::text AS total,
