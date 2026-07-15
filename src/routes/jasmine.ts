@@ -474,7 +474,8 @@ router.get("/jasmine/leases", async (req: Request, res: Response) => {
         contact_phone                                          AS phone,
         contact_email                                          AS email
       FROM v_lease_population
-      WHERE is_soonest_future_for_unit AND NOT is_superseded AND NOT is_family_held
+      WHERE is_soonest_future_for_unit AND NOT is_superseded
+        AND NOT is_released AND NOT is_family_held AND NOT is_employee_held
         AND days_until_expiration <= ${windowDays}
       ORDER BY lease_end_date ASC
     `;
@@ -1005,7 +1006,8 @@ router.get("/jasmine/tasks", async (_req: Request, res: Response) => {
         contact_phone          AS phone,
         contact_email          AS email
       FROM v_lease_population
-      WHERE is_soonest_future_for_unit AND NOT is_superseded AND NOT is_family_held
+      WHERE is_soonest_future_for_unit AND NOT is_superseded
+        AND NOT is_released AND NOT is_family_held AND NOT is_employee_held
         AND days_until_expiration <= 60
       ORDER BY lease_end_date ASC
     `;
@@ -1789,7 +1791,8 @@ cacheLoaders.set('leases:90', async () => {
         contact_phone      AS phone,
         contact_email      AS email
       FROM v_lease_population
-      WHERE is_soonest_future_for_unit AND NOT is_superseded AND NOT is_family_held
+      WHERE is_soonest_future_for_unit AND NOT is_superseded
+        AND NOT is_released AND NOT is_family_held AND NOT is_employee_held
         AND days_until_expiration <= 90
       ORDER BY lease_end_date ASC
     `;
@@ -1984,7 +1987,8 @@ cacheLoaders.set('tasks', async () => {
         contact_phone          AS phone,
         contact_email          AS email
       FROM v_lease_population
-      WHERE is_soonest_future_for_unit AND NOT is_superseded AND NOT is_family_held
+      WHERE is_soonest_future_for_unit AND NOT is_superseded
+        AND NOT is_released AND NOT is_family_held AND NOT is_employee_held
         AND days_until_expiration <= 60
       ORDER BY lease_end_date ASC
     `;

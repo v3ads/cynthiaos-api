@@ -310,6 +310,34 @@ SELECT
       AND t.move_in_date::date >= b.lease_end_date
   )                                                                     AS is_released,
   COALESCE(gu.unit_group = 'picinich_family', FALSE)                    AS is_family_held,
+  (juo.unit_id IS NOT NULL AND juo.override_type = 'employee')          AS is_employee_held,
+  gu.unit_status,
+  -- Holdover: soonest per-unit lease is expired, no renewal or re-lease
+  -- evidence, and the unit is still reported occupied — the tenant likely
+  -- stayed past the lease end without a renewal being ingested.
+  (b.unit_rank_all = 1 AND b.lease_end_date IS NOT NULL
+     AND b.days_until_expiration < 0
+     AND gta.unit_id IS NULL
+     AND NOT EXISTS (
+       SELECT 1 FROM gold_unit_turnover t
+       WHERE t.unit_id = b.unit_id
+         AND t.move_in_date IS NOT NULL
+         AND t.move_in_date::date >= b.lease_end_date
+     )
+     AND gu.unit_status = 'occupied')                                   AS is_holdover,
+  -- Stale closeout: same expired-unresolved evidence but the unit is now
+  -- vacant — the lease record should be closed and the unit routed to the
+  -- vacancy/turn workflow.
+  (b.unit_rank_all = 1 AND b.lease_end_date IS NOT NULL
+     AND b.days_until_expiration < 0
+     AND gta.unit_id IS NULL
+     AND NOT EXISTS (
+       SELECT 1 FROM gold_unit_turnover t
+       WHERE t.unit_id = b.unit_id
+         AND t.move_in_date IS NOT NULL
+         AND t.move_in_date::date >= b.lease_end_date
+     )
+     AND gu.unit_status IS DISTINCT FROM 'occupied')                    AS is_stale_closeout,
   gu.unit_group,
   gu.exclude_from_occupancy,
   rl.monthly_rent,
@@ -322,6 +350,7 @@ SELECT
 FROM base b
 LEFT JOIN gt_active     gta ON gta.unit_id = b.unit_id
 LEFT JOIN gold_units    gu  ON gu.unit_id  = b.unit_id
+LEFT JOIN jasmine_unit_overrides juo ON juo.unit_id = b.unit_id
 LEFT JOIN rent_lookup   rl  ON rl.unit_id  = b.unit_id
 LEFT JOIN tenant_lookup tl  ON tl.unit_id  = b.unit_id
 `;
@@ -333,11 +362,17 @@ const LEASE_SCOPE_DEFINITIONS: Record<string, string> = {
   including_expired:
     "All lease-expiration rows in the Gold layer, including already-expired leases; countdowns computed at query time from lease_end_date.",
   active_future:
-    "Actionable renewal pipeline: one row per unit — the soonest future-dated lease (countdown > 0 days) — excluding units whose active tenant record shows a strictly later lease end (already renewed) and family-held units (unit_group = picinich_family). Family-held future leases are returned separately in family_held.",
+    "Actionable renewal pipeline: one row per unit — the soonest future-dated lease (countdown > 0 days) — excluding already-renewed units (active tenant record with a strictly later lease end), re-leased units (post-expiry move-in), family-held units (unit_group = picinich_family), and employee-held units (override_type = employee). Family-held future leases are returned separately in family_held. [Decisions 1-2, July 15 2026]",
+  renewals_due:
+    "Lease decisions due: the actionable renewal pipeline (active_future predicates) limited to the management decision window — default 90 days [Decision 3, July 15 2026], overridable via ?days=N.",
+  holdover:
+    "Holdover / missing renewal: per-unit soonest lease is expired with no renewal or re-lease evidence, and the unit is still reported occupied. Action: confirm month-to-month status or ingest the renewal.",
+  stale_closeout:
+    "Vacant stale closeout: per-unit soonest lease is expired with no renewal or re-lease evidence, and the unit is now vacant. Action: close the stale lease record and route the unit to the vacancy/turn workflow.",
   risk:
     "Unresolved-expiration risk population: per-unit soonest dated lease with no active future tenant record and no post-expiry move-in, already expired or due within 90 days.",
-  future_window_all:
-    "All future lease rows with countdown inside the requested day window; includes family-held units.",
+  future_window_actionable:
+    "Renewal-action window: per-unit soonest future lease with countdown inside the requested day window, excluding renewed, re-leased, family-held, and employee-held units [Decisions 1-2, July 15 2026 — resolved the July 14 open question; family units no longer appear in renewal worklists].",
 };
 
 // ── GET /api/v1/leases/expirations ────────────────────────────────────────────
@@ -351,8 +386,8 @@ app.get("/api/v1/leases/expirations", async (req: Request, res: Response) => {
     const scope  = typeof req.query.scope === "string" ? req.query.scope.trim() : "including_expired";
     const days   = req.query.days !== undefined ? parseInt(String(req.query.days), 10) : null;
 
-    if (!["including_expired", "active_future", "risk"].includes(scope)) {
-      res.status(400).json({ success: false, error: "scope must be including_expired, active_future, or risk" });
+    if (!["including_expired", "active_future", "renewals_due", "risk", "holdover", "stale_closeout"].includes(scope)) {
+      res.status(400).json({ success: false, error: "scope must be including_expired, active_future, renewals_due, risk, holdover, or stale_closeout" });
       return;
     }
     if (days !== null && (!Number.isFinite(days) || days < 0 || days > 730)) {
@@ -365,13 +400,24 @@ app.get("/api/v1/leases/expirations", async (req: Request, res: Response) => {
     // All scopes read the SAME canonical relation; only the flag predicates
     // differ. Column list and ordering are identical to the pre-view endpoint
     // so response shapes are unchanged.
+    // Actionable predicates per the July 15 2026 decision register:
+    // renewed (is_superseded), re-leased (is_released), family-held, and
+    // employee-held units are all excluded from action scopes.
+    const actionablePred = sql`is_soonest_future_for_unit AND NOT is_superseded
+              AND NOT is_released AND NOT is_family_held AND NOT is_employee_held`;
     const scopeWhere =
       scope === "active_future"
-        ? sql`is_soonest_future_for_unit AND NOT is_superseded AND NOT is_family_held
+        ? sql`${actionablePred}
               AND ${days !== null ? sql`days_until_expiration <= ${days}` : sql`TRUE`}`
+        : scope === "renewals_due"
+        ? sql`${actionablePred} AND days_until_expiration <= ${days ?? 90}`
         : scope === "risk"
         ? sql`is_soonest_for_unit AND NOT has_active_future_tenant_lease
               AND NOT is_released AND days_until_expiration <= 90`
+        : scope === "holdover"
+        ? sql`is_holdover`
+        : scope === "stale_closeout"
+        ? sql`is_stale_closeout`
         : sql`TRUE`;
 
     const rows = await sql<GoldLeaseExpiration[]>`
@@ -467,14 +513,16 @@ app.get("/api/v1/leases/expiring-soon", async (req: Request, res: Response) => {
              unit_group,
              created_at
       FROM v_lease_population
-      WHERE is_soonest_future_for_unit AND NOT is_superseded AND NOT is_family_held
+      WHERE is_soonest_future_for_unit AND NOT is_superseded
+        AND NOT is_released AND NOT is_family_held AND NOT is_employee_held
         AND days_until_expiration <= ${days}
       ORDER BY lease_end_date ASC
       LIMIT ${limit}
     `;
     const countRes = await sql<{ count: string }[]>`
       SELECT COUNT(*) AS count FROM v_lease_population
-      WHERE is_soonest_future_for_unit AND NOT is_superseded AND NOT is_family_held
+      WHERE is_soonest_future_for_unit AND NOT is_superseded
+        AND NOT is_released AND NOT is_family_held AND NOT is_employee_held
         AND days_until_expiration <= ${days}
     `;
     const total = parseInt(countRes[0].count, 10);
@@ -504,13 +552,11 @@ app.get("/api/v1/leases/upcoming-renewals", async (req: Request, res: Response) 
     const toDays   = Math.min(parseInt(String(req.query.to_days   ?? "180"), 10), 730);
     const limit    = Math.min(parseInt(String(req.query.limit     ?? "100"), 10), 500);
     sql = getDb();
-    // future_window_all scope: deliberately NOT the active_future predicates.
-    // This endpoint's pre-view semantics (all future rows in the window,
-    // family-held units included) are preserved output-identical; the Home
-    // renewals card consumes it at 300–400 days, where the three family-held
-    // leases (365 days out on July 14, 2026) sit permanently. Whether family
-    // units belong in the renewal window is an open product question — flagged
-    // July 14, 2026, decide separately rather than change the number silently.
+    // future_window_actionable: per the July 15 2026 decision register,
+    // renewal worklists are ACTIONS — renewed, re-leased, family-held, and
+    // employee-held units are excluded. (This resolves the question flagged
+    // July 14; the Home renewals card count drops by the family/employee
+    // leases previously counted in the window — an intentional change.)
     const rows = await sql<GoldLeaseExpiration[]>`
       SELECT id, bronze_report_id, tenant_id, unit_id,
              lease_start_date::text AS lease_start_date,
@@ -522,7 +568,8 @@ app.get("/api/v1/leases/upcoming-renewals", async (req: Request, res: Response) 
              unit_group,
              created_at
       FROM v_lease_population
-      WHERE lease_end_date IS NOT NULL
+      WHERE is_soonest_future_for_unit AND NOT is_superseded
+        AND NOT is_released AND NOT is_family_held AND NOT is_employee_held
         AND days_until_expiration > ${fromDays}
         AND days_until_expiration <= ${toDays}
       ORDER BY lease_end_date ASC
@@ -530,15 +577,16 @@ app.get("/api/v1/leases/upcoming-renewals", async (req: Request, res: Response) 
     `;
     const countRes = await sql<{ count: string }[]>`
       SELECT COUNT(*) AS count FROM v_lease_population
-      WHERE lease_end_date IS NOT NULL
+      WHERE is_soonest_future_for_unit AND NOT is_superseded
+        AND NOT is_released AND NOT is_family_held AND NOT is_employee_held
         AND days_until_expiration > ${fromDays}
         AND days_until_expiration <= ${toDays}
     `;
     const total = parseInt(countRes[0].count, 10);
     res.status(200).json({
       success: true,
-      scope: "future_window_all",
-      scope_definition: LEASE_SCOPE_DEFINITIONS.future_window_all,
+      scope: "future_window_actionable",
+      scope_definition: LEASE_SCOPE_DEFINITIONS.future_window_actionable,
       from_days: fromDays,
       to_days: toDays,
       total,
@@ -2061,6 +2109,7 @@ interface PortfolioHealthRow {
   net_operating_income:  string | null;
   gross_revenue:         string | null;
   profit_margin:         string | null;
+  expense_to_income_ratio: string | null;
   total_delinquency:     string | null;
   avg_risk_score:        string | null;
   high_expiration_count: string | null;
@@ -2132,6 +2181,15 @@ app.get("/api/v1/insights/portfolio-health", async (_req: Request, res: Response
           ORDER BY report_date DESC, created_at DESC
           LIMIT 1
         ) AS profit_margin,
+        (
+          -- Expense completeness: same 10% ratio rule as /api/pages/financials.
+          SELECT CASE WHEN total_income > 0
+                      THEN (total_expenses / total_income)::text ELSE NULL END
+          FROM gold_income_statements
+          WHERE total_income > 0
+          ORDER BY report_date DESC, created_at DESC
+          LIMIT 1
+        ) AS expense_to_income_ratio,
         -- Risk: total delinquency balance (latest per tenant)
         (
           SELECT COALESCE(SUM(balance_due), 0)::text
@@ -2179,6 +2237,13 @@ app.get("/api/v1/insights/portfolio-health", async (_req: Request, res: Response
     const noi             = row.net_operating_income !== null ? parseFloat(row.net_operating_income) : null;
     const grossRevenue    = row.gross_revenue !== null ? parseFloat(row.gross_revenue) : null;
     const profitMargin    = row.profit_margin     !== null ? parseFloat(row.profit_margin)    : null;
+    const expenseRatio    = row.expense_to_income_ratio !== null ? parseFloat(row.expense_to_income_ratio) : null;
+    // Same completeness rule as /api/pages/financials: expenses under 10% of
+    // income means the AppFolio feed is exporting a partial expense account
+    // scope. Per the July 15 2026 decision register (item 4 / plan item 1.4),
+    // incomplete financial inputs BLOCK the financial component rather than
+    // scoring a favorable partial margin as healthy.
+    const expenseScopeBlocked = expenseRatio !== null && expenseRatio < 0.1;
     const totalDelinquency = parseFloat(row.total_delinquency ?? "0");
     const avgRiskScore    = parseFloat(row.avg_risk_score ?? "0");
     const highExpCount    = parseInt(row.high_expiration_count ?? "0", 10);
@@ -2196,8 +2261,10 @@ app.get("/api/v1/insights/portfolio-health", async (_req: Request, res: Response
 
     // Financial health: based on profit_margin (0–1 range)
     // 30%+ margin → 100, 0% → 50, negative → 0
-    let financialHealth: number;
-    if (profitMargin === null && noi === null) {
+    let financialHealth: number | null;
+    if (expenseScopeBlocked) {
+      financialHealth = null; // BLOCKED — partial expense feed cannot score
+    } else if (profitMargin === null && noi === null) {
       financialHealth = 50; // no data → neutral
     } else if (profitMargin !== null) {
       financialHealth = Math.round(Math.max(0, Math.min(100, (profitMargin / 0.3) * 100)));
@@ -2216,11 +2283,16 @@ app.get("/api/v1/insights/portfolio-health", async (_req: Request, res: Response
     const riskHealth      = Math.round(Math.min(100, (riskFromAR * 0.4 + riskFromDelinq * 0.4 + riskFromExpiry * 0.2)));
 
     // ── Portfolio health score (weighted average) ───────────────────────────
-    const portfolioScore = Math.round(
-      financialHealth * 0.4 +
-      occupancyHealth * 0.3 +
-      riskHealth      * 0.3
-    );
+    // When the financial component is blocked, the score renormalizes over
+    // the remaining components (occupancy/risk at equal weight) instead of
+    // treating partial data as neutral or healthy.
+    const portfolioScore = financialHealth === null
+      ? Math.round(occupancyHealth * 0.5 + riskHealth * 0.5)
+      : Math.round(
+          financialHealth * 0.4 +
+          occupancyHealth * 0.3 +
+          riskHealth      * 0.3
+        );
 
     // ── Classification ─────────────────────────────────────────────────────
     let classification: string;
@@ -2233,12 +2305,25 @@ app.get("/api/v1/insights/portfolio-health", async (_req: Request, res: Response
       success: true,
       portfolio_health_score: portfolioScore,
       classification,
+      score_confidence: expenseScopeBlocked ? "warning" : "trusted",
+      score_note: expenseScopeBlocked
+        ? "Financial component blocked: the AppFolio expense feed is partial (expenses under 10% of income), so margin cannot be scored. Score is renormalized over occupancy and risk only."
+        : null,
       breakdown: {
-        financial: {
-          score:       financialHealth,
-          weight:      "40%",
-          description: "Derived from profit margin and NOI",
-        },
+        financial: expenseScopeBlocked
+          ? {
+              score:       null,
+              confidence:  "blocked",
+              weight:      "excluded (renormalized)",
+              description: "BLOCKED — partial expense feed; NOI/margin unavailable for scoring",
+              affected_checks: ["financial_expense_scope_plausibility"],
+            }
+          : {
+              score:       financialHealth,
+              confidence:  "trusted",
+              weight:      "40%",
+              description: "Derived from profit margin and NOI",
+            },
         occupancy: {
           score:       occupancyHealth,
           weight:      "30%",
@@ -2260,18 +2345,31 @@ app.get("/api/v1/insights/portfolio-health", async (_req: Request, res: Response
         // Rates computed from canonical denominator
         occupancy_rate:         occupancyRate !== null ? Math.round(occupancyRate * 10000) / 10000 : null,
         vacancy_rate:           vacancyRate   !== null ? Math.round(vacancyRate   * 10000) / 10000 : null,
-        // Financial
-        net_operating_income:   noi,
-        profit_margin:          profitMargin,   // null when expense data unavailable
+        // Financial — authoritative fields are NULLED when the expense feed
+        // is partial (per July 15 2026 decision register / plan item 1.4);
+        // raw partial-scope values move to partial_scope_values so nothing
+        // downstream can mistake them for complete property performance.
+        net_operating_income:   expenseScopeBlocked ? null : noi,
+        profit_margin:          expenseScopeBlocked ? null : profitMargin,
         gross_revenue:          grossRevenue,
+        ...(expenseScopeBlocked
+          ? {
+              financial_confidence: "blocked",
+              partial_scope_values: {
+                net_operating_income: noi,
+                profit_margin: profitMargin,
+                note: "Computed from a partial expense feed — not usable as property performance.",
+              },
+            }
+          : { financial_confidence: "trusted" }),
         total_delinquency_balance: totalDelinquency,
         avg_aged_receivables_risk_score: avgRiskScore,
         high_expiration_risk_count: highExpCount,
       },
       data_availability: {
         occupancy_data:   totalUnits > 0,
-        financial_data:   noi !== null || profitMargin !== null,
-        expense_data:     profitMargin !== null,  // false = AppFolio has no expense export
+        financial_data:   !expenseScopeBlocked && (noi !== null || profitMargin !== null),
+        expense_data:     !expenseScopeBlocked && profitMargin !== null,
         risk_data:        totalDelinquency > 0 || avgRiskScore > 0,
       },
     });

@@ -1,25 +1,8 @@
--- Migration: create_v_lease_population
--- Created: 2026-07-14
--- Purpose: Canonical lease-population view. One SQL relation defines every
---          lease population served by the API and the Jasmine agent; scopes
---          are row-level boolean flags so endpoints, Jasmine loaders, and the
---          transform worker's reconciliation checks share one definition.
---
---          Scope predicates (documented in LEASE_SCOPE_DEFINITIONS,
---          src/index.ts):
---            active_future = is_soonest_future_for_unit
---                            AND NOT is_superseded AND NOT is_family_held
---            family_held   = is_soonest_future_for_unit AND is_family_held
---            risk          = is_soonest_for_unit
---                            AND NOT has_active_future_tenant_lease
---                            AND NOT is_released
---                            AND days_until_expiration <= 90
---
--- NOTE: This file documents the view. The authoritative copy is
---       V_LEASE_POPULATION_DDL in src/index.ts, executed idempotently at API
---       startup (CREATE OR REPLACE VIEW). The regex literals below are the
---       cooked form the JS driver has always sent (e.g. 's*-s*'), preserved
---       byte-identically so enrichment join keys never shift.
+-- Migration: create_v_lease_population (v2 — July 15, 2026)
+-- Documentation copy. The AUTHORITATIVE DDL is V_LEASE_POPULATION_DDL in
+-- src/index.ts, (re)applied idempotently at API startup via CREATE OR REPLACE.
+-- v2 adds: is_employee_held (jasmine_unit_overrides join), unit_status,
+-- is_holdover, is_stale_closeout — per the July 15 2026 decision register.
 
 CREATE OR REPLACE VIEW v_lease_population AS
 WITH rent_lookup AS (
@@ -103,6 +86,34 @@ SELECT
       AND t.move_in_date::date >= b.lease_end_date
   )                                                                     AS is_released,
   COALESCE(gu.unit_group = 'picinich_family', FALSE)                    AS is_family_held,
+  (juo.unit_id IS NOT NULL AND juo.override_type = 'employee')          AS is_employee_held,
+  gu.unit_status,
+  -- Holdover: soonest per-unit lease is expired, no renewal or re-lease
+  -- evidence, and the unit is still reported occupied — the tenant likely
+  -- stayed past the lease end without a renewal being ingested.
+  (b.unit_rank_all = 1 AND b.lease_end_date IS NOT NULL
+     AND b.days_until_expiration < 0
+     AND gta.unit_id IS NULL
+     AND NOT EXISTS (
+       SELECT 1 FROM gold_unit_turnover t
+       WHERE t.unit_id = b.unit_id
+         AND t.move_in_date IS NOT NULL
+         AND t.move_in_date::date >= b.lease_end_date
+     )
+     AND gu.unit_status = 'occupied')                                   AS is_holdover,
+  -- Stale closeout: same expired-unresolved evidence but the unit is now
+  -- vacant — the lease record should be closed and the unit routed to the
+  -- vacancy/turn workflow.
+  (b.unit_rank_all = 1 AND b.lease_end_date IS NOT NULL
+     AND b.days_until_expiration < 0
+     AND gta.unit_id IS NULL
+     AND NOT EXISTS (
+       SELECT 1 FROM gold_unit_turnover t
+       WHERE t.unit_id = b.unit_id
+         AND t.move_in_date IS NOT NULL
+         AND t.move_in_date::date >= b.lease_end_date
+     )
+     AND gu.unit_status IS DISTINCT FROM 'occupied')                    AS is_stale_closeout,
   gu.unit_group,
   gu.exclude_from_occupancy,
   rl.monthly_rent,
@@ -115,5 +126,6 @@ SELECT
 FROM base b
 LEFT JOIN gt_active     gta ON gta.unit_id = b.unit_id
 LEFT JOIN gold_units    gu  ON gu.unit_id  = b.unit_id
+LEFT JOIN jasmine_unit_overrides juo ON juo.unit_id = b.unit_id
 LEFT JOIN rent_lookup   rl  ON rl.unit_id  = b.unit_id
-LEFT JOIN tenant_lookup tl  ON tl.unit_id  = b.unit_id;
+LEFT JOIN tenant_lookup tl  ON tl.unit_id  = b.unit_id
