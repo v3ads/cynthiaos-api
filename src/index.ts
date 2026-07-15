@@ -2287,9 +2287,13 @@ app.get("/api/v1/metrics/summary", async (_req: Request, res: Response) => {
     // Values: one round-trip per metric family, all from canonical relations.
     const [units] = await sql<{ total: string; occupied: string; vacant: string; notice: string; excluded: string }[]>`
       SELECT COUNT(*)::text AS total,
-             COUNT(*) FILTER (WHERE unit_status='occupied')::text AS occupied,
-             COUNT(*) FILTER (WHERE unit_status='vacant')::text   AS vacant,
-             COUNT(*) FILTER (WHERE unit_status='notice')::text   AS notice,
+             -- Status counts come from the ELIGIBLE population only, matching
+             -- portfolio-health exactly: numerator and denominator must be
+             -- the same universe or the rates drift (caught 34.64% vs 33.52%
+             -- on first cross-check).
+             COUNT(*) FILTER (WHERE unit_status='occupied' AND NOT exclude_from_occupancy)::text AS occupied,
+             COUNT(*) FILTER (WHERE unit_status='vacant'   AND NOT exclude_from_occupancy)::text AS vacant,
+             COUNT(*) FILTER (WHERE unit_status='notice'   AND NOT exclude_from_occupancy)::text AS notice,
              COUNT(*) FILTER (WHERE exclude_from_occupancy)::text AS excluded
       FROM v_unit_occupancy
     `;
