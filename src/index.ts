@@ -4190,7 +4190,14 @@ app.listen(PORT, "0.0.0.0", async () => {
     // a missing view during deploys. Gold promotion only UPSERTs into
     // gold_lease_expirations (never drops it), so the view persists across
     // pipeline runs. See V_LEASE_POPULATION_DDL for full semantics.
-    await boot.unsafe(V_LEASE_POPULATION_DDL);
+    // DROP first: CREATE OR REPLACE VIEW can only append columns at the END
+    // of the list — the v2 view (July 15) inserts flag columns mid-list,
+    // which OR REPLACE rejects, silently leaving the old definition live.
+    // Nothing depends on the view at DDL level, so DROP+CREATE is safe; the
+    // view is only absent for the milliseconds between the two statements
+    // during startup.
+    await boot.unsafe(`DROP VIEW IF EXISTS v_lease_population`);
+    await boot.unsafe(V_LEASE_POPULATION_DDL.replace('CREATE OR REPLACE VIEW', 'CREATE VIEW'));
     console.log(`[${SERVICE_NAME}] v_lease_population canonical lease view ensured`);
     const [cnt] = await boot<{ n: string }[]>`SELECT COUNT(*)::text AS n FROM gold_units`;
     if (parseInt(cnt.n, 10) === 0) {
