@@ -2277,6 +2277,238 @@ const METRIC_REGISTRY: MetricRegistryEntry[] = [
   },
 ];
 
+// ══ Release 2: Action layer API (/api/v2/*) ═════════════════════════════════
+
+// GET /api/v2/actions — list actions, filterable by status/type/owner/entity.
+app.get("/api/v2/actions", async (req: Request, res: Response) => {
+  let sql: postgres.Sql | null = null;
+  try {
+    sql = getDb();
+    const status = (req.query.status as string | undefined)?.toLowerCase();
+    const type   = req.query.type as string | undefined;
+    const owner  = req.query.owner as string | undefined;
+    const entityType = req.query.entity_type as string | undefined;
+    const entityId   = req.query.entity_id as string | undefined;
+    // Default view excludes done/dismissed unless explicitly requested.
+    const rows = await sql`
+      SELECT * FROM actions
+      WHERE (${status ?? null}::text IS NULL OR status = ${status ?? null})
+        AND (${status ? null : true} IS NULL OR status NOT IN ('done','dismissed'))
+        AND (${type ?? null}::text IS NULL OR type = ${type ?? null})
+        AND (${owner ?? null}::text IS NULL OR owner = ${owner ?? null})
+        AND (${entityType ?? null}::text IS NULL OR entity_type = ${entityType ?? null})
+        AND (${entityId ?? null}::text IS NULL OR entity_id = ${entityId ?? null})
+      ORDER BY
+        CASE priority WHEN 'high' THEN 0 WHEN 'normal' THEN 1 ELSE 2 END,
+        due_at ASC NULLS LAST,
+        created_at DESC
+    `;
+    res.status(200).json({ success: true, total: rows.length, data: rows });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`[${SERVICE_NAME}] GET /api/v2/actions error:`, message);
+    res.status(500).json({ success: false, error: message });
+  } finally {
+    if (sql) await sql.end();
+  }
+});
+
+// POST /api/v2/actions — create an ad-hoc action (user write path).
+app.post("/api/v2/actions", async (req: Request, res: Response) => {
+  let sql: postgres.Sql | null = null;
+  try {
+    sql = getDb();
+    const b = req.body ?? {};
+    if (!b.title || typeof b.title !== "string") {
+      res.status(400).json({ success: false, error: "title is required" });
+      return;
+    }
+    const [row] = await sql`
+      INSERT INTO actions (source, type, entity_type, entity_id, title, detail,
+        owner, priority, due_at, impact_label, next_action)
+      VALUES ('user', ${b.type ?? 'ad_hoc'}, ${b.entity_type ?? null}, ${b.entity_id ?? null},
+        ${b.title}, ${b.detail ?? null}, ${b.owner ?? 'Cindy'}, ${b.priority ?? 'normal'},
+        ${b.due_at ?? null}, ${b.impact_label ?? null}, ${b.next_action ?? null})
+      RETURNING *
+    `;
+    await sql`
+      INSERT INTO action_events (action_id, from_status, to_status, note, actor)
+      VALUES (${row.action_id}, NULL, 'open', 'created', ${b.owner ?? 'Cindy'})
+    `;
+    res.status(201).json({ success: true, data: row });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`[${SERVICE_NAME}] POST /api/v2/actions error:`, message);
+    res.status(500).json({ success: false, error: message });
+  } finally {
+    if (sql) await sql.end();
+  }
+});
+
+// PATCH /api/v2/actions/:id — transition status / reassign / snooze.
+app.patch("/api/v2/actions/:id", async (req: Request, res: Response) => {
+  let sql: postgres.Sql | null = null;
+  try {
+    sql = getDb();
+    const id = req.params.id;
+    const b = req.body ?? {};
+    const [current] = await sql<{ status: string }[]>`
+      SELECT status FROM actions WHERE action_id = ${id}
+    `;
+    if (!current) {
+      res.status(404).json({ success: false, error: "action not found" });
+      return;
+    }
+    const newStatus: string | null = b.status ?? null;
+    const completedAt = newStatus === "done" ? sql`NOW()` : sql`completed_at`;
+    const [row] = await sql`
+      UPDATE actions SET
+        status        = COALESCE(${newStatus}, status),
+        owner         = COALESCE(${b.owner ?? null}, owner),
+        priority      = COALESCE(${b.priority ?? null}, priority),
+        due_at        = COALESCE(${b.due_at ?? null}, due_at),
+        snoozed_until = COALESCE(${b.snoozed_until ?? null}, snoozed_until),
+        next_action   = COALESCE(${b.next_action ?? null}, next_action),
+        completed_at  = ${completedAt},
+        updated_at    = NOW()
+      WHERE action_id = ${id}
+      RETURNING *
+    `;
+    if (newStatus && newStatus !== current.status) {
+      await sql`
+        INSERT INTO action_events (action_id, from_status, to_status, note, actor)
+        VALUES (${id}, ${current.status}, ${newStatus}, ${b.note ?? null}, ${b.actor ?? 'Cindy'})
+      `;
+    }
+    res.status(200).json({ success: true, data: row });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`[${SERVICE_NAME}] PATCH /api/v2/actions/:id error:`, message);
+    res.status(500).json({ success: false, error: message });
+  } finally {
+    if (sql) await sql.end();
+  }
+});
+
+// GET /api/v2/today — the management outcome view: five outcome cards
+// (cash at risk, vacancy exposure, lease decisions due, operational
+// blockers, data confidence) plus a ranked exception queue drawn from the
+// actions table. Composes canonical relations + the action layer so the
+// property manager sees material issues with owner/impact/next-action
+// without opening a raw table (Release 2 / plan item 2.4).
+app.get("/api/v2/today", async (_req: Request, res: Response) => {
+  let sql: postgres.Sql | null = null;
+  try {
+    sql = getDb();
+
+    // Cash at risk: positive collectible exposure (latest per tenant).
+    const [coll] = await sql<{ exposure: string; tenants: string }[]>`
+      SELECT COALESCE(SUM(balance_due) FILTER (WHERE balance_due > 0), 0)::text AS exposure,
+             COUNT(*) FILTER (WHERE balance_due > 0)::text AS tenants
+      FROM (SELECT DISTINCT ON (tenant_id) balance_due FROM gold_delinquency_records
+            ORDER BY tenant_id, created_at DESC) d
+    `;
+    // Vacancy exposure: vacant + notice units and their market-rent value.
+    const [vac] = await sql<{ vacant: string; notice: string }[]>`
+      SELECT COUNT(*) FILTER (WHERE unit_status='vacant')::text AS vacant,
+             COUNT(*) FILTER (WHERE unit_status='notice')::text AS notice
+      FROM v_unit_occupancy WHERE NOT exclude_from_occupancy
+    `;
+    // Lease decisions due (90d), holdovers, stale closeouts.
+    const [lease] = await sql<{ due: string; holdover: string; closeout: string }[]>`
+      SELECT
+        COUNT(*) FILTER (WHERE is_soonest_future_for_unit AND NOT is_superseded
+          AND NOT is_released AND NOT is_family_held AND NOT is_employee_held
+          AND days_until_expiration <= 90)::text AS due,
+        COUNT(*) FILTER (WHERE is_holdover AND NOT is_family_held AND NOT is_employee_held)::text AS holdover,
+        COUNT(*) FILTER (WHERE is_stale_closeout AND NOT is_family_held AND NOT is_employee_held)::text AS closeout
+      FROM v_lease_population
+    `;
+    // Operational blockers: open work orders + in-progress turns.
+    const [ops] = await sql<{ open_wo: string; turns: string }[]>`
+      SELECT
+        (SELECT COUNT(*)::text FROM gold_maintenance
+          WHERE status IS NULL OR (status NOT ILIKE '%completed%' AND status NOT ILIKE '%canceled%')) AS open_wo,
+        (SELECT COUNT(*)::text FROM gold_unit_turnover
+          WHERE move_out_date IS NOT NULL AND move_out_date::date <= CURRENT_DATE
+            AND turn_end_date IS NULL AND days_to_complete IS NULL) AS turns
+    `;
+    // Data confidence: failing integrity checks right now.
+    const checkRows = await sql<{ failing: string }[]>`
+      SELECT COUNT(*)::text AS failing FROM integrity_check_results WHERE passed = false
+    `.catch(() => [{ failing: "0" }]);
+
+    // Ranked open exception queue from the action layer.
+    const queue = await sql`
+      SELECT action_id, type, entity_type, entity_id, title, detail, owner,
+             priority, status, due_at, impact_label, next_action, confidence
+      FROM actions
+      WHERE status IN ('open','in_progress')
+        AND (snoozed_until IS NULL OR snoozed_until <= CURRENT_DATE)
+      ORDER BY
+        CASE priority WHEN 'high' THEN 0 WHEN 'normal' THEN 1 ELSE 2 END,
+        due_at ASC NULLS LAST, created_at DESC
+      LIMIT 50
+    `;
+
+    const failing = parseInt(checkRows[0]?.failing ?? "0", 10);
+    res.status(200).json({
+      success: true,
+      as_of: new Date().toISOString(),
+      outcomes: {
+        cash_at_risk: {
+          label: "Cash at risk",
+          value: parseFloat(coll.exposure),
+          unit: "currency",
+          sub: `${coll.tenants} tenants with a positive balance`,
+          confidence: "trusted",
+          drilldown_url: "/insights",
+        },
+        vacancy_exposure: {
+          label: "Vacancy exposure",
+          value: parseInt(vac.vacant, 10) + parseInt(vac.notice, 10),
+          unit: "count",
+          sub: `${vac.vacant} vacant, ${vac.notice} on notice`,
+          confidence: "trusted",
+          drilldown_url: "/unit-intelligence",
+        },
+        lease_decisions_due: {
+          label: "Lease decisions due",
+          value: parseInt(lease.due, 10),
+          unit: "count",
+          sub: `${lease.holdover} holdovers, ${lease.closeout} stale closeouts`,
+          confidence: "trusted",
+          drilldown_url: "/lease-expirations",
+        },
+        operational_blockers: {
+          label: "Operational blockers",
+          value: parseInt(ops.open_wo, 10),
+          unit: "count",
+          sub: `${ops.turns} turns in progress`,
+          confidence: failing > 0 ? "warning" : "trusted",
+          drilldown_url: "/maintenance",
+        },
+        data_confidence: {
+          label: "Data confidence",
+          value: failing,
+          unit: "count",
+          sub: failing === 0 ? "All checks passing" : `${failing} check${failing === 1 ? "" : "s"} failing`,
+          confidence: failing === 0 ? "trusted" : "warning",
+          drilldown_url: "/pipeline",
+        },
+      },
+      queue,
+      queue_total: queue.length,
+    });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`[${SERVICE_NAME}] GET /api/v2/today error:`, message);
+    res.status(500).json({ success: false, error: message });
+  } finally {
+    if (sql) await sql.end();
+  }
+});
+
 app.get("/api/v1/metrics/summary", async (_req: Request, res: Response) => {
   let sql: postgres.Sql | null = null;
   try {
@@ -4416,6 +4648,74 @@ app.listen(PORT, "0.0.0.0", async () => {
       )
     `;
     console.log(`[${SERVICE_NAME}] unit_notes table ensured`);
+
+    // ── actions table (Release 2 — the shared accountable work queue) ─────
+    // One table backs Today, Tasks, and every future workflow surface.
+    // Two write paths: system-generated actions (emitted by the transform
+    // worker after Gold promotion, idempotent on natural_key so re-runs
+    // update rather than duplicate) and user actions/transitions from the
+    // frontend. Owner defaults to Cindy — this is Cindy's system, no roles
+    // (decision 5, July 15 2026). Status history is append-only via
+    // action_events so nothing is destructively overwritten.
+    await boot`
+      CREATE TABLE IF NOT EXISTS actions (
+        action_id     UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        natural_key   TEXT UNIQUE,               -- system actions: dedupe key; NULL for ad-hoc
+        source        TEXT NOT NULL DEFAULT 'system',  -- 'system' | 'user'
+        type          TEXT NOT NULL,             -- renewal_due | broken_promise | overdue_turn | no_recent_contact | stale_closeout | ad_hoc ...
+        entity_type   TEXT,                      -- unit | tenant | work_order | prospect | lease
+        entity_id     TEXT,
+        title         TEXT NOT NULL,
+        detail        TEXT,
+        owner         TEXT NOT NULL DEFAULT 'Cindy',
+        priority      TEXT NOT NULL DEFAULT 'normal',  -- high | normal | low
+        status        TEXT NOT NULL DEFAULT 'open',    -- open | in_progress | snoozed | done | dismissed
+        due_at        DATE,
+        snoozed_until DATE,
+        impact_amount NUMERIC,                   -- dollar impact where known
+        impact_label  TEXT,                      -- e.g. "$2,400/mo at risk"
+        next_action   TEXT,                      -- the single recommended next step
+        source_freshness TIMESTAMPTZ,
+        confidence    TEXT NOT NULL DEFAULT 'trusted',
+        created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        completed_at  TIMESTAMPTZ
+      )
+    `;
+    await boot`CREATE INDEX IF NOT EXISTS idx_actions_status_due ON actions (status, due_at)`;
+    await boot`CREATE INDEX IF NOT EXISTS idx_actions_type ON actions (type)`;
+    await boot`CREATE INDEX IF NOT EXISTS idx_actions_entity ON actions (entity_type, entity_id)`;
+    // Append-only audit trail of every transition.
+    await boot`
+      CREATE TABLE IF NOT EXISTS action_events (
+        event_id    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        action_id   UUID NOT NULL REFERENCES actions(action_id) ON DELETE CASCADE,
+        from_status TEXT,
+        to_status   TEXT,
+        note        TEXT,
+        actor       TEXT NOT NULL DEFAULT 'Cindy',
+        created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `;
+    await boot`CREATE INDEX IF NOT EXISTS idx_action_events_action ON action_events (action_id, created_at)`;
+    // Seed: migrate existing unit_notes into the action universe as ad-hoc,
+    // already-done note actions so historical context isn't lost. One-time,
+    // idempotent via natural_key.
+    await boot`
+      INSERT INTO actions (natural_key, source, type, entity_type, entity_id, title, detail, status, owner, created_at, updated_at, completed_at)
+      SELECT
+        'seed:unit_note:' || unit_id,
+        'user', 'ad_hoc', 'unit', unit_id,
+        'Note: unit ' || unit_id,
+        notes,
+        'done',
+        COALESCE(updated_by, 'Cindy'),
+        updated_at, updated_at, updated_at
+      FROM unit_notes
+      WHERE TRIM(COALESCE(notes, '')) <> ''
+      ON CONFLICT (natural_key) DO NOTHING
+    `;
+    console.log(`[${SERVICE_NAME}] actions + action_events tables ensured (Release 2)`);
     await boot`
       ALTER TABLE gold_delinquency_records
         ADD COLUMN IF NOT EXISTS tenant_status TEXT NOT NULL DEFAULT 'current'
