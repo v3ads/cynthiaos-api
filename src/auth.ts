@@ -15,7 +15,16 @@ import { createRemoteJWKSet, jwtVerify, type JWTPayload } from "jose";
 // Internal worker→API calls carry a shared secret header instead of a user
 // token (cron/transform triggers have no user session).
 
-const SUPABASE_URL = process.env.SUPABASE_URL ?? process.env.NEXT_PUBLIC_SUPABASE_URL ?? "";
+const SUPABASE_URL =
+  process.env.SUPABASE_URL ??
+  process.env.NEXT_PUBLIC_SUPABASE_URL ??
+  // Public project URL (not a secret — verified live against the JWKS
+  // endpoint). Hardcoded as a fallback so JWKS verification activates the
+  // moment this deploys, rather than waiting on a Railway dashboard env-var
+  // change for what is otherwise the single most severe open finding
+  // (direct-Railway access, unauthenticated). SUPABASE_URL/SUPABASE_JWT_SECRET
+  // env vars still take precedence if set — e.g. if the project URL rotates.
+  "https://vnwyuvmwggcbobwmdyql.supabase.co";
 const JWT_SECRET = process.env.SUPABASE_JWT_SECRET ?? "";
 const INTERNAL_SECRET = process.env.INTERNAL_API_SECRET ?? "";
 // Fail closed unless auth is explicitly disabled for local dev.
