@@ -1153,8 +1153,8 @@ app.get("/health", (_req: Request, res: Response) => {
     timestamp: new Date().toISOString(),
     db: { connected: dbConnected, verified_at: dbTimestamp },
     constraints: {
-      auth: "single_operator",
-      auth_note: "No authentication layer. All endpoints are publicly accessible. Multi-user auth is a future phase.",
+      auth: "supabase_jwt_required",
+      auth_note: "Deny-by-default: every /api route requires a valid Supabase session (JWKS-verified), except /health. Single-tenant — a verified session is authorized for the whole surface; there is no per-org/role scoping.",
       tenant_id_format: "normalised",
       tenant_id_note: "All Gold strategies use shared normalizeTenantId(name, unit) from utils/normalize. Format: name_unit e.g. maria_santos_101.",
       idempotency: "content_hash",
