@@ -12,8 +12,22 @@ const API_VERSION = "v1";
 app.use(express.json());
 
 // ── CORS ──────────────────────────────────────────────────────────────────────
+const ALLOWED_CORS_ORIGINS = new Set([
+  "https://www.cynthiacore.com",
+  "https://cynthiaos.vercel.app",
+]);
+const CYNTHIAOS_VERCEL_PREVIEW_ORIGIN =
+  /^https:\/\/cynthiaos(?:-[a-z0-9-]+)?-v3ads-projects\.vercel\.app$/;
+
 app.use((_req: Request, res: Response, next) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
+  const origin = _req.headers.origin;
+  if (
+    origin &&
+    (ALLOWED_CORS_ORIGINS.has(origin) || CYNTHIAOS_VERCEL_PREVIEW_ORIGIN.test(origin))
+  ) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Vary", "Origin");
+  }
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
   if (_req.method === "OPTIONS") { res.status(204).end(); return; }
