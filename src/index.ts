@@ -2,6 +2,7 @@ import express, { Express, Request, Response, NextFunction } from "express";
 import postgres from "postgres";
 import jasmineRouter from "./routes/jasmine";
 import pagesRouter from "./routes/pages";
+import tenantVerifyRouter from "./routes/tenantVerify";
 import { requireAuth, actorFrom, type AuthedRequest } from "./auth";
 
 const app: Express = express();
@@ -4975,6 +4976,8 @@ app.post('/api/v1/pipeline/sync', async (_req: Request, res: Response) => {
 // ── Jasmine AI Agent Routes ─────────────────────────────────────────────────
 app.use('/api', jasmineRouter);
 app.use('/api', pagesRouter);
+// ── CynthiaConnect service-to-service routes ────────────────────────────────
+app.use('/api', tenantVerifyRouter);
 
 // ── Error handler ─────────────────────────────────────────────────────────────
 app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {

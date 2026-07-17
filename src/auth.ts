@@ -31,7 +31,13 @@ const INTERNAL_SECRET = process.env.INTERNAL_API_SECRET ?? "";
 const AUTH_DISABLED = process.env.DISABLE_AUTH === "true";
 
 // Paths that must remain open regardless of auth.
-const PUBLIC_PATHS = new Set<string>(["/health", "/"]);
+// /api/v1/tenants/verify carries its OWN Authorization: Bearer check (against
+// TENANT_VERIFY_SECRET, constant-time compared — see src/routes/tenantVerify.ts)
+// for its single service caller (CynthiaConnect), not a Supabase session, so it
+// is exempted here the same way /health and internal-secret callers are: this
+// global middleware would otherwise treat that bearer token as a Supabase JWT
+// and reject it before the route's own auth ever runs.
+const PUBLIC_PATHS = new Set<string>(["/health", "/", "/api/v1/tenants/verify"]);
 
 let jwks: ReturnType<typeof createRemoteJWKSet> | null = null;
 function getJwks() {
