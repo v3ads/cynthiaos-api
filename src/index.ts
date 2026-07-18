@@ -4240,6 +4240,9 @@ app.get("/api/v1/renewals", async (req: Request, res: Response) => {
       )
     `;
 
+    // Renewal worklists are actionable alert inputs. Read from the canonical
+    // lease population so the Picinich-family classification matches every
+    // other renewal workflow, then explicitly exclude family-held units.
     const rows = await sql<{
       id: string; unit_id: string; tenant_id: string;
       lease_end_date: string; days_until_expiration: string;
@@ -4296,12 +4299,13 @@ app.get("/api/v1/renewals", async (req: Request, res: Response) => {
         rt.proposed_rent::text,
         rt.notes,
         rt.updated_at::text
-      FROM gold_lease_expirations le
+      FROM v_lease_population le
       LEFT JOIN rent_lookup   rl ON rl.unit_id = le.unit_id
       LEFT JOIN tenant_lookup tl ON tl.unit_id = le.unit_id
       LEFT JOIN rr_names      rn ON rn.unit_id = le.unit_id
       LEFT JOIN renewal_tracking rt ON rt.unit_id = le.unit_id
       WHERE le.lease_end_date IS NOT NULL
+        AND NOT le.is_family_held
         AND (le.lease_end_date - CURRENT_DATE) > ${fromDays}
         AND (le.lease_end_date - CURRENT_DATE) <= ${toDays}
       ORDER BY le.unit_id, le.lease_end_date ASC
@@ -4309,10 +4313,11 @@ app.get("/api/v1/renewals", async (req: Request, res: Response) => {
     `;
 
     const countRes = await sql<{ count: string }[]>`
-      SELECT COUNT(*) AS count FROM gold_lease_expirations
-      WHERE lease_end_date IS NOT NULL
-        AND (lease_end_date - CURRENT_DATE) > ${fromDays}
-        AND (lease_end_date - CURRENT_DATE) <= ${toDays}
+      SELECT COUNT(*) AS count FROM v_lease_population le
+      WHERE le.lease_end_date IS NOT NULL
+        AND NOT le.is_family_held
+        AND (le.lease_end_date - CURRENT_DATE) > ${fromDays}
+        AND (le.lease_end_date - CURRENT_DATE) <= ${toDays}
     `;
     const total = parseInt(countRes[0].count, 10);
 
