@@ -438,7 +438,7 @@ router.get("/jasmine/units/:unit_id", async (req: Request, res: Response) => {
 router.get("/jasmine/leases", async (req: Request, res: Response) => {
   const windowDays = Math.min(
     Math.max(parseInt(String(req.query.window_days ?? '90'), 10), 1),
-    730
+    90
   );
   // Cache only for default 90-day window
   if (windowDays === 90) {
@@ -449,9 +449,9 @@ router.get("/jasmine/leases", async (req: Request, res: Response) => {
   try {
     sql = getDb();
 
-    // Canonical active_future scope from v_lease_population — the exact same
-    // predicates the pages' /api/v1/leases/expirations?scope=active_future
-    // uses, so Jasmine's lease answers match the pages tenant-for-tenant.
+    // Canonical 90-day renewal scope from v_lease_population — the exact same
+    // predicates the user-facing renewal pages use, so Jasmine's lease answers
+    // match the pages tenant-for-tenant.
     // Contact fields come from the view's Bronze tenant_directory lookup
     // (same source as the pages), not gold_tenants.
     const rows = await sql<{
@@ -975,7 +975,7 @@ router.get("/jasmine/move-schedule", async (req: Request, res: Response) => {
 });
 // ── ENDPOINT 11 — GET /jasmine/tasks ─────────────────────────────────────────
 // Generates tasks server-side from gold_lease_expirations.
-// Leases expiring within 60 days = contact task (priority: medium)
+// Leases expiring within 90 days = contact task (priority: medium)
 // Leases expiring within 30 days = urgent follow-up (priority: high)
 // Leases expiring within 14 days = critical renewal (priority: critical)
 router.get("/jasmine/tasks", async (_req: Request, res: Response) => {
@@ -993,7 +993,7 @@ router.get("/jasmine/tasks", async (_req: Request, res: Response) => {
       phone: string | null;
       email: string | null;
     }[]>`
-      -- Canonical active_future scope from v_lease_population at the 60-day
+      -- Canonical renewal scope from v_lease_population at the fixed 90-day
       -- window, so generated renewal tasks always target the same population
       -- the pages display (deduped, renewed-superseded and family-held units
       -- excluded). Contacts come from the view's Bronze tenant_directory
@@ -1008,7 +1008,7 @@ router.get("/jasmine/tasks", async (_req: Request, res: Response) => {
       FROM v_lease_population
       WHERE is_soonest_future_for_unit AND NOT is_superseded
         AND NOT is_released AND NOT is_vacating AND NOT is_family_held AND NOT is_employee_held
-        AND days_until_expiration <= 60
+        AND days_until_expiration <= 90
       ORDER BY lease_end_date ASC
     `;
 
@@ -1974,7 +1974,7 @@ cacheLoaders.set('tasks', async () => {
       phone: string | null;
       email: string | null;
     }[]>`
-      -- Canonical active_future scope from v_lease_population at the 60-day
+      -- Canonical renewal scope from v_lease_population at the fixed 90-day
       -- window, so generated renewal tasks always target the same population
       -- the pages display (deduped, renewed-superseded and family-held units
       -- excluded). Contacts come from the view's Bronze tenant_directory
@@ -1989,7 +1989,7 @@ cacheLoaders.set('tasks', async () => {
       FROM v_lease_population
       WHERE is_soonest_future_for_unit AND NOT is_superseded
         AND NOT is_released AND NOT is_vacating AND NOT is_family_held AND NOT is_employee_held
-        AND days_until_expiration <= 60
+        AND days_until_expiration <= 90
       ORDER BY lease_end_date ASC
     `;
     const tasks = rows.map(r => {

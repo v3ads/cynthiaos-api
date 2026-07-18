@@ -446,7 +446,7 @@ const LEASE_SCOPE_DEFINITIONS: Record<string, string> = {
   active_future:
     "Actionable renewal pipeline: one row per unit — the soonest future-dated lease (countdown > 0 days) — excluding already-renewed units (active tenant record with a strictly later lease end), re-leased units (post-expiry move-in), family-held units (unit_group = picinich_family), and employee-held units (override_type = employee). Family-held future leases are returned separately in family_held. [Decisions 1-2, July 15 2026]",
   renewals_due:
-    "Lease decisions due: the actionable renewal pipeline (active_future predicates) limited to the management decision window — default 90 days [Decision 3, July 15 2026], overridable via ?days=N.",
+    "Lease decisions due: the actionable renewal pipeline (active_future predicates) limited to the fixed 90-day management decision window [Decision 3, July 15 2026].",
   holdover:
     "Holdover / missing renewal: per-unit soonest lease is expired with no renewal or re-lease evidence, and the unit is still reported occupied. Family/employee-held units excluded (always-occupied by rule; a lapsed lease on them is expected, not actionable). Action: confirm month-to-month status or ingest the renewal.",
   stale_closeout:
@@ -456,6 +456,10 @@ const LEASE_SCOPE_DEFINITIONS: Record<string, string> = {
   future_window_actionable:
     "Renewal-action window: per-unit soonest future lease with countdown inside the requested day window, excluding renewed, re-leased, family-held, and employee-held units [Decisions 1-2, July 15 2026 — resolved the July 14 open question; family units no longer appear in renewal worklists].",
 };
+
+// The user-facing renewal population is fixed at 90 days. Individual pages
+// and supporting endpoints must not widen this window.
+const RENEWAL_WINDOW_DAYS = 90;
 
 // ── GET /api/v1/leases/expirations ────────────────────────────────────────────
 // Supports ?scope=including_expired (default, backward-compatible) |
@@ -487,12 +491,14 @@ app.get("/api/v1/leases/expirations", async (req: Request, res: Response) => {
     // employee-held units are all excluded from action scopes.
     const actionablePred = sql`is_soonest_future_for_unit AND NOT is_superseded
               AND NOT is_released AND NOT is_vacating AND NOT is_family_held AND NOT is_employee_held`;
+    const renewalWindowDays = Math.min(days ?? RENEWAL_WINDOW_DAYS, RENEWAL_WINDOW_DAYS);
+    const responseDays = scope === "renewals_due" ? renewalWindowDays : days;
     const scopeWhere =
       scope === "active_future"
         ? sql`${actionablePred}
               AND ${days !== null ? sql`days_until_expiration <= ${days}` : sql`TRUE`}`
         : scope === "renewals_due"
-        ? sql`${actionablePred} AND days_until_expiration <= ${days ?? 90}`
+        ? sql`${actionablePred} AND days_until_expiration <= ${renewalWindowDays}`
         : scope === "risk"
         ? sql`is_soonest_for_unit AND NOT has_active_future_tenant_lease
               AND NOT is_released AND days_until_expiration <= 90`
@@ -531,7 +537,7 @@ app.get("/api/v1/leases/expirations", async (req: Request, res: Response) => {
       total: parseInt(totalRes[0].count, 10),
       limit,
       offset,
-      ...(days !== null ? { days_window: days } : {}),
+      ...(responseDays !== null ? { days_window: responseDays } : {}),
       data: rows.map(mapRow),
     };
 
@@ -574,11 +580,11 @@ app.get("/api/v1/leases/expirations", async (req: Request, res: Response) => {
 app.get("/api/v1/leases/expiring-soon", async (req: Request, res: Response) => {
   let sql: postgres.Sql | null = null;
   try {
-    const days  = Math.min(parseInt(String(req.query.days  ?? "90"),  10), 730);
+    const days  = Math.min(parseInt(String(req.query.days  ?? String(RENEWAL_WINDOW_DAYS)), 10), RENEWAL_WINDOW_DAYS);
     const limit = Math.min(parseInt(String(req.query.limit ?? "100"), 10), 500);
     sql = getDb();
-    // Windowed slice of the canonical active_future scope — the same
-    // population the pages display, restricted to the requested day window.
+    // Fixed 90-day slice of the canonical actionable renewal scope — the same
+    // population the user-facing pages display.
     // (Pre-view this endpoint had its own dialect: >= CURRENT_DATE i.e.
     // day-0 leases in, no dedup, family units in. Verified July 14, 2026 that
     // the canonical predicates return identical counts on live data — 27 at
@@ -610,8 +616,8 @@ app.get("/api/v1/leases/expiring-soon", async (req: Request, res: Response) => {
     const total = parseInt(countRes[0].count, 10);
     res.status(200).json({
       success: true,
-      scope: "active_future",
-      scope_definition: LEASE_SCOPE_DEFINITIONS.active_future,
+      scope: "renewals_due",
+      scope_definition: LEASE_SCOPE_DEFINITIONS.renewals_due,
       days_window: days,
       total,
       count: rows.length,
@@ -630,8 +636,8 @@ app.get("/api/v1/leases/expiring-soon", async (req: Request, res: Response) => {
 app.get("/api/v1/leases/upcoming-renewals", async (req: Request, res: Response) => {
   let sql: postgres.Sql | null = null;
   try {
-    const fromDays = Math.max(parseInt(String(req.query.from_days ?? "90"),  10), 0);
-    const toDays   = Math.min(parseInt(String(req.query.to_days   ?? "180"), 10), 730);
+    const fromDays = Math.min(Math.max(parseInt(String(req.query.from_days ?? "0"), 10), 0), RENEWAL_WINDOW_DAYS);
+    const toDays   = Math.min(Math.max(parseInt(String(req.query.to_days   ?? String(RENEWAL_WINDOW_DAYS)), 10), 0), RENEWAL_WINDOW_DAYS);
     const limit    = Math.min(parseInt(String(req.query.limit     ?? "100"), 10), 500);
     sql = getDb();
     // future_window_actionable: per the July 15 2026 decision register,
@@ -4217,13 +4223,13 @@ app.get("/api/v1/insights/unit-intelligence", async (req: Request, res: Response
 });
 
 // ── GET /api/v1/renewals ─────────────────────────────────────────────────────
-// Returns upcoming leases (90–365 days) joined with manual renewal tracking data.
+// Returns actionable leases due within the fixed 90-day renewal window, joined with manual renewal tracking data.
 // The renewal_tracking table is created on first use (no migration needed).
 app.get("/api/v1/renewals", async (req: Request, res: Response) => {
   let sql: postgres.Sql | null = null;
   try {
-    const fromDays = Math.max(parseInt(String(req.query.from_days ?? "0"),  10), 0);
-    const toDays   = Math.min(parseInt(String(req.query.to_days   ?? "365"), 10), 730);
+    const fromDays = Math.min(Math.max(parseInt(String(req.query.from_days ?? "0"), 10), 0), RENEWAL_WINDOW_DAYS);
+    const toDays   = Math.min(Math.max(parseInt(String(req.query.to_days   ?? String(RENEWAL_WINDOW_DAYS)), 10), 0), RENEWAL_WINDOW_DAYS);
     const limit    = Math.min(parseInt(String(req.query.limit     ?? "100"), 10), 500);
     const offset   = parseInt(String(req.query.offset ?? "0"), 10);
     sql = getDb();
@@ -4305,7 +4311,9 @@ app.get("/api/v1/renewals", async (req: Request, res: Response) => {
       LEFT JOIN rr_names      rn ON rn.unit_id = le.unit_id
       LEFT JOIN renewal_tracking rt ON rt.unit_id = le.unit_id
       WHERE le.lease_end_date IS NOT NULL
-        AND NOT le.is_family_held
+        AND le.is_soonest_future_for_unit AND NOT le.is_superseded
+        AND NOT le.is_released AND NOT le.is_vacating
+        AND NOT le.is_family_held AND NOT le.is_employee_held
         AND (le.lease_end_date - CURRENT_DATE) > ${fromDays}
         AND (le.lease_end_date - CURRENT_DATE) <= ${toDays}
       ORDER BY le.unit_id, le.lease_end_date ASC
@@ -4315,7 +4323,9 @@ app.get("/api/v1/renewals", async (req: Request, res: Response) => {
     const countRes = await sql<{ count: string }[]>`
       SELECT COUNT(*) AS count FROM v_lease_population le
       WHERE le.lease_end_date IS NOT NULL
-        AND NOT le.is_family_held
+        AND le.is_soonest_future_for_unit AND NOT le.is_superseded
+        AND NOT le.is_released AND NOT le.is_vacating
+        AND NOT le.is_family_held AND NOT le.is_employee_held
         AND (le.lease_end_date - CURRENT_DATE) > ${fromDays}
         AND (le.lease_end_date - CURRENT_DATE) <= ${toDays}
     `;
@@ -4337,7 +4347,18 @@ app.get("/api/v1/renewals", async (req: Request, res: Response) => {
       tracking_updated_at:  r.updated_at ?? null,
     }));
 
-    res.status(200).json({ success: true, total, count: data.length, limit, offset, data });
+    res.status(200).json({
+      success: true,
+      scope: "renewals_due",
+      scope_definition: LEASE_SCOPE_DEFINITIONS.renewals_due,
+      from_days: fromDays,
+      to_days: toDays,
+      total,
+      count: data.length,
+      limit,
+      offset,
+      data,
+    });
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
     console.error(`[${SERVICE_NAME}] GET /api/v1/renewals error:`, message);
