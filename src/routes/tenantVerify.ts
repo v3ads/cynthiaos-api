@@ -198,4 +198,64 @@ router.post(
   }
 );
 
+// ── POST /api/v1/tenants/lookup-by-email ──────────────────────────────────────
+// Body: { email: string }
+// Looks up a CURRENT tenant by email ALONE and returns their unit + name.
+// Intended for flows where the email is ALREADY verified by an external
+// identity provider (e.g. Google OAuth sign-in), so the caller can auto-assign
+// resident status + unit without collecting a unit number. Same service-auth,
+// rate-limit, no-store, and no-email-logging posture as /verify. Because it is
+// gated by the service secret and only ever run against a single already-
+// authenticated email, it does not expose an enumeration surface to
+// unauthenticated callers. The two-factor /verify endpoint remains the path
+// for flows where the email is user-asserted rather than provider-verified.
+// 200 { isTenant: true, unitId, fullName } | { isTenant: false }
+router.post(
+  "/v1/tenants/lookup-by-email",
+  tenantVerifyRateLimiter,
+  requireServiceAuth,
+  async (req: Request, res: Response) => {
+    res.setHeader("Cache-Control", "no-store");
+    let sql: postgres.Sql | null = null;
+    try {
+      const body = req.body as { email?: unknown };
+      if (typeof body.email !== "string") {
+        res.status(200).json({ isTenant: false });
+        return;
+      }
+      const normalizedEmail = body.email.trim().toLowerCase();
+      if (!normalizedEmail) {
+        res.status(200).json({ isTenant: false });
+        return;
+      }
+
+      sql = getDb();
+      const rows = await sql<CurrentTenantMatch[]>`
+        SELECT unit_id, full_name
+        FROM gold_tenants
+        WHERE LOWER(TRIM(email)) = ${normalizedEmail}
+          AND lease_status = 'active'
+          AND (lease_end_date IS NULL OR lease_end_date >= CURRENT_DATE)
+        ORDER BY is_primary DESC NULLS LAST, unit_id
+        LIMIT 1
+      `;
+
+      const fingerprint = redactedEmailFingerprint(normalizedEmail);
+      if (rows.length > 0) {
+        console.log(`[tenant-lookup] email=${fingerprint} outcome=match`);
+        res.status(200).json({ isTenant: true, unitId: rows[0].unit_id, fullName: rows[0].full_name });
+        return;
+      }
+      console.log(`[tenant-lookup] email=${fingerprint} outcome=no-match`);
+      res.status(200).json({ isTenant: false });
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error("[tenant-lookup] internal error (no email logged):", message);
+      res.status(200).json({ isTenant: false });
+    } finally {
+      if (sql) await sql.end();
+    }
+  }
+);
+
 export default router;

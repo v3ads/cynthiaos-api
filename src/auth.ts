@@ -37,7 +37,12 @@ const AUTH_DISABLED = process.env.DISABLE_AUTH === "true";
 // is exempted here the same way /health and internal-secret callers are: this
 // global middleware would otherwise treat that bearer token as a Supabase JWT
 // and reject it before the route's own auth ever runs.
-const PUBLIC_PATHS = new Set<string>(["/health", "/", "/api/v1/tenants/verify"]);
+const PUBLIC_PATHS = new Set<string>([
+  "/health",
+  "/",
+  "/api/v1/tenants/verify",
+  "/api/v1/tenants/lookup-by-email",
+]);
 
 let jwks: ReturnType<typeof createRemoteJWKSet> | null = null;
 function getJwks() {
