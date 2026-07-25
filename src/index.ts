@@ -4956,7 +4956,13 @@ app.post('/api/v1/pipeline/sync', async (_req: Request, res: Response) => {
     // Run Gold promotion on the transform worker — always available, responds in <10s
     const goldRes = await fetch(`${TRANSFORM_WORKER_URL}/gold/run`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        // Service-to-service credential for the transform worker's auth
+        // boundary. The worker fails closed, so this must be set on both
+        // services or Sync Now returns 503 worker_auth_unconfigured.
+        'X-Worker-Key': process.env.WORKER_SHARED_SECRET ?? '',
+      },
       signal: AbortSignal.timeout(30_000),
     });
 
