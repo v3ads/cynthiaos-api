@@ -1,5 +1,7 @@
 import express, { Express, Request, Response, NextFunction } from "express";
 import postgres from "postgres";
+import { FAST_SCHEMA } from './lib/fast';
+import { createFastRouter } from './routes/fast';
 import jasmineRouter from "./routes/jasmine";
 import pagesRouter from "./routes/pages";
 import tenantVerifyRouter from "./routes/tenantVerify";
@@ -42,6 +44,7 @@ app.use((_req: Request, res: Response, next) => {
 // session (or the internal service secret). Runs after CORS so OPTIONS
 // preflight is answered above before auth is evaluated.
 app.use(requireAuth());
+app.use('/api/v1', createFastRouter(getDb));
 
 // ── Database client ───────────────────────────────────────────────────────────
 function getDb(): postgres.Sql {
@@ -5008,6 +5011,7 @@ app.listen(PORT, "0.0.0.0", async () => {
   // without waiting for the next scheduled cron run.
   try {
     const boot = getDb();
+    await boot.unsafe(FAST_SCHEMA);
     await boot`
       CREATE TABLE IF NOT EXISTS gold_units (
         unit_id    TEXT PRIMARY KEY,
