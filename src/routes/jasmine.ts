@@ -18,6 +18,8 @@
 import { Router, Request, Response } from "express";
 import postgres from "postgres";
 
+import { loadOccupancy, occupancyList, getOccupancyFreshness } from '../lib/occupancy';
+
 const router: Router = Router();
 
 // ── Database client factory (mirrors pattern in src/index.ts) ─────────────────
@@ -144,223 +146,43 @@ setTimeout(() => warmCache(), 2_000);
 // ── ENDPOINT 1 — GET /jasmine/portfolio-summary ───────────────────────────────
 // Returns a single summary object with occupancy counts, vacancy rate,
 // rent totals, and the timestamp of the last successful pipeline run.
-router.get("/jasmine/portfolio-summary", async (_req: Request, res: Response) => {
-  const cached = getCached('portfolio-summary');
-  if (cached) { res.json(cached); return; }
+router.get("/jasmine/portfolio-summary", async (_req, res) => {
   let sql: postgres.Sql | null = null;
   try {
     sql = getDb();
-    const excluded = excludedUnitIds;
-
-    const [summary] = await sql<{
-      occupied: string;
-      vacant: string;
-      on_notice: string;
-      total_monthly_rent: string | null;
-      avg_rent: string | null;
-    }[]>`
-      WITH latest_uv AS (
-        SELECT MAX(report_date) AS dt FROM bronze_appfolio_reports WHERE report_type = 'unit_vacancy'
-      ),
-      uv AS (
-        SELECT DISTINCT ON (LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g')))
-          LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g')) AS unit_id,
-          NULLIF(TRIM(elem->>'UnitStatus'), '')                             AS unit_status
-        FROM bronze_appfolio_reports b,
-             jsonb_array_elements(b.raw_data->'results') AS elem,
-             latest_uv
-        WHERE b.report_type = 'unit_vacancy'
-          AND b.report_date = latest_uv.dt
-          AND elem->>'Unit' IS NOT NULL
-        ORDER BY LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g'))
-      ),
-      latest_rr AS (
-        SELECT MAX(report_date) AS dt
-        FROM bronze_appfolio_reports
-        WHERE report_type = 'rent_roll'
-      ),
-      rr AS (
-        SELECT
-          LOWER(REGEXP_REPLACE(elem->>'Unit', '[^a-zA-Z0-9]', '', 'g')) AS unit_id,
-          NULLIF(REPLACE(elem->>'Rent', ',', ''), '')::numeric AS monthly_rent
-        FROM bronze_appfolio_reports b,
-             jsonb_array_elements(b.raw_data->'results') AS elem,
-             latest_rr
-        WHERE b.report_type = 'rent_roll'
-          AND b.report_date = latest_rr.dt
-          AND elem->>'Unit' IS NOT NULL
-          AND elem->>'Status' ILIKE '%current%'
-      )
-      SELECT
-        COUNT(*) FILTER (WHERE COALESCE(uv.unit_status, gu.unit_status) ILIKE '%occupied%'
-          AND gu.unit_id NOT IN (${sql.array(excluded)}))                   AS occupied,
-        COUNT(*) FILTER (WHERE COALESCE(uv.unit_status, gu.unit_status) ILIKE '%vacant%'
-          AND gu.unit_id NOT IN (${sql.array(excluded)}))                   AS vacant,
-        COUNT(*) FILTER (WHERE COALESCE(uv.unit_status, gu.unit_status) ILIKE '%notice%'
-          AND gu.unit_id NOT IN (${sql.array(excluded)}))                   AS on_notice,
-        SUM(rr.monthly_rent)::text                                           AS total_monthly_rent,
-        ROUND(AVG(rr.monthly_rent), 2)::text                                 AS avg_rent
-      FROM gold_units gu
-      LEFT JOIN uv  ON uv.unit_id  = gu.unit_id
-      LEFT JOIN rr  ON rr.unit_id  = gu.unit_id
-        AND gu.unit_id NOT IN (${sql.array(excluded)})
-    `;
-
+    const rows = await loadOccupancy(sql);
+    const eligible = rows.filter(r => !r.exclude_from_occupancy);
+    const occupied = eligible.filter(r => r.status === 'occupied').length;
+    const vacant = eligible.filter(r => r.status === 'vacant').length;
+    const on_notice = eligible.filter(r => r.status === 'notice').length;
+    const rents = rows.filter(r => !r.exclude_from_revenue && r.monthly_rent !== null).map(r => r.monthly_rent!);
     const [pipeline] = await sql<{ last_run: string | null }[]>`
-      SELECT MAX(updated_at)::text AS last_run
-      FROM pipeline_metadata
-      WHERE status = 'processed'
+      SELECT MAX(updated_at)::text AS last_run FROM pipeline_metadata WHERE status = 'processed'
     `;
-
-    const TOTAL_UNITS = 182;
-    const vacant = parseInt(summary.vacant ?? '0', 10);
-    const vacancyRatePct = parseFloat(((vacant / TOTAL_UNITS) * 100).toFixed(1));
-
-    const portfolioResult = {
-      total_units: TOTAL_UNITS,
-      occupied: parseInt(summary.occupied ?? '0', 10),
-      vacant,
-      on_notice: parseInt(summary.on_notice ?? '0', 10),
-      vacancy_rate_pct: vacancyRatePct,
-      total_monthly_rent: summary.total_monthly_rent ? parseFloat(summary.total_monthly_rent) : null,
-      avg_rent: summary.avg_rent ? parseFloat(summary.avg_rent) : null,
+    res.json({ total_units: rows.length, occupancy_denominator: eligible.length, occupied, vacant, on_notice,
+      total_monthly_rent: rents.length ? rents.reduce((a, b) => a + b, 0) : null,
+      avg_rent: rents.length ? rents.reduce((a, b) => a + b, 0) / rents.length : null,
       last_pipeline_run: pipeline?.last_run ?? null,
-    };
-    responseCache.set('portfolio-summary', portfolioResult);
-    res.json(portfolioResult);
-  } catch (err: unknown) {
-    const error = err instanceof Error ? err.message : String(err);
-    res.status(500).json({ error });
-  } finally {
-    if (sql) await sql.end();
-  }
+      vacancy_including_notice: vacant + on_notice,
+      vacancy_rate_pct: eligible.length ? 100 * (vacant + on_notice) / eligible.length : null,
+      ...await getOccupancyFreshness(sql) });
+  } catch { res.status(503).json({ error: 'Occupancy source unavailable; no cached availability served.' }); }
+  finally { if (sql) await sql.end(); }
 });
 
-// ── ENDPOINT 2 — GET /jasmine/units ──────────────────────────────────────────
-router.get("/jasmine/units", async (req: Request, res: Response) => {
-  const status   = String(req.query.status   ?? 'all').toLowerCase();
-  const building = req.query.building ? String(req.query.building) : null;
-  // Serve from cache for default variants (no building filter)
-  if (!building && ['all', 'vacant', 'occupied', 'notice'].includes(status)) {
-    const cached = getCached(`units:${status}`);
-    if (cached) { res.json(cached); return; }
-  }
+router.get("/jasmine/units", async (req, res) => {
+  const status = String(req.query.status ?? 'all').toLowerCase();
+  if (!['all','vacant','occupied','notice'].includes(status)) { res.status(400).json({ error: 'Invalid status' }); return; }
   let sql: postgres.Sql | null = null;
   try {
     sql = getDb();
-    const excluded = excludedUnitIds;
-
-    const validStatuses = ['vacant', 'occupied', 'notice', 'all'];
-    if (!validStatuses.includes(status)) {
-      res.status(400).json({ error: `status must be one of: ${validStatuses.join(', ')}` });
-      return;
-    }
-
-    // For status=all we drive off gold_units (182 rows) so every unit is
-    // represented even if it has no entry in the unit_vacancy Bronze report.
-    // For status-filtered queries we still drive off the vacancy report.
-    // Exclusion uses a subquery against jasmine_unit_overrides so it works
-    // reliably regardless of the postgres driver's array interpolation.
-    const rows = await sql<{
-      unit_id: string;
-      unit_type: string | null;
-      unit_group: string | null;
-      building: string | null;
-      status: string | null;
-      days_vacant: string | null;
-      market_rent: string | null;
-      monthly_rent: string | null;
-      tenant_name: string | null;
-    }[]>`
-      WITH latest_uv AS (
-        SELECT MAX(report_date) AS dt FROM bronze_appfolio_reports WHERE report_type = 'unit_vacancy'
-      ),
-      latest_rr AS (
-        SELECT MAX(report_date) AS dt FROM bronze_appfolio_reports WHERE report_type = 'rent_roll'
-      ),
-      uv AS (
-        SELECT DISTINCT ON (LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g')))
-          LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g'))   AS unit_id,
-          NULLIF(TRIM(elem->>'UnitType'), '')                                AS unit_type,
-          NULLIF(TRIM(elem->>'Property'), '')                                AS building,
-          NULLIF(TRIM(elem->>'UnitStatus'), '')                              AS unit_status,
-          NULLIF(TRIM(elem->>'DaysVacant'), '')                              AS days_vacant,
-          NULLIF(REPLACE(elem->>'ComputedMarketRent', ',', ''), '')::numeric AS market_rent
-        FROM bronze_appfolio_reports b,
-             jsonb_array_elements(b.raw_data->'results') AS elem,
-             latest_uv
-        WHERE b.report_type = 'unit_vacancy'
-          AND b.report_date = latest_uv.dt
-          AND elem->>'Unit' IS NOT NULL
-        ORDER BY LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g'))
-      ),
-      rr AS (
-        SELECT DISTINCT ON (LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g')))
-          LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g'))   AS unit_id,
-          NULLIF(REPLACE(elem->>'Rent', ',', ''), '')::numeric               AS monthly_rent,
-          NULLIF(TRIM(REGEXP_REPLACE(TRIM(COALESCE(elem->>'Tenant','')), '[[:space:]]{2,}', ' ', 'g')), '') AS tenant_name
-        FROM bronze_appfolio_reports b,
-             jsonb_array_elements(b.raw_data->'results') AS elem,
-             latest_rr
-        WHERE b.report_type = 'rent_roll'
-          AND b.report_date = latest_rr.dt
-          AND elem->>'Unit' IS NOT NULL
-        ORDER BY LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g'))
-      ),
-      excluded AS (
-        SELECT unit_id FROM jasmine_unit_overrides WHERE exclude_from_vacancy = true
-      )
-      SELECT
-        gu.unit_id,
-        uv.unit_type,
-        gu.unit_group,
-        uv.building,
-        COALESCE(uv.unit_status, gu.unit_status)  AS status,
-        uv.days_vacant,
-        uv.market_rent::text,
-        rr.monthly_rent::text,
-        rr.tenant_name
-      FROM gold_units gu
-      LEFT JOIN uv  ON uv.unit_id  = gu.unit_id
-      LEFT JOIN rr  ON rr.unit_id  = gu.unit_id
-      WHERE (
-        ${status === 'all'}
-        OR (${status === 'vacant'}   AND COALESCE(uv.unit_status, gu.unit_status) ILIKE '%vacant%')
-        OR (${status === 'notice'}   AND COALESCE(uv.unit_status, gu.unit_status) ILIKE '%notice%')
-        OR (${status === 'occupied'} AND COALESCE(uv.unit_status, gu.unit_status) ILIKE '%occupied%')
-      )
-      AND (
-        ${!building}
-        OR uv.building ILIKE ${'%' + (building ?? '') + '%'}
-      )
-      AND gu.unit_id NOT IN (SELECT unit_id FROM excluded)
-      ORDER BY gu.unit_id
-    `;
-
-    const unitsResult = rows.map(r => ({
-      unit_id:      r.unit_id,
-      unit_type:    r.unit_type,
-      unit_group:   r.unit_group,
-      building:     r.building,
-      status:       r.status,
-      days_vacant:  r.days_vacant !== null ? parseInt(r.days_vacant, 10) : null,
-      market_rent:  r.market_rent  !== null ? parseFloat(r.market_rent)  : null,
-      monthly_rent: r.monthly_rent !== null ? parseFloat(r.monthly_rent) : null,
-      tenant_name:  r.tenant_name,
-    }));
-    if (!building && ['all', 'vacant', 'occupied', 'notice'].includes(status)) {
-      responseCache.set(`units:${status}`, unitsResult);
-    }
-    res.json(unitsResult);
-  } catch (err: unknown) {
-    const error = err instanceof Error ? err.message : String(err);
-    res.status(500).json({ error });
-  } finally {
-    if (sql) await sql.end();
-  }
+    const rows = await loadOccupancy(sql);
+    const result = { ...occupancyList(rows, status, String(req.query.building ?? ''), undefined, String(req.query.unit_type ?? '')), ...await getOccupancyFreshness(sql) };
+    res.json(req.query.format === 'envelope' ? result : result.units);
+  } catch { res.status(503).json({ error: 'Occupancy source unavailable; no cached availability served.' }); }
+  finally { if (sql) await sql.end(); }
 });
 
-// ── ENDPOINT 3 — GET /jasmine/units/:unit_id ─────────────────────────────────
 router.get("/jasmine/units/:unit_id", async (req: Request, res: Response) => {
   let sql: postgres.Sql | null = null;
   try {
@@ -388,7 +210,7 @@ router.get("/jasmine/units/:unit_id", async (req: Request, res: Response) => {
     }[]>`
       SELECT
         gu.unit_id,
-        gu.unit_status,
+        o.unit_status,
         gu.unit_group,
         gu.raw_name,
         gu.report_date::text,
@@ -405,6 +227,7 @@ router.get("/jasmine/units/:unit_id", async (req: Request, res: Response) => {
         un.contacted           AS contact_status,
         un.flagged
       FROM gold_units gu
+      JOIN v_unit_occupancy o ON o.unit_id = gu.unit_id
       LEFT JOIN gold_tenants gt ON gt.unit_id = gu.unit_id
       LEFT JOIN gold_lease_expirations le ON le.unit_id = gu.unit_id
       LEFT JOIN unit_notes un ON un.unit_id = gu.unit_id
@@ -425,7 +248,8 @@ router.get("/jasmine/units/:unit_id", async (req: Request, res: Response) => {
       return;
     }
 
-    res.json(row);
+    const shared = (await loadOccupancy(sql)).find(r => r.unit_id === unitId);
+    res.json({ ...row, ...shared, ...await getOccupancyFreshness(sql) });
   } catch (err: unknown) {
     const error = err instanceof Error ? err.message : String(err);
     res.status(500).json({ error });
@@ -729,69 +553,20 @@ router.get("/jasmine/below-market", async (req: Request, res: Response) => {
   }
 });
 // ── ENDPOINT 8 — GET /jasmine/long-vacancies ────────────────────────────────────────
-router.get("/jasmine/long-vacancies", async (req: Request, res: Response) => {
-  const minDays = Math.max(parseInt(String(req.query.min_days ?? '90'), 10), 0);
-  // Cache only for default min_days=90
-  if (minDays === 90) {
-    const cached = getCached('long-vacancies:30');
-    if (cached) { res.json(cached); return; }
-  }
+router.get("/jasmine/long-vacancies", async (req, res) => {
+  const minDays = Number(req.query.min_days ?? 90);
+  if (!Number.isInteger(minDays) || minDays < 0) { res.status(400).json({ error: 'min_days must be a nonnegative integer' }); return; }
   let sql: postgres.Sql | null = null;
   try {
     sql = getDb();
-    const rows = await sql<{
-      unit_id: string;
-      unit_type: string | null;
-      days_vacant: string | null;
-      market_rent: string | null;
-    }[]>`
-      WITH latest_uv AS (
-        SELECT MAX(report_date) AS dt FROM bronze_appfolio_reports WHERE report_type = 'unit_vacancy'
-      ),
-      uv AS (
-        SELECT DISTINCT ON (LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g')))
-          LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g'))   AS unit_id,
-          NULLIF(TRIM(elem->>'UnitType'), '')                                AS unit_type,
-          NULLIF(TRIM(elem->>'DaysVacant'), '')                              AS days_vacant,
-          NULLIF(REPLACE(elem->>'ComputedMarketRent', ',', ''), '')::numeric AS market_rent,
-          elem->>'UnitStatus'                                                AS unit_status
-        FROM bronze_appfolio_reports b,
-             jsonb_array_elements(b.raw_data->'results') AS elem,
-             latest_uv
-        WHERE b.report_type = 'unit_vacancy'
-          AND b.report_date = latest_uv.dt
-          AND elem->>'Unit' IS NOT NULL
-          AND LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g'))
-              NOT IN (SELECT unit_id FROM jasmine_unit_overrides WHERE exclude_from_vacancy = true)
-        ORDER BY LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g'))
-      )
-      SELECT unit_id, unit_type, days_vacant, market_rent::text
-      FROM uv
-      WHERE unit_status ILIKE '%vacant%'
-        AND NULLIF(TRIM(days_vacant), '') IS NOT NULL
-        AND TRIM(days_vacant)::integer >= ${minDays}
-      ORDER BY TRIM(days_vacant)::integer DESC
-    `;
-
-    const longVacanciesResult = rows.map(r => ({
-      unit_id:                r.unit_id,
-      unit_type:              r.unit_type,
-      days_vacant:            r.days_vacant !== null ? parseInt(r.days_vacant, 10) : null,
-      market_rent:            r.market_rent !== null ? parseFloat(r.market_rent) : null,
-      estimated_monthly_loss: r.market_rent !== null ? parseFloat(r.market_rent) : null,
-    }));
-    // NOTE: Do not write back to 'long-vacancies:30' here — that key is owned by the warmCache
-    // loader which uses a broader 30-day minimum for Jasmine AI context. Writing the 90-day-filtered
-    // result here would corrupt the warmed data.
-    res.json(longVacanciesResult);
-  } catch (err: unknown) {
-    const error = err instanceof Error ? err.message : String(err);
-    res.status(500).json({ error });
-  } finally {
-    if (sql) await sql.end();
-  }
+    const rows = await loadOccupancy(sql);
+    const result = { ...occupancyList(rows, 'vacant', '', minDays), min_days: minDays, ...await getOccupancyFreshness(sql) };
+    const units = result.units.map(r => ({ ...r, estimated_monthly_loss: r.market_rent }));
+    res.json(req.query.format === 'envelope' ? { ...result, units } : units);
+  } catch { res.status(503).json({ error: 'Occupancy source unavailable; no cached availability served.' }); }
+  finally { if (sql) await sql.end(); }
 });
-// ── ENDPOINT 9 — GET /jasmine/tenantss ────────────────────────────────────────
+
 router.get("/jasmine/tenants", async (req: Request, res: Response) => {
   let sql: postgres.Sql | null = null;
   try {
@@ -1637,130 +1412,6 @@ router.get("/jasmine/prospects", async (req: Request, res: Response) => {
 // result in responseCache. warmCache() iterates all loaders at startup and
 // at 8 AM ET daily.
 
-cacheLoaders.set('portfolio-summary', async () => {
-  const sql = getDb();
-  try {
-    const excluded = excludedUnitIds;
-    const [summary] = await sql<{ occupied: string; vacant: string; on_notice: string; total_monthly_rent: string | null; avg_rent: string | null; }[]>`
-      WITH latest_uv AS (
-        SELECT MAX(report_date) AS dt FROM bronze_appfolio_reports WHERE report_type = 'unit_vacancy'
-      ),
-      uv AS (
-        SELECT DISTINCT ON (LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g')))
-          LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g')) AS unit_id,
-          NULLIF(TRIM(elem->>'UnitStatus'), '')                             AS unit_status
-        FROM bronze_appfolio_reports b,
-             jsonb_array_elements(b.raw_data->'results') AS elem,
-             latest_uv
-        WHERE b.report_type = 'unit_vacancy'
-          AND b.report_date = latest_uv.dt
-          AND elem->>'Unit' IS NOT NULL
-        ORDER BY LOWER(REGEXP_REPLACE(TRIM(elem->>'Unit'), '\s*-\s*', '-', 'g'))
-      ),
-      latest_rr AS (
-        SELECT MAX(report_date) AS dt FROM bronze_appfolio_reports WHERE report_type = 'rent_roll'
-      ),
-      rr AS (
-        SELECT
-          LOWER(REGEXP_REPLACE(elem->>'Unit', '[^a-zA-Z0-9]', '', 'g')) AS unit_id,
-          NULLIF(REPLACE(elem->>'Rent', ',', ''), '')::numeric AS monthly_rent
-        FROM bronze_appfolio_reports b,
-             jsonb_array_elements(b.raw_data->'results') AS elem,
-             latest_rr
-        WHERE b.report_type = 'rent_roll'
-          AND b.report_date = latest_rr.dt
-          AND elem->>'Unit' IS NOT NULL
-          AND elem->>'Status' ILIKE '%current%'
-      )
-      SELECT
-        COUNT(*) FILTER (WHERE COALESCE(uv.unit_status, gu.unit_status) ILIKE '%occupied%'
-          AND gu.unit_id NOT IN (${sql.array(excluded)}))  AS occupied,
-        COUNT(*) FILTER (WHERE COALESCE(uv.unit_status, gu.unit_status) ILIKE '%vacant%'
-          AND gu.unit_id NOT IN (${sql.array(excluded)}))  AS vacant,
-        COUNT(*) FILTER (WHERE COALESCE(uv.unit_status, gu.unit_status) ILIKE '%notice%'
-          AND gu.unit_id NOT IN (${sql.array(excluded)}))  AS on_notice,
-        SUM(rr.monthly_rent)::text                          AS total_monthly_rent,
-        ROUND(AVG(rr.monthly_rent), 2)::text                AS avg_rent
-      FROM gold_units gu
-      LEFT JOIN uv  ON uv.unit_id  = gu.unit_id
-      LEFT JOIN rr  ON rr.unit_id  = gu.unit_id
-      WHERE gu.unit_id NOT IN (${sql.array(excluded)})
-    `;
-    const [pipeline] = await sql<{ last_run: string | null }[]>`
-      SELECT MAX(created_at)::text AS last_run FROM bronze_appfolio_reports
-    `;
-    const total = (parseInt(summary.occupied) || 0) + (parseInt(summary.vacant) || 0) + (parseInt(summary.on_notice) || 0);
-    return {
-      total_units: total,
-      occupied: parseInt(summary.occupied) || 0,
-      vacant: parseInt(summary.vacant) || 0,
-      on_notice: parseInt(summary.on_notice) || 0,
-      vacancy_rate_pct: total > 0 ? parseFloat(((parseInt(summary.vacant) / total) * 100).toFixed(1)) : 0,
-      total_monthly_rent: summary.total_monthly_rent ? parseFloat(summary.total_monthly_rent) : null,
-      avg_rent: summary.avg_rent ? parseFloat(summary.avg_rent) : null,
-      last_pipeline_run: pipeline.last_run ?? null,
-    };
-  } finally { await sql.end(); }
-});
-
-cacheLoaders.set('units:all', async () => {
-  const sql = getDb();
-  try {
-    const excluded = excludedUnitIds;
-    return await sql`
-      SELECT
-        gu.unit_id,
-        gu.unit_status AS status,
-        gu.unit_group,
-        tl.full_name AS tenant_name,
-        tl.email,
-        tl.phone,
-        le.lease_end_date::text,
-        (le.lease_end_date - CURRENT_DATE)::int AS days_until_expiration,
-        le.monthly_rent,
-        le.market_rent,
-        uv.days_vacant
-      FROM gold_units gu
-      LEFT JOIN gold_lease_expirations le ON le.unit_id = gu.unit_id
-      LEFT JOIN (
-        SELECT DISTINCT ON (unit_id)
-          unit_id,
-          full_name AS tenant_name,
-          email,
-          phone
-        FROM gold_tenants
-        ORDER BY unit_id, (is_primary = true) DESC, (tenant_status ILIKE '%primary%') DESC
-      ) tl ON tl.unit_id = gu.unit_id
-      LEFT JOIN (
-        SELECT
-          LOWER(REGEXP_REPLACE(elem->>'Unit', '[^a-zA-Z0-9]', '', 'g')) AS unit_id,
-          (elem->>'DaysVacant')::int AS days_vacant
-        FROM bronze_appfolio_reports,
-             LATERAL jsonb_array_elements(raw_data->'results') AS elem
-        WHERE report_type = 'unit_vacancy'
-          AND report_date = (SELECT MAX(report_date) FROM bronze_appfolio_reports WHERE report_type = 'unit_vacancy')
-      ) uv ON uv.unit_id = gu.unit_id
-      WHERE gu.unit_id NOT IN (${sql.array(excluded)})
-      ORDER BY gu.unit_id
-    `;
-  } finally { await sql.end(); }
-});
-
-cacheLoaders.set('units:vacant', async () => {
-  const all = (await cacheLoaders.get('units:all')!()) as Array<{ status: string | null }>;
-  return all.filter(u => u.status?.toLowerCase().includes('vacant'));
-});
-
-cacheLoaders.set('units:occupied', async () => {
-  const all = (await cacheLoaders.get('units:all')!()) as Array<{ status: string | null }>;
-  return all.filter(u => u.status?.toLowerCase().includes('occupied'));
-});
-
-cacheLoaders.set('units:notice', async () => {
-  const all = (await cacheLoaders.get('units:all')!()) as Array<{ status: string | null }>;
-  return all.filter(u => u.status?.toLowerCase().includes('notice'));
-});
-
 cacheLoaders.set('leases:90', async () => {
   const sql = getDb();
   try {
@@ -1910,28 +1561,6 @@ cacheLoaders.set('below-market:5', async () => {
         AND gu.unit_id NOT IN (SELECT unit_id FROM jasmine_unit_overrides WHERE exclude_from_revenue = true)
         AND ROUND(((rr.market_rent - rr.monthly_rent) / NULLIF(rr.market_rent, 0)) * 100, 1) >= 5
       ORDER BY percent_below DESC
-    `;
-  } finally { await sql.end(); }
-});
-
-cacheLoaders.set('long-vacancies:30', async () => {
-  const sql = getDb();
-  try {
-    return await sql`
-      SELECT
-        LOWER(REGEXP_REPLACE(elem->>'Unit', '[^a-zA-Z0-9]', '', 'g')) AS unit_id,
-        elem->>'Unit'         AS unit_display,
-        (elem->>'DaysVacant')::int AS days_vacant,
-        elem->>'VacancyStatus' AS vacancy_status,
-        elem->>'MarketRent'    AS market_rent
-      FROM bronze_appfolio_reports,
-           LATERAL jsonb_array_elements(raw_data->'results') AS elem
-      WHERE report_type = 'unit_vacancy'
-        AND report_date = (SELECT MAX(report_date) FROM bronze_appfolio_reports WHERE report_type = 'unit_vacancy')
-        AND (elem->>'DaysVacant')::int >= 30
-        AND LOWER(REGEXP_REPLACE(elem->>'Unit', '[^a-zA-Z0-9]', '', 'g'))
-            NOT IN (SELECT unit_id FROM jasmine_unit_overrides WHERE exclude_from_vacancy = true)
-      ORDER BY (elem->>'DaysVacant')::int DESC
     `;
   } finally { await sql.end(); }
 });

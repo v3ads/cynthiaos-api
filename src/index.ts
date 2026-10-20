@@ -5,6 +5,8 @@ import pagesRouter from "./routes/pages";
 import tenantVerifyRouter from "./routes/tenantVerify";
 import { requireAuth, actorFrom, type AuthedRequest } from "./auth";
 
+import { getOccupancyFreshness, loadOccupancy } from './lib/occupancy';
+
 const app: Express = express();
 const PORT = parseInt(process.env.PORT ?? "3003", 10);
 const SERVICE_NAME = "cynthiaos-api";
@@ -3001,6 +3003,7 @@ app.get("/api/v1/metrics/summary", async (_req: Request, res: Response) => {
     };
 
     const asOf = new Date().toISOString();
+    const occupancySource = await getOccupancyFreshness(sql);
     const metrics = METRIC_REGISTRY.map((m) => {
       const failing = m.affected_checks.filter(
         (c) => checkState.has(c) && checkState.get(c) === false
@@ -3012,6 +3015,8 @@ app.get("/api/v1/metrics/summary", async (_req: Request, res: Response) => {
         expenseBlocked && (m.metric_id === "noi_ytd" || m.metric_id === "profit_margin_ytd");
       const confidence = structurallyBlocked
         ? "blocked"
+        : ['occupancy_rate', 'vacancy_rate'].includes(m.metric_id) && occupancySource.freshness !== 'current'
+        ? "warning"
         : failing.length === 0
         ? "trusted"
         : m.blocked_when_failing ? "blocked" : "warning";
@@ -3022,7 +3027,8 @@ app.get("/api/v1/metrics/summary", async (_req: Request, res: Response) => {
         value: confidence === "blocked" ? null : v.value,
         population_definition: m.population_definition,
         as_of: asOf,
-        source_freshness: checksAsOf,
+        source_freshness: ['occupancy_rate', 'vacancy_rate'].includes(m.metric_id) ? occupancySource.source_report_date : null,
+        integrity_checked_at: checksAsOf,
         ...(v.denominator !== undefined
           ? { denominator: v.denominator, denominator_definition: m.denominator_definition }
           : {}),
@@ -3035,7 +3041,7 @@ app.get("/api/v1/metrics/summary", async (_req: Request, res: Response) => {
       };
     });
 
-    res.status(200).json({ success: true, as_of: asOf, metrics });
+    res.status(200).json({ success: true, as_of: asOf, occupancy_source: occupancySource, metrics });
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
     console.error(`[${SERVICE_NAME}] GET /api/v1/metrics/summary error:`, message);
@@ -3214,6 +3220,7 @@ app.get("/api/v1/insights/portfolio-health", async (_req: Request, res: Response
 
     res.status(200).json({
       success: true,
+      occupancy_source: await getOccupancyFreshness(sql),
       portfolio_health_score: portfolioScore,
       classification,
       score_confidence: expenseScopeBlocked ? "warning" : "trusted",
@@ -3815,18 +3822,8 @@ app.get("/api/v1/insights/unit-intelligence", async (req: Request, res: Response
       ),
 
       unit_status_cte AS (
-        SELECT
-          u.unit_id,
-          CASE
-            WHEN lt.lease_end_date IS NULL                                          THEN 'vacant'
-            WHEN lt.days_until_expiration IS NOT NULL
-                 AND lt.days_until_expiration BETWEEN 0 AND 60                      THEN 'notice'
-            WHEN lt.days_until_expiration IS NOT NULL
-                 AND lt.days_until_expiration < 0                                   THEN 'vacant'
-            ELSE 'occupied'
-          END AS unit_status
-        FROM unit_universe u
-        LEFT JOIN latest_tenant_per_unit lt ON lt.unit_id = u.unit_id
+        SELECT unit_id, unit_status FROM v_unit_occupancy
+        WHERE exclude_from_occupancy IS NOT TRUE
       ),
 
       assembled AS (
@@ -3986,15 +3983,8 @@ app.get("/api/v1/insights/unit-intelligence", async (req: Request, res: Response
         ORDER BY le.unit_id, le.lease_end_date DESC NULLS LAST
       ),
       unit_status_cte AS (
-        SELECT u.unit_id,
-          CASE
-            WHEN lt.lease_end_date IS NULL THEN 'vacant'
-            WHEN lt.days_until_expiration BETWEEN 0 AND 60 THEN 'notice'
-            WHEN lt.days_until_expiration < 0 THEN 'vacant'
-            ELSE 'occupied'
-          END AS unit_status
-        FROM unit_universe u
-        LEFT JOIN latest_tenant_per_unit lt ON lt.unit_id = u.unit_id
+        SELECT unit_id, unit_status FROM v_unit_occupancy
+        WHERE exclude_from_occupancy IS NOT TRUE
       ),
       delinquency_agg AS (
         SELECT d.unit_id,
@@ -4084,14 +4074,8 @@ app.get("/api/v1/insights/unit-intelligence", async (req: Request, res: Response
         FROM gold_lease_expirations ORDER BY unit_id, lease_end_date DESC NULLS LAST
       ),
       unit_status_cte AS (
-        SELECT u.unit_id,
-          CASE
-            WHEN ll.lease_end_date IS NULL THEN 'vacant'
-            WHEN ll.days_until_expiration BETWEEN 0 AND 60 THEN 'notice'
-            WHEN ll.days_until_expiration < 0 THEN 'vacant'
-            ELSE 'occupied'
-          END AS unit_status
-        FROM unit_universe u LEFT JOIN latest_lease ll ON ll.unit_id = u.unit_id
+        SELECT unit_id, unit_status FROM v_unit_occupancy
+        WHERE exclude_from_occupancy IS NOT TRUE
       ),
       delinquency_agg AS (
         SELECT unit_id, SUM(balance_due) AS delinquency_balance, LEAST(MAX(days_overdue),365) AS max_days_overdue
@@ -4443,22 +4427,19 @@ app.get("/api/v1/units", async (_req: Request, res: Response) => {
   try {
     sql = getDb();
     // Canonical occupancy view — one definition, one place.
-    const rows = await sql<{ unit_id: string; unit_status: string | null; exclude_from_occupancy: boolean; created_at: string }[]>`
-      SELECT unit_id, unit_status, exclude_from_occupancy, created_at::text
-      FROM v_unit_occupancy
-      ORDER BY unit_id ASC
-    `;
+    const rows = await loadOccupancy(sql);
     res.status(200).json({
       success: true,
       total: rows.length,
-      source: 'gold_units',
+      source: 'v_unit_occupancy',
+      ...await getOccupancyFreshness(sql),
       roster_notes: {
         canonical_count: rows.length,
         occupancy_excluded_units: rows.filter((r) => r.exclude_from_occupancy).map((r) => r.unit_id),
         note:
-          'The canonical roster is the authoritative union of the latest AppFolio unit-directory, rent-roll, lease, and tenant sources (181 units as of July 2026). Jasmine may additionally reference one transient/system unit outside this roster, giving a "182 total system units" figure — that transient unit is not a leaseable canonical unit and is intentionally excluded here.',
+          'Canonical roster shared with Home and Jasmine. Occupancy denominator excludes flagged units; leasing exclusions are separate.',
       },
-      data: rows,
+      data: rows.map(r => ({ ...r, unit_status: r.status })),
     });
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
