@@ -2,6 +2,7 @@ import express, { Express, Request, Response, NextFunction } from "express";
 import postgres from "postgres";
 import { FAST_SCHEMA } from './lib/fast';
 import { createFastRouter } from './routes/fast';
+import { createPublicFastRouter } from './routes/publicFast';
 import jasmineRouter from "./routes/jasmine";
 import pagesRouter from "./routes/pages";
 import tenantVerifyRouter from "./routes/tenantVerify";
@@ -43,6 +44,8 @@ app.use((_req: Request, res: Response, next) => {
 // Deny-by-default: every route except /health and / requires a valid Supabase
 // session (or the internal service secret). Runs after CORS so OPTIONS
 // preflight is answered above before auth is evaluated.
+// One explicitly public read-only projection. All remaining routes retain auth.
+app.use(createPublicFastRouter(getDb));
 app.use(requireAuth());
 app.use('/api/v1', createFastRouter(getDb));
 
