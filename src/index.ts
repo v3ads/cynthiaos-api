@@ -6,7 +6,7 @@ import { createPublicFastRouter } from './routes/publicFast';
 import jasmineRouter from "./routes/jasmine";
 import pagesRouter from "./routes/pages";
 import tenantVerifyRouter from "./routes/tenantVerify";
-import { requireAuth, actorFrom, type AuthedRequest } from "./auth";
+import { requireAuth, actorFrom, warmJwksCache, type AuthedRequest } from "./auth";
 
 import { getOccupancyFreshness, loadOccupancy } from './lib/occupancy';
 
@@ -5007,6 +5007,9 @@ app.use((_req: Request, res: Response) => {
 // ── Start ─────────────────────────────────────────────────────────────────────
 app.listen(PORT, "0.0.0.0", async () => {
   console.log(`[${SERVICE_NAME}] listening on port ${PORT}`);
+  // Warm the Supabase JWKS cache in the background so the first authenticated
+  // request doesn't pay the remote key fetch itself (see src/auth.ts).
+  void warmJwksCache();
   await checkDatabaseConnectivity();
 
   // Bootstrap gold_units if not yet populated by the transform worker.
