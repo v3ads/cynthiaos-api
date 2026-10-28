@@ -118,6 +118,13 @@ export function requireAuth() {
     // Internal service-to-service calls (cron / transform triggers).
     const internal = req.header("x-internal-secret");
     if (INTERNAL_SECRET && internal && internal === INTERNAL_SECRET) {
+      // Attach a principal so downstream routers that require req.auth
+      // (e.g. the Fast router mounted on /api/v1, whose guard rejects any
+      // request without one) treat internal callers as authenticated.
+      // Without this, internal-secret callers passed this middleware but
+      // were 401'd by that guard before reaching the classic /api/v1
+      // routes — the regression that broke the weekly monitor.
+      req.auth = { sub: "internal-service", payload: {} as JWTPayload };
       return next();
     }
 
