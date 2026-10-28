@@ -45,13 +45,58 @@ const PUBLIC_PATHS = new Set<string>([
 ]);
 
 let jwks: ReturnType<typeof createRemoteJWKSet> | null = null;
+
+// ── Verification timeouts ────────────────────────────────────────────────────
+// jose verifies against a REMOTE key set: on a cold cache (process start,
+// key rotation, cache expiry) or an unknown `kid`, a single jwtVerify can
+// trigger up to TWO sequential JWKS fetches before it can answer. With no
+// overall bound, a slow or stalled fetch to Supabase leaves the HTTP request
+// hanging — measured >60s on the live service (2026-10-27), and 12s for a
+// fake-kid token in local reproduction. Bound both layers: each fetch gets
+// 3s, and the whole JWKS verification gets 6s; on timeout the request falls
+// through to the HS256 fallback (if configured) or a fast 401 — never a hang.
+const JWKS_FETCH_TIMEOUT_MS = 3000;
+const JWKS_VERIFY_TIMEOUT_MS = 6000;
+
 function getJwks() {
   if (!jwks && SUPABASE_URL) {
     jwks = createRemoteJWKSet(
-      new URL(`${SUPABASE_URL.replace(/\/$/, "")}/auth/v1/.well-known/jwks.json`)
+      new URL(`${SUPABASE_URL.replace(/\/$/, "")}/auth/v1/.well-known/jwks.json`),
+      { timeoutDuration: JWKS_FETCH_TIMEOUT_MS }
     );
   }
   return jwks;
+}
+
+/** Race a promise against a deadline; on deadline, reject with a timeout error. */
+async function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+/**
+ * Warm the JWKS cache at process start so the first authenticated request
+ * doesn't pay the remote fetch (or eat the verification timeout) itself.
+ * Best-effort: failures are logged, never fatal — verification retries live.
+ */
+export async function warmJwksCache(): Promise<void> {
+  const set = getJwks();
+  if (!set) return;
+  try {
+    await withTimeout(set.reload(), JWKS_FETCH_TIMEOUT_MS + 1000, "JWKS warm-up fetch");
+    console.log("[auth] JWKS cache warmed");
+  } catch (err) {
+    console.warn("[auth] JWKS warm-up failed (verification will retry on demand):", err);
+  }
 }
 
 const encoder = new TextEncoder();
@@ -65,11 +110,15 @@ async function verifyToken(token: string): Promise<JWTPayload | null> {
   try {
     const set = getJwks();
     if (set) {
-      const { payload } = await jwtVerify(token, set, {
-        // Supabase tokens use issuer {SUPABASE_URL}/auth/v1 and audience 'authenticated'.
-        issuer: SUPABASE_URL ? `${SUPABASE_URL.replace(/\/$/, "")}/auth/v1` : undefined,
-        audience: "authenticated",
-      });
+      const { payload } = await withTimeout(
+        jwtVerify(token, set, {
+          // Supabase tokens use issuer {SUPABASE_URL}/auth/v1 and audience 'authenticated'.
+          issuer: SUPABASE_URL ? `${SUPABASE_URL.replace(/\/$/, "")}/auth/v1` : undefined,
+          audience: "authenticated",
+        }),
+        JWKS_VERIFY_TIMEOUT_MS,
+        "JWKS token verification"
+      );
       return payload;
     }
   } catch (err) {
